@@ -2931,8 +2931,13 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
    购买力与现金归集，它防的是不可恢复的透支。
    **裁决**：**不改代码**（收窄无据、加宽有害）；仅把票据措辞从"跌停封死"改为事实描述
    （"`T` 日收盘触跌停板，`T+1` 开盘多数可成交——本标签是资金保险，不是卖出禁止"）并在
-   `detail_reason` 带出 `T+1` 跌停价。**该措辞改动待办**：`scripts/run_live_strategy.py` 当时由并行批次
-   占用，未实施。证据强度：n=19 只支持方向，不支持把 5.3% 当作精确概率。
+   `detail_reason` 带出 `T+1` 跌停价。
+   **该措辞改动已落地（2026-11-18）**：`LIMIT_DOWN_ILLIQUID_RISK` 文案改为事实描述（`T` 日收盘触板、
+   `T+1` 开盘多数可成交、本标签是资金保险而非卖出禁止），`LIMIT_UP_LOCKED` 同步改为「按规则放弃追板」
+   而非断言市场无法成交；`detail_reason.limit_board` 并排带出 `_session_t` 与 `_next` 两套板价，
+   防止把下一会话的板价误读成当日板价。判定零改动（`execution_warning` / `blocking_reason` / `action` /
+   股数与成交额 / 被否单集合均未变），回归见 `pipeline/tests/test_live_limit_band_anchor.py`（6 例）。
+   证据强度：n=19 只支持方向，不支持把 5.3% 当作精确概率。
 
 ---
 

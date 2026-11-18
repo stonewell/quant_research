@@ -35,10 +35,24 @@ WHAT THIS FILE PINS (all 100% offline: synthetic frames, frozen clock, `tmp_path
 2. `test_sell_limit_uses_the_next_session_board` -- -9.9% `T`: the sell limit is the
    as-of close x 0.998 (`8.992`), not the lifted stale floor (`9.000`), and it stays
    inside the true `T+1` band.
-3. `test_*_lock_decision_still_runs_on_the_session_t_board` -- the two risk vetoes are
+3. `test_risk_vetoes_still_run_on_the_session_t_board` -- the two risk vetoes are
    bit-identical to before the change: they still fire off the `T-1`-anchored board.
    Both cases are constructed so that re-pointing the veto at the `T+1` board would
    make it STOP firing (11.000 vs 12.100, 9.000 vs 8.100), so the guard cannot rot.
+4. `test_detail_reason_carries_the_next_session_board_not_the_session_t_board` --
+   the ticket's diagnostic `detail_reason["limit_board"]` publishes the `T+1` board
+   (`*_next`, anchored on the `T` close) NEXT TO the `T` board (`*_session_t`), and the
+   same two divergent cases prove the `_next` key is not a relabelled `_session_t`
+   price (12.100 != 11.000, 8.100 != 9.000).
+
+WORDING (2026-11-18, cosmetic + diagnostic only -- no decision moved)
+=====================================================================
+The `LIMIT_DOWN_ILLIQUID_RISK` reason used to say "跌停封死/流动性枯竭" ("sealed
+limit-down / liquidity exhausted"), which reads as a `T+1` market verdict although the
+label is set from a `T`-session fact and never blocks a sell. An earlier revision of
+this file also called the up-side veto "涨停封板无法买入". Both texts now state only the
+`T`-session observation plus what the label does; the enums, actions, share counts and
+the veto condition are untouched.
 
 The harness is one REAL `run_live_strategy.main()` per case; only the daily-bar loader
 is replaced, so every field asserted here is the field the ticket actually ships.
@@ -282,6 +296,25 @@ def test_risk_vetoes_still_run_on_the_session_t_board(
     assert row["execution_warning"] == expected_warning
     assert row["detail_reason"]["blocking_reason"] == expected_blocking
 
+    # (2026-11-18 wording change) The old texts asserted a `T+1` market fact from a
+    # `T`-session observation:
+    #   * down side: `" [跌停封死/流动性枯竭警示 LIMIT_DOWN_ILLIQUID_RISK]"` -- the word
+    #     "封死" ("sealed") claimed the sell cannot execute, which this branch never
+    #     measured and which is false for 18/19 of the measured cases.
+    #   * up side:   `"涨停封板无法买入 (LIMIT_UP_LOCKED)"` -- same defect class.
+    # Only the prose moved; the enum token stays a substring (other suites assert it).
+    if side == "limit_up":
+        assert row["reason"] == (
+            "T日收盘触及涨停板，本行按规则放弃本次买入（不追板，非断言市场无法成交）"
+            " (LIMIT_UP_LOCKED)"
+        )
+        assert "无法买入" not in row["reason"]
+    else:
+        assert "T日收盘触及跌停板" in row["reason"]
+        assert "不是禁止卖出" in row["reason"]
+        assert "LIMIT_DOWN_ILLIQUID_RISK" in row["reason"]
+        assert "跌停封死" not in row["reason"]
+
     if side == "limit_up":
         # The veto froze the entry: nothing bought, weight kept.
         assert row["delta_shares"] == 0
@@ -296,3 +329,68 @@ def test_risk_vetoes_still_run_on_the_session_t_board(
         # ...and its limit price is still the `T`-close anchor, not the stale floor.
         assert row["suggested_limit_price"] == pytest.approx(8.982)
         assert row["suggested_limit_price"] < round(prev_close * 0.90, 3)
+
+
+# ---------------------------------------------------------------------------
+# 4. The diagnostic field carries the `T+1` board, next to the `T` board
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "side, prev_close, as_of_close, holdings, next_key, expected_next, session_key, expected_session_t",
+    [
+        # Up seal: `T` board = round(10.000*1.10) = 11.000 (anchored on `T-1`);
+        # `T+1` board = round(11.000*1.10) = 12.100 (anchored on the `T` close).
+        ("limit_up", 10.000, 11.000, {_ETF: 100}, "limit_up_next", 12.100, "limit_up_session_t", 11.000),
+        # Down seal: `T` board = 9.000; `T+1` board = round(9.000*0.90) = 8.100.
+        ("limit_down", 10.000, 9.000, {_ETF: 8000}, "limit_down_next", 8.100, "limit_down_session_t", 9.000),
+    ],
+)
+def test_detail_reason_carries_the_next_session_board_not_the_session_t_board(
+    tmp_path,
+    monkeypatch,
+    side,
+    prev_close,
+    as_of_close,
+    holdings,
+    next_key,
+    expected_next,
+    session_key,
+    expected_session_t,
+):
+    """`detail_reason["limit_board"]` publishes BOTH boards, and `_next` is the `T+1` one.
+
+    (2026-11-18) Motivation: the veto reason used to be the ONLY place a reader could
+    learn the board, and it named the `T` session in prose that sounded like a `T+1`
+    verdict. The diagnostic now carries the price an operator actually needs when
+    judging whether a frozen sell will clear at tomorrow's open.
+
+    The two boards are deliberately one limit step apart in both cases, so a
+    "relabelled `T` price" regression -- i.e. writing `p_limit_*_session_t` into the
+    `*_next` key -- turns this test red instead of silently agreeing with itself.
+    """
+    ticket = _ticket(
+        tmp_path,
+        monkeypatch,
+        prev_close=prev_close,
+        as_of_close=as_of_close,
+        holdings=holdings,
+    )
+    row = _order(ticket, _ETF)
+    board = row["detail_reason"]["limit_board"]
+
+    # The veto itself did NOT move (this row still carries the same verdict).
+    expected_warning = "LIMIT_UP_LOCKED" if side == "limit_up" else "LIMIT_DOWN_ILLIQUID_RISK"
+    assert row["execution_warning"] == expected_warning
+
+    # `_next` is anchored on the `T` close (`price`), not on the `T-1` close.
+    assert board[next_key] == pytest.approx(expected_next)
+    assert board[next_key] == pytest.approx(
+        round(row["price"] * (1.0 + 0.10 if side == "limit_up" else 1.0 - 0.10), 3)
+    )
+    # The `T`-session board is published too, and it is the OTHER number.
+    assert board[session_key] == pytest.approx(expected_session_t)
+    assert board[session_key] == pytest.approx(round(prev_close * (1.0 + 0.10 if side == "limit_up" else 1.0 - 0.10), 3))
+    assert board[next_key] != pytest.approx(board[session_key]), (
+        f"{next_key} equals {session_key}: the diagnostic is a relabelled `T` price"
+    )
+    # 51xxxx ETF => `limit_pct == 0.10` (i.e. a real board, not the new-listing sentinel).
+    assert board["limit_pct"] == pytest.approx(0.10)

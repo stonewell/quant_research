@@ -609,6 +609,7 @@ flowchart LR
 - **修复逻辑**：
   在生成 Phase 2 `BUY` 订单时（同步更新 `delta_shares`, `target_shares`, `trade_value`, `trade_value_rmb`, `target_weight`, `delta_weight`）：
   1. **涨停封板拦截（`LIMIT_UP_LOCKED`，R10）**：若当前价触及板块精确涨停价 $P_{\text{limit\_up}} = \text{round}(C_{t-1,\text{close}} \times (1 + \text{limit\_pct}), \text{decimals})$ 或 `Last_3Bars_Locked_Limit == 1`，无法在二级市场买入，自动将该笔买单 `action` 置为 `"HOLD_FILTERED"`、`delta_shares = 0`、`trade_value = 0.0`（释放资金留存现金池生息），并在 `reason` 中标注 `"涨停封板无法买入 (LIMIT_UP_LOCKED)"`；
+  > （2026-11-18 订正：该措辞已改为「T日收盘触及涨停板，本行按规则放弃本次买入（不追板，非断言市场无法成交）」；历史原文保留以便追溯。）
   2. **日内超买透支降档（`INTRADAY_OVEREXTENDED_TRIM`）**：若 `VWAP_Prem_5m > 0.035`（当前价高于日内 VWAP 达 $3.5\%$ 以上）且 `Chan_5m_Sell_Trigger == 1`（5m 小级别顶背驰/三卖），将当日计划买入股数自动折半（按 `sym_lot` 向下取整），避免 T+1 制度下在日内最高点追高被套。
 
 #### 5.4 护栏 4：交割单新增双模式微观执行引导字段（`live_trading_ticket.csv` / `.json`，评审修订 R11）

@@ -8153,7 +8153,21 @@ def main(cli_args: Optional[List[str]] = None):
                     tgt_w = cur_w
                     delta_w = 0.0
                     abs_delta = 0.0
-                    reason = "涨停封板无法买入 (LIMIT_UP_LOCKED)"
+                    # (2026-11-18 wording) The old text -- "涨停封板无法买入" -- asserted a
+                    # `T+1` market fact from a `T`-session observation: this row's BUY is
+                    # never submitted, so nothing here measured whether tomorrow's open
+                    # would actually be unfillable. That is the same defect class as the
+                    # LIMIT_DOWN text below (a `T` fact published as a `T+1` verdict), and
+                    # it matters because "无法买入" reads as a market fact while the rule
+                    # applied is a POLICY choice (decline to chase a name that just
+                    # locked). No LIMIT_UP counterpart of the down-side study exists, so
+                    # this branch makes the narrower claim it can support.
+                    # DECISION UNTOUCHED: HOLD_FILTERED / delta_shares=0 /
+                    # blocking_reason=LIMIT_UP_LOCKED below are byte-identical.
+                    reason = (
+                        "T日收盘触及涨停板，本行按规则放弃本次买入（不追板，非断言市场无法成交）"
+                        " (LIMIT_UP_LOCKED)"
+                    )
                     execution_warning = "LIMIT_UP_LOCKED"
                     # (L2.24) A BUY that was vetoed at the exchange board, not at
                     # the lifecycle machine.
@@ -8174,10 +8188,52 @@ def main(cli_args: Optional[List[str]] = None):
                     target_shares = current_shares + delta_shares
                     actual_trade_val = delta_shares * price
             elif action == "SELL":
-                # Check LIMIT_DOWN_ILLIQUID_RISK (R10 & R14)
+                # ---- `LIMIT_DOWN_ILLIQUID_RISK`: what this veto actually measures -----
+                # (2026-11-18, real-data OFFLINE study -- read-only DuckDB, no network.)
+                #
+                # The old reason text said "跌停封死/流动性枯竭" ("sealed limit-down / liquidity
+                # exhausted"), which reads like a claim that the sell cannot execute. The
+                # label is set purely from a `T`-SESSION fact (`price <= *_session_t + tick`
+                # or `last_locked == -1`); nothing in this branch observes tomorrow's book,
+                # and the freeze never blocks a sell at all -- the SELL below still ships and
+                # only its proceeds are held out of purchasing power / the cash sweep.
+                #
+                # Measured on the 20 deployed A-shares, 2024-01-02..2026-11-17, 13,756
+                # symbol-days after dropping the 109 ex-dividend days (earlier history was
+                # excluded: `adjust_factors` re-bases across 2024-01-02 and manufactures
+                # 10-12% phantom gaps):
+                #   * `T` closed on the limit-down board:                19 (0.138%)
+                #   * `T+1` OPEN still at/below that board (unfillable):  1/19 = 5.3%
+                #     (Wilson 95% CI 0.9%-24.6%; 239x the 0.022% base rate)
+                #   * `T+1` OPEN already above it (freeze was STALE):    18/19 = 94.7%
+                #     (Wilson 95% CI 75.4%-99.1%)
+                #   * longest run of consecutive limit-down closes: 2 sessions (17/19 = 1)
+                #   * stale-freeze cost: about 0.2% of NAV, roughly once per 181 rounds
+                #     (deployed book, 4 holdings) -- the veto holds one session of
+                #     purchasing power and pauses the cash sweep; it is a CASH-FLOW safety
+                #     hold against an unrecoverable overdraft, not a sell prohibition.
+                #
+                # TWO NEGATIVE FINDINGS -- both must survive any future "tightening":
+                #   (a) The only correct freeze and the only all-day seal are NOT the same
+                #       day. So "was `T` sealed all day?" / "did the 5m bars never leave the
+                #       floor?" has NO predictive power in this sample, and narrowing the
+                #       veto on that test would drop the one case it got right.
+                #   (b) n=19 bounds the claim: it supports a DIRECTION (the freeze is usually
+                #       stale), not the 5.3% as a precise probability. Do not quote the
+                #       percentage without the CI.
+                # Hence: no logic change (narrowing is unsupported, widening is harmful --
+                # SSOT `docs/development_plan.md` 2026-11-17/18 盘后口径收尾补记 item 7);
+                # only this text plus the `T+1` board in `detail_reason["limit_board"]`
+                # become honest about which session they describe.
                 if limit_pct < 1.0 and (price <= p_limit_down_session_t + tick_tol or last_locked == -1 or cur_v == 0.0):
                     execution_warning = "LIMIT_DOWN_ILLIQUID_RISK"
-                    reason = f"{reason} [跌停封死/流动性枯竭警示 LIMIT_DOWN_ILLIQUID_RISK]"
+                    # Fact-shaped: say what was observed on `T` and what the label does.
+                    # The enum token is kept verbatim -- `test_blend_intraday_5m.py`
+                    # asserts it as a substring of this reason.
+                    reason = (
+                        f"{reason} [T日收盘触及跌停板；T+1开盘多数可成交，本标签为资金保险持有"
+                        "（冻结一拍购买力与现金归集），不是禁止卖出 LIMIT_DOWN_ILLIQUID_RISK]"
+                    )
 
                 if tgt_w <= 1e-6:
                     raw_shares = -float(current_shares)
@@ -8397,6 +8453,28 @@ def main(cli_args: Optional[List[str]] = None):
                 "lot_size": int(sym_lot),
             },
         }
+        # (2026-11-18) THE `T+1` BOARD NOW TRAVELS WITH THE ROW. Both board vetoes above
+        # answer a question about session `T` (`*_session_t`, anchored on the `T-1` close),
+        # but this ticket FILLS AT THE `T+1` OPEN, so the price an operator needs in order
+        # to judge whether a frozen sell will actually clear tomorrow is the `*_next` board
+        # -- anchored on the `T` close (`price`). Publishing BOTH pairs side by side, under
+        # the code's own variable names, is the point: `limit_down_next` cannot be mistaken
+        # for a relabelled `T` price, because `limit_down_session_t` sits right next to it.
+        # `limit_pct` is included because it is the only way to tell a real board from the
+        # new-listing sentinel (`limit_pct == 1.0` => `up = price*2`, `down = 0.01`, i.e.
+        # "exempt", not a 100% band).
+        # ADDITIVE ONLY: no gate in this file reads this block back (grep `limit_board`:
+        # this assignment is its only occurrence), exactly like `advisory` /
+        # `stale_input_lot`. The cash proxy is skipped -- it is a US-listed T-bill fund
+        # here, so an A-share +/-10% board is meaningless for it.
+        if sym != cash_proxy and price > 0:
+            detail_reason["limit_board"] = {
+                "limit_up_session_t": float(p_limit_up_session_t),
+                "limit_down_session_t": float(p_limit_down_session_t),
+                "limit_up_next": float(p_limit_up_next),
+                "limit_down_next": float(p_limit_down_next),
+                "limit_pct": round(float(limit_pct), 4),
+            }
         # (`AT7` P1/P2/P3) Advisory-only audit key: same shape on every symbol, never
         # read back by any gate or sizing function (P2 carries the shadow `r1` /
         # `shadow_buy_scale` line; P3 flips `r1_effective` and adds
