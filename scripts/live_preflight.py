@@ -910,7 +910,8 @@ def assert_state_version_not_clobbered(
 #   2. A candidate is INADMISSIBLE when its run verdict is a recorded non-SUCCESS
 #      (`deploy_status` wins, else `health_status`), when the state's OWN `as_of_date` is
 #      not the directory's date (the orphan signature: an 11-05 book sitting in an 11-08
-#      directory), or when its `base_version` disagrees with today's live engine.
+#      directory), or when its `base_version` is from a DIFFERENT MAJOR than today's live
+#      engine (a same-major bump stays admissible -- see `_version_majors_match` below).
 #   3. Among admissible candidates the winner is the NEWEST date, and within one date the
 #      NEWEST instance.  A failed newest instance falls back to the next-newest instance of
 #      the SAME date before any older date is considered.
@@ -933,6 +934,55 @@ SKIP_AS_OF_MISSING = "as_of_date_missing"
 SKIP_BASE_VERSION_MISMATCH = "base_version_mismatch"
 SKIP_BASE_VERSION_MISSING = "base_version_missing"
 SKIP_UNREADABLE = "account_state_unreadable_or_empty"
+
+#: `X.Y.Z` (numeric components only), optionally with a `-prerelease` / `+build` tail.
+#: Deliberately STRICT: the engine only ever writes numeric triples, and a string this
+#: cannot parse must never become "compatible" by accident (see `_version_majors_match`).
+_VERSION_CORE_RE = re.compile(r"^(\d+)(?:\.\d+)*(?:[-+][0-9A-Za-z.+-]+)?$")
+
+
+def _version_major(value: Any) -> Optional[int]:
+    """The major component of a version string, or None when it is missing / unparsable."""
+    text = _normalise_version_value(value)
+    if text is None:
+        return None
+    match = _VERSION_CORE_RE.match(text)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _version_majors_match(expected: Any, actual: Any) -> bool:
+    """Whether a recorded version is admissible next to today's live version.
+
+    THE COLD-START THIS PREVENTS (`docs/development_plan.md` `NV8`, 2026-11-17 owner
+    decision A). `prior_state` is the anchor for `entry_prices` / `holding_bars` / cooldown
+    state, and `-8%` stop-loss levels are measured against it. Comparing the two versions by
+    EXACT STRING EQUALITY meant that any `BASE_VERSION` bump dropped the previous session's
+    snapshot and cold-started the book. That is not hypothetical: the archive already holds
+    `LiveDumpPreflightError base_version` deploy failures on 2026-11-06 / 2026-11-09 and a
+    `strategy_version` one on 2026-11-12 (`NV8`, `NV6`'s MEDIUM count). So the version axis
+    here is about "which ENGINE ERA wrote this book", and a same-major bump (patch / minor)
+    is the same era.
+
+    The rule is therefore: compatible iff BOTH sides parse AND their majors are equal.
+    Everything else is ineligible -- missing and unparsable strings are NOT "no constraint"
+    and NOT "compatible"; the caller keeps today's `base_version_missing` /
+    `base_version_mismatch` reason codes, so a garbage record fails closed with the mismatch
+    reason rather than being accepted (the vocabulary has no `malformed` code on purpose --
+    adding one would change the meanings existing archives were audited under).
+
+    Scoped to THIS resolver only. The dump-vs-live-class parity gate
+    (`_assert_version_axis`, and `state_version_mismatches` which mirrors it) stays an exact
+    comparison: it answers "may this exact engine write this artifact at all", it runs on the
+    dump/round-state axis where the archived remedy is "re-dump", and loosening it would let
+    a stale dump be stamped with a version no persisted artifact agrees with.
+    """
+    expected_major = _version_major(expected)
+    actual_major = _version_major(actual)
+    if expected_major is None or actual_major is None:
+        return False
+    return expected_major == actual_major
 
 
 class PriorStateCandidate(NamedTuple):
@@ -1036,6 +1086,12 @@ def list_prior_state_candidates(
     "Strictly before" is the `prior_state` contract (previous session's confirmed snapshot);
     today's own earlier instances are the same session and are covered by the carried state
     itself, not by this resolver.
+
+    `expected_base_version` is optional (`None` = do not filter on the version axis). When it
+    IS given, a snapshot is admissible if its recorded `base_version` shares that version's
+    MAJOR component -- a patch/minor bump must not cold-start the book (`NV8`; see
+    `_version_majors_match`). A missing, different-major or unparsable recorded version is
+    ineligible with the pre-existing reason codes.
     """
     if not session_root or not os.path.isdir(str(session_root)) or not as_of_date:
         return []
@@ -1099,7 +1155,13 @@ def list_prior_state_candidates(
                 eligible, reason = False, SKIP_AS_OF_MISSING
             elif as_of != run_date:
                 eligible, reason = False, SKIP_AS_OF_MISMATCH
-            elif expected is not None and base_version != expected:
+            elif expected is not None and not (
+                base_version and _version_majors_match(expected, base_version)
+            ):
+                # Same-major tolerance (`NV8`): a patch/minor bump is the same engine era and
+                # must NOT cold-start the book. A MISSING recorded version keeps its own
+                # reason; every other rejection -- different major, and a malformed string on
+                # either side (fail closed) -- reports `base_version_mismatch`.
                 eligible = False
                 reason = (
                     SKIP_BASE_VERSION_MISMATCH if base_version else SKIP_BASE_VERSION_MISSING

@@ -16,7 +16,9 @@ THE RULES PINNED HERE (`scripts/live_preflight.py`, section "(D2)"):
    older date (that implicit fallback is what skipped 11-06/185016).
 2. Inadmissible: a recorded non-SUCCESS verdict (`deploy_status` wins over `health_status`),
    a state whose OWN `as_of_date` is not its run date (the orphan signature), or a
-   `base_version` that disagrees with today's live engine.
+   `base_version` from a DIFFERENT MAJOR than today's live engine. A same-major bump (patch
+   / minor) IS admissible -- exact string equality here cold-started the book on every
+   `BASE_VERSION` bump (`NV8`).
 3. Newest date wins; within one date the newest instance wins; a failed newest instance
    falls back to the next-newest instance of the SAME date before any older date.
 4. Every rejection is recorded with a machine-readable reason -- a FAILED snapshot is never
@@ -39,7 +41,9 @@ from scripts.live_preflight import (
     PRIOR_STATE_LOG_PREFIX,
     SKIP_AS_OF_MISMATCH,
     SKIP_BASE_VERSION_MISMATCH,
+    SKIP_BASE_VERSION_MISSING,
     SKIP_STATUS_NOT_SUCCESS,
+    _version_majors_match,
     apply_prior_state_selection,
     derive_session_root,
     list_prior_state_candidates,
@@ -214,6 +218,130 @@ def test_base_version_mismatch_is_skipped_and_not_silently_used(tmp_path):
     assert selection.source["path"] == os.path.join(good, "account_state.json")
     skipped = {s["instance"]: s for s in selection.source["skipped"]}
     assert skipped["202418"]["reason"] == SKIP_BASE_VERSION_MISMATCH
+
+
+# ---------------------------------------------------------------------------
+# Rule 2, the version axis: SAME-MAJOR tolerance (`NV8`, 2026-11-17 owner decision A)
+# ---------------------------------------------------------------------------
+# THE DEFECT PINNED HERE. The comparison used to be EXACT STRING EQUALITY, so any
+# `BASE_VERSION` patch/minor bump made the previous session's snapshot ineligible and
+# COLD-STARTED the book: `entry_prices` / `holding_bars` / cooldown state were lost and the
+# `-8%` stop-loss lost its reference anchor. The archive already holds that failure mode as
+# `LiveDumpPreflightError base_version` deploy failures (2026-11-06 / 2026-11-09) and a
+# `strategy_version` one (2026-11-12), so this is not hypothetical.
+#
+# The rule is now "same engine ERA" = same MAJOR component. Every other branch is pinned
+# right next to the tolerance -- different major, missing, blank and unparsable -- so the
+# tolerance cannot be widened into "always admissible" without a red test.
+
+
+def _single_candidate(tmp_path, recorded, expected):
+    """One flat snapshot carrying `recorded` as `base_version`, resolved against `expected`."""
+    _snapshot(tmp_path, "2026-11-06", "185016", nav=199480.90, base_version=recorded)
+    selection = _selection(tmp_path, expected=expected)
+    (candidate,) = selection.candidates
+    return selection, candidate
+
+
+@pytest.mark.parametrize(
+    "recorded, expected",
+    [
+        ("2.0.0", "2.1.0"),  # patch differs -> same era, admissible
+        ("2.1.0", "2.3.4"),  # minor differs -> same era, admissible
+        ("2.4.0", "2.0.0"),  # the post-bump shape: OLD snapshot, NEW live engine
+    ],
+)
+def test_same_major_bump_keeps_the_snapshot_admissible(tmp_path, recorded, expected):
+    selection, candidate = _single_candidate(tmp_path, recorded, expected)
+
+    assert candidate.eligible is True
+    assert candidate.reason == "eligible"
+    assert selection.state is not None
+    assert selection.source["base_version"] == recorded
+    # The snapshot is adopted verbatim: its recorded version is NOT re-stamped.
+    assert selection.state["base_version"] == recorded
+    assert selection.source["skipped"] == []
+
+
+@pytest.mark.parametrize(
+    "recorded, expected",
+    [
+        ("2.9.9", "3.0.0"),  # old major -> live major
+        ("3.0.0", "2.9.9"),  # and the reverse, so the rule is symmetric
+    ],
+)
+def test_different_major_is_still_refused_with_the_original_reason(
+    tmp_path, recorded, expected
+):
+    """The guard this task must NOT weaken: a different major is a different engine era."""
+    selection, candidate = _single_candidate(tmp_path, recorded, expected)
+
+    assert candidate.eligible is False
+    assert candidate.reason == SKIP_BASE_VERSION_MISMATCH
+    assert selection.state is None
+    assert selection.source is None
+    assert "reason=no_admissible_candidate" in selection.log_line
+
+
+def test_missing_recorded_version_keeps_its_own_reason(tmp_path):
+    """`base_version: null` stays INADMISSIBLE -- never "no constraint" and never compatible."""
+    selection, candidate = _single_candidate(tmp_path, None, "2.0.0")
+
+    assert candidate.eligible is False
+    assert candidate.reason == SKIP_BASE_VERSION_MISSING
+    assert selection.state is None
+
+
+def test_blank_recorded_version_keeps_its_own_reason(tmp_path):
+    """`""` is the dumper's other spelling of "no value": MISSING, not "compatible"."""
+    selection, candidate = _single_candidate(tmp_path, "", "2.0.0")
+
+    assert candidate.eligible is False
+    assert candidate.reason == SKIP_BASE_VERSION_MISSING
+    assert selection.state is None
+
+
+@pytest.mark.parametrize("garbage", ["abc", "2.x", "v2.0.0", "2..0", "2.0.0.0.x"])
+def test_unparsable_recorded_version_fails_closed(tmp_path, garbage):
+    """A garbage string must never become compatible.
+
+    The reason stays `base_version_mismatch`: the skip-reason vocabulary deliberately has no
+    `malformed` code (adding one would change the meaning existing archives were audited
+    under), so a fail-closed rejection reuses the mismatch reason.
+    """
+    selection, candidate = _single_candidate(tmp_path, garbage, "2.0.0")
+
+    assert candidate.eligible is False
+    assert candidate.reason == SKIP_BASE_VERSION_MISMATCH
+    assert selection.state is None
+
+
+@pytest.mark.parametrize("recorded", ["1.8.0", "2.0.0", "2.7.3", "", "abc", None])
+def test_no_expected_version_means_no_version_constraint(tmp_path, recorded):
+    """`expected_base_version=None` is unchanged: no version filter at all.
+
+    That is the web layer's default (it has no authoritative live value to offer) and it must
+    stay permissive even for a record today's engine could not parse -- the fail-closed side
+    of that path is Stage 2's exact parity gate, not this resolver.
+    """
+    selection, candidate = _single_candidate(tmp_path, recorded, None)
+
+    assert candidate.eligible is True
+    assert selection.state is not None
+    assert selection.source["skipped"] == []
+
+
+def test_the_major_helper_is_never_unconditionally_true():
+    """Guard: the tolerance may not be "simplified" into a constant True."""
+    assert _version_majors_match("2.9.9", "3.0.0") is False
+    assert _version_majors_match("3.0.0", "2.9.9") is False
+    assert _version_majors_match("2.0.0", None) is False
+    assert _version_majors_match(None, "2.0.0") is False
+    assert _version_majors_match(None, None) is False
+    assert _version_majors_match("2.0.0", "abc") is False
+    assert _version_majors_match("abc", "2.0.0") is False
+    assert _version_majors_match("2.0.0", "2.0.0") is True
+    assert _version_majors_match("2.0.0", "2.99.1") is True
 
 
 def test_candidates_come_from_instance_dirs_not_only_date_root_files(tmp_path):
