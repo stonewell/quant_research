@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 
 from common.testing import make_ohlcv_from_closes
-from amine.benchmark import evaluate_rule9_gate, run_alpha_mining_benchmark
+from amine.benchmark import _evaluate_arm, evaluate_rule9_gate, run_alpha_mining_benchmark
+from amine.labels import build_forward_labels
 from amine.config import AlphaMiningConfig, CombinerConfig, GPConfig, PurgedCVConfig
 import run_alpha_mining
 
@@ -85,7 +86,7 @@ def test_cli_end_to_end_synthetic_writes_report_and_oof(tmp_path):
     with open(report_path, "r", encoding="utf-8") as fh:
         report = json.load(fh)
 
-    assert report["strategy_version"] == "1.0.0"
+    assert report["strategy_version"] == "1.1.0"
     assert set(report["holdout_arms"].keys()) == {
         "lgbm_top_n",
         "equal_weight_universe",
@@ -95,6 +96,22 @@ def test_cli_end_to_end_synthetic_writes_report_and_oof(tmp_path):
     }
     assert report["monitoring"]["report_only"] is True
     assert "passed" in report["rule9_gate"]
+
+    # FIX 2: the constant equal-weight arm must report a null IC, not a fabricated 0.0.
+    assert report["holdout_arms"]["equal_weight_universe"]["ic_summary"] is None
+    for arm_key in ("lgbm_top_n", "best_single_seed", "equal_weight_gp_combo", "lgbm_lowdin_on"):
+        assert report["holdout_arms"][arm_key]["ic_summary"] is not None
+
+    # FIX 3a: holdout backtest window extends exactly h = k + exec_lag bars past the
+    # label-valid IC window (trailing forward labels are NaN).
+    wa = report["window_alignment"]
+    assert wa["label_horizon_h"] == 5 + 1
+    assert wa["holdout_trailing_unlabeled_bars"] == wa["label_horizon_h"] == 6
+    assert (
+        wa["holdout_ic_valid_bars"] + wa["holdout_trailing_unlabeled_bars"]
+        == wa["holdout_backtest_bars"]
+    )
+    assert wa["holdout_backtest_end"] > wa["holdout_ic_valid_end"]
 
     oof_df = pd.read_csv(oof_path, index_col=0)
     assert not oof_df.empty
@@ -157,3 +174,98 @@ def test_rule9_gate_pass_on_planted_signal_and_null_noise_check():
     report, _ = run_alpha_mining_benchmark(universe, cfg)
     oof_t = float(report["stage2_combiner_oof"]["ic_summary"]["t_stat"])
     assert oof_t < 2.0, f"Pure-noise null panel unexpectedly produced OOF t={oof_t:.2f} >= 2.0"
+
+
+def test_evaluate_arm_skips_degenerate_ic_for_constant_panel():
+    """FIX 2: arm (b)'s constant panel must yield ``ic_summary is None``, not a fake IC."""
+    dates = pd.bdate_range("2023-01-02", periods=30)
+    symbols = ["A", "B", "C", "D", "E", "F"]
+    universe = {}
+    for i, sym in enumerate(symbols):
+        closes = 100.0 + (i + 1) * np.linspace(0.0, 6.0, len(dates))
+        df = make_ohlcv_from_closes(closes)
+        df.index = dates
+        universe[sym] = df
+    scores = pd.DataFrame(1.0, index=dates, columns=symbols, dtype=float)
+    close_panel = pd.DataFrame({s: universe[s]["Close"] for s in symbols}, index=dates)
+    labels = build_forward_labels(close_panel, holding_period=5, exec_lag=1)
+
+    kwargs = dict(
+        top_n=len(symbols),
+        rebalance_every=5,
+        min_assets=3,
+        commission_pct=0.0005,
+        slippage_pct=0.0005,
+        min_shares=1,
+    )
+    arm_null = _evaluate_arm(
+        "equal_weight_universe", scores, universe, labels, compute_ic=False, **kwargs
+    )
+    assert arm_null["ic_summary"] is None
+
+    # Regression guard: the legacy path routed this constant panel through
+    # ``factor_ic_summary``, which hard-codes constant cross-sections to ic=0.0
+    # (a degenerate statistic with full n_obs). Keep that path opt-in only.
+    arm_legacy = _evaluate_arm(
+        "equal_weight_universe", scores, universe, labels, compute_ic=True, **kwargs
+    )
+    assert arm_legacy["ic_summary"] is not None
+    assert arm_legacy["ic_summary"]["mean_ic"] == 0.0
+
+    # The IC flag changes diagnostics only -- backtest outcomes are byte-identical.
+    for key in (
+        "sharpe_ratio",
+        "cagr",
+        "total_return",
+        "max_drawdown",
+        "total_turnover",
+        "total_rebalances",
+        "total_trades",
+    ):
+        assert arm_null[key] == arm_legacy[key]
+
+
+def test_rule9_gate_ignores_equal_weight_arm_ic_summary():
+    """FIX 2: the Rule-9 gate must be unchanged when arm (b)'s IC becomes ``None``."""
+    mon_clean = {
+        "adversarial_validation": {"alarm": False},
+        "importance_decay": {"alarm": False},
+        "turnover_breaker": {"alarm": False},
+    }
+    arms_core = {
+        "lgbm_top_n": {
+            "ic_summary": {"mean_ic": 0.12, "t_stat": 4.2},
+            "sharpe_ratio": 1.8,
+            "total_rebalances": 12,
+            "total_trades": 24,
+        },
+        "best_single_seed": {
+            "ic_summary": {"mean_ic": 0.05, "t_stat": 1.5},
+            "sharpe_ratio": 0.7,
+            "total_rebalances": 12,
+            "total_trades": 20,
+        },
+        "equal_weight_gp_combo": {
+            "ic_summary": {"mean_ic": 0.08, "t_stat": 2.4},
+            "sharpe_ratio": 1.2,
+            "total_rebalances": 12,
+            "total_trades": 22,
+        },
+    }
+    eq_bt = {
+        "sharpe_ratio": 1.83,
+        "total_rebalances": 73,
+        "total_trades": 350,
+    }
+    arms_null = {**arms_core, "equal_weight_universe": {"ic_summary": None, **eq_bt}}
+    arms_degenerate = {
+        **arms_core,
+        "equal_weight_universe": {
+            "ic_summary": {"mean_ic": 0.0, "t_stat": 0.0},
+            **eq_bt,
+        },
+    }
+    gate_null = evaluate_rule9_gate(arms_null, mon_clean)
+    gate_degenerate = evaluate_rule9_gate(arms_degenerate, mon_clean)
+    assert gate_null == gate_degenerate
+    assert gate_null["passed"] is True

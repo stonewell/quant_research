@@ -8,6 +8,8 @@ Timeline Isolation (Zero Selection Leakage):
 Holdout Comparison Arms (all simulated via ``run_allocation_backtest`` with friction):
 - ``(a) lgbm_top_n``: LightGBM combiner top-N equal-weight (default ``lowdin_for_combiner``)
 - ``(b) equal_weight_universe``: Equal-weight across all tradable assets in universe
+  (``ic_summary: null`` -- a constant score panel has no IC by construction, so no
+  degenerate ``ic=0.0`` is fabricated)
 - ``(c) best_single_seed``: Best seed factor chosen strictly on discovery dates
 - ``(d) equal_weight_gp_combo``: Equal-weight z-score average of discovered GP factors
   (with signed Löwdin enabled when ``lowdin_for_gp_library=True``)
@@ -141,18 +143,28 @@ def _evaluate_arm(
     *,
     top_n: int,
     rebalance_every: int,
-    warmup: int,
     min_assets: int,
     commission_pct: float,
     slippage_pct: float,
     min_shares: int,
+    compute_ic: bool = True,
 ) -> Dict[str, Any]:
-    """Run ``AlphaMiningStrategy`` + ``run_allocation_backtest`` + ``factor_ic_summary``."""
+    """Run ``AlphaMiningStrategy`` + ``run_allocation_backtest`` + ``factor_ic_summary``.
+
+    ``compute_ic=False`` is used for arms whose score panel is constant by
+    construction (e.g. ``equal_weight_universe``): ``factor_ic_summary`` would
+    hard-code constant cross-sections to ``ic=0.0`` and emit a fake
+    ``mean_ic=0.0, t_stat=0.0`` with full ``n_obs``. Such arms report
+    ``ic_summary: null`` instead of a degenerate IC.
+
+    ``warmup`` is intentionally NOT plumbed here: ``AlphaMiningStrategy`` never
+    skips leading bars from it (the holdout score panel is already pre-warmed),
+    so passing it through would be a no-op.
+    """
     strategy = AlphaMiningStrategy(
         score_panel=score_panel,
         top_n=top_n,
         rebalance_every=rebalance_every,
-        warmup=warmup,
         name=arm_name,
     )
     weights = strategy.generate_weights(holdout_universe)
@@ -165,8 +177,12 @@ def _evaluate_arm(
     )
     rebal_report = bt.get("rebalance_report", pd.DataFrame())
     n_trades = int(len(rebal_report)) if isinstance(rebal_report, pd.DataFrame) else 0
-    ic_sum = _clean_ic_summary(
-        factor_ic_summary(score_panel, holdout_labels, min_assets=min_assets)
+    ic_sum = (
+        _clean_ic_summary(
+            factor_ic_summary(score_panel, holdout_labels, min_assets=min_assets)
+        )
+        if compute_ic
+        else None
     )
     return {
         "arm": arm_name,
@@ -277,7 +293,6 @@ def run_alpha_mining_benchmark(
     gp_fallback_used = False
     gp_panels: Dict[str, pd.DataFrame] = {}
     gp_records: List[Dict[str, Any]] = []
-    max_warmup = 1
 
     if selected_factors:
         for f in selected_factors:
@@ -287,7 +302,6 @@ def run_alpha_mining_benchmark(
                 )
             else:
                 gp_panels[f.name] = f.panel.reindex(index=all_dates, columns=close.columns)
-            max_warmup = max(max_warmup, int(f.max_window))
             gp_records.append(
                 {
                     "name": f.name,
@@ -302,7 +316,6 @@ def run_alpha_mining_benchmark(
     else:
         gp_fallback_used = True
         gp_panels = dict(seed_lib)
-        max_warmup = 20
 
     # Stage 2: Purged Walk-Forward CV -> OOF strictly on combiner_dates
     cv_res = run_purged_cv_oof(
@@ -384,11 +397,42 @@ def run_alpha_mining_benchmark(
     holdout_universe = _slice_universe(universe, split.holdout_dates)
     holdout_labels = labels.loc[split.holdout_dates]
 
+    # FIX 3a diagnostics: the holdout backtest runs to the last data row, while the
+    # forward labels leave the trailing ``h = holding_period + exec_lag`` rows NaN,
+    # so the label-valid IC window stops ``h`` bars earlier than the backtest window.
+    label_row_valid = holdout_labels.notna().any(axis=1).to_numpy()
+    n_trailing_unlabeled = 0
+    for flag in label_row_valid[::-1]:
+        if flag:
+            break
+        n_trailing_unlabeled += 1
+    valid_positions = np.flatnonzero(label_row_valid)
+    if len(valid_positions) > 0:
+        ic_valid_start = str(split.holdout_dates[int(valid_positions[0])].date())
+        ic_valid_end = str(split.holdout_dates[int(valid_positions[-1])].date())
+    else:
+        ic_valid_start = None
+        ic_valid_end = None
+    window_alignment = {
+        "label_horizon_h": int(h),
+        "holdout_backtest_start": str(split.holdout_dates[0].date()),
+        "holdout_backtest_end": str(split.holdout_dates[-1].date()),
+        "holdout_backtest_bars": int(len(split.holdout_dates)),
+        "holdout_ic_valid_start": ic_valid_start,
+        "holdout_ic_valid_end": ic_valid_end,
+        "holdout_ic_valid_bars": int(label_row_valid.sum()),
+        "holdout_trailing_unlabeled_bars": int(n_trailing_unlabeled),
+        "note": (
+            "Holdout Sharpe/CAGR are simulated over the full holdout bar range, "
+            "which extends label_horizon_h bars beyond the label-valid window used "
+            "for holdout RankIC/t_stat validation."
+        ),
+    }
+
     common_bt_kwargs = dict(
         holdout_universe=holdout_universe,
         holdout_labels=holdout_labels,
         rebalance_every=cfg.holding_period,
-        warmup=max_warmup,
         min_assets=cfg.gp.min_assets,
         commission_pct=commission_pct,
         slippage_pct=slippage_pct,
@@ -402,6 +446,7 @@ def run_alpha_mining_benchmark(
             "equal_weight_universe",
             scores_b,
             top_n=len(holdout_universe),
+            compute_ic=False,
             **common_bt_kwargs,
         ),
         "best_single_seed": _evaluate_arm(
@@ -513,6 +558,7 @@ def run_alpha_mining_benchmark(
             "ic_summary": oof_ic,
         },
         "holdout_arms": arms,
+        "window_alignment": window_alignment,
         "monitoring": monitoring_report,
         "rule9_gate": gate,
     }

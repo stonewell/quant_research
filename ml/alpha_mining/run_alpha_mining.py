@@ -207,8 +207,14 @@ def main(argv: list[str] | None = None) -> int:
     print("\n=== Holdout 5-Arm Comparison ===")
     for arm_key, arm in report["holdout_arms"].items():
         ic_s = arm["ic_summary"]
+        # Arm (b) (equal-weight universe) is a constant panel and reports ic_summary: null.
+        ic_txt = (
+            "IC=n/a      (no IC)  "
+            if ic_s is None
+            else f"IC={ic_s['mean_ic']:+.4f} (t={ic_s['t_stat']:+.2f})"
+        )
         print(
-            f"  {arm_key:24s} | IC={ic_s['mean_ic']:+.4f} (t={ic_s['t_stat']:+.2f}) "
+            f"  {arm_key:24s} | {ic_txt} "
             f"| Sharpe={arm['sharpe_ratio']:+.2f} | CAGR={arm['cagr']*100:+.1f}% "
             f"| Rebal={arm['total_rebalances']} Trades={arm['total_trades']}"
         )

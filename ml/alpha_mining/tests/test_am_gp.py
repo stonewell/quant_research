@@ -187,3 +187,48 @@ def test_gp_rejects_degenerate_constant_and_terminal_only():
         assert not f.node.is_terminal()
         assert f.node_count > 1
         assert np.isfinite(f.fitness)
+
+
+def test_gp_validity_mask_drops_neutral_fills_for_nonfinite_inputs():
+    """A cell whose input terminal is non-finite must be NaN, never a fabricated 0.5/0.0.
+
+    ``common/alpha101_operators.cs_rank`` fills missing cells with 0.5 and ``ts_*``
+    operators fill with 0.0. When ``close`` is finite but ``volume`` is NaN the cell is
+    tradable (availability mask True), so only the per-node validity mask can prevent the
+    fabricated neutral value from entering GP fitness/IC.
+    """
+    ohlcv = _make_synthetic_ohlcv(n_dates=40, n_syms=6, seed=31)
+    # Row 20 / column S2: close stays finite, but volume is non-finite.
+    ohlcv["volume"].iloc[20, 2] = np.nan
+
+    terminals, avail = build_terminals(ohlcv)
+    assert bool(avail.iloc[20, 2]) is True
+    assert np.isnan(terminals["volume"].iloc[20, 2])
+
+    # (a) direct cross-sectional rank of volume
+    rank_node = GPNode(op="cs_rank", children=(GPNode(op="term", value="volume"),))
+    ranked = evaluate_node(rank_node, terminals, avail)
+    assert np.isnan(ranked.iloc[20, 2]), "cs_rank NaN fill (0.5) must not survive"
+    # Sibling cells in the same row/column remain valid
+    assert np.isfinite(ranked.iloc[20, 3])
+    assert np.isfinite(ranked.iloc[19, 2])
+
+    # (b) NaN propagated through a nested derived node, then cross-sectionally ranked
+    nested_rank = GPNode(
+        op="cs_rank",
+        children=(
+            GPNode(
+                op="div",
+                children=(
+                    GPNode(op="term", value="volume"),
+                    GPNode(op="term", value="open"),
+                ),
+            ),
+        ),
+    )
+    out = evaluate_node(nested_rank, terminals, avail)
+    # div(volume, open) is NaN at the bad cell; cs_rank must not fabricate 0.5 there
+    assert np.isnan(out.iloc[20, 2])
+    assert np.isfinite(out.iloc[20, 3])
+    assert np.isfinite(out.iloc[19, 2])
+    assert not np.isinf(out.to_numpy(dtype=float)).any()

@@ -13,6 +13,15 @@ Sparse Weights & NaN vs 0.0 Contract:
   equal weight ``1 / M`` (row sum <= 1.0), and **every excluded symbol is
   written as an explicit ``0.0``** so the backtester never silently carries
   forward a stale position.
+
+Warmup Semantics (deliberately asymmetric -- do not "fix"):
+- ``warmup`` ONLY feeds :meth:`warmup_bars`, which external callers (e.g.
+  ``common.allocation_search.run_walkforward``) use to prepend a warmup fold
+  buffer before scoring a fold.
+- :meth:`generate_weights` deliberately NEVER consumes ``warmup`` / never skips
+  leading bars: the score panel it consumes is already pre-warmed over the full
+  history, and the caller has already buffered the fold. Skipping again here
+  would double-count the warmup.
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ from common.allocation_templates import AllocationTemplate, _get_master_index
 class AlphaMiningStrategy(AllocationTemplate):
     """Equal-weight top-N cross-sectional allocation driven by a precomputed ML1 score panel."""
 
-    version: str = "1.0.0"
+    version: str = "1.1.0"
 
     def __init__(
         self,
@@ -69,8 +78,19 @@ class AlphaMiningStrategy(AllocationTemplate):
         universe : Dict[str, pd.DataFrame]
             Symbol -> OHLCV DataFrame mapping.
         params : Optional[dict]
-            Optional overrides: ``score_panel``, ``top_n``, ``rebalance_every``
-            (or ``holding_period``), ``warmup_bars``.
+            Optional overrides actually read here: ``score_panel``, ``top_n``,
+            ``rebalance_every`` (or ``holding_period``). ``warmup_bars`` is NOT
+            read -- see the note below.
+
+        Notes
+        -----
+        ``warmup`` is intentionally a ``warmup_bars()``-only knob: it exists so
+        external walkforward drivers can prepend a fold warmup buffer
+        (``common/allocation_search.py``'s ``run_walkforward`` already does
+        this). This method deliberately starts rebalancing at the first bar
+        with finite tradable scores and never skips leading bars from
+        ``warmup``, because the score panel is pre-warmed over full history and
+        skipping again would double-count the warmup.
 
         Returns
         -------
@@ -116,7 +136,11 @@ class AlphaMiningStrategy(AllocationTemplate):
         close_arr = closes.to_numpy(dtype=float)
         tradable_scored = np.isfinite(score_arr) & np.isfinite(close_arr) & (close_arr > 0.0)
 
-        # Start rebalancing on the first bar that has at least one tradable scored asset
+        # Start rebalancing on the first bar that has at least one tradable scored asset.
+        # NOTE: ``self._warmup_bars`` is deliberately NOT applied here -- it only
+        # feeds ``warmup_bars()`` for external walkforward fold buffering, and the
+        # score panel is pre-warmed over full history. Skipping again would
+        # double-count the warmup already prepended by ``run_walkforward``.
         valid_bar_positions = np.flatnonzero(tradable_scored.any(axis=1))
         if len(valid_bar_positions) == 0:
             return weights

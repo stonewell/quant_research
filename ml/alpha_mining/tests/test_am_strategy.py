@@ -2,7 +2,7 @@
 
 100% offline: uses synthetic universes and precomputed score panels only.
 Verifies sparse weights contract, explicit 0.0 for excluded symbols,
-semantic version == "1.0.0", and ZERO lightgbm import dependency.
+semantic version == "1.1.0", and ZERO lightgbm import dependency.
 """
 
 import builtins
@@ -54,7 +54,7 @@ def test_strategy_imports_without_lightgbm(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _block_lgb)
     try:
         mod = importlib.import_module("amine.strategy")
-        assert mod.AlphaMiningStrategy.version == "1.0.0"
+        assert mod.AlphaMiningStrategy.version == "1.1.0"
         assert "lightgbm" not in sys.modules
     finally:
         # Restore original module state cleanly
@@ -73,9 +73,9 @@ def test_strategy_sparse_weights_explicit_zeros_and_cadence():
     scores.iloc[10:] = [1.0, 2.0, 8.0, 10.0]    # top-2: D, C (A, B now excluded -> explicit 0.0)
 
     strat = AlphaMiningStrategy(score_panel=scores, top_n=2, rebalance_every=5, warmup=10)
-    assert strat.version == "1.0.0"
+    assert strat.version == "1.1.0"
     assert strat.warmup_bars() == 10
-    assert "AlphaMiningStrategy v1.0.0" in strat.explain_weights()
+    assert "AlphaMiningStrategy v1.1.0" in strat.explain_weights()
 
     weights = strat.generate_weights(universe)
     expected_rebal_pos = {2, 7, 12, 17}
@@ -100,3 +100,35 @@ def test_strategy_sparse_weights_explicit_zeros_and_cadence():
         else:
             # Strict sparse weights: non-rebalance days are all NaN (no ffill)
             assert row.isna().all()
+
+
+def test_warmup_does_not_skip_leading_bars():
+    """``warmup`` is a ``warmup_bars()``-only knob: it must NOT move the first rebalance bar.
+
+    INTENTIONAL: ``generate_weights`` never skips leading bars from ``warmup`` because the
+    score panel is pre-warmed over full history and ``common.allocation_search.run_walkforward``
+    already prepends a warmup fold buffer -- skipping again would double-count the warmup.
+    """
+    from amine.strategy import AlphaMiningStrategy
+
+    universe, dates = _make_universe(n_dates=20, symbols=("A", "B", "C", "D"))
+    scores = pd.DataFrame(np.nan, index=dates, columns=["A", "B", "C", "D"], dtype=float)
+    # First bar with finite scores is index 3; keep all later bars scored.
+    scores.iloc[3:] = [4.0, 3.0, 2.0, 1.0]
+
+    w_no_warmup = AlphaMiningStrategy(
+        score_panel=scores, top_n=2, rebalance_every=4, warmup=0
+    )
+    w_warmup_10 = AlphaMiningStrategy(
+        score_panel=scores, top_n=2, rebalance_every=4, warmup=10
+    )
+    assert w_warmup_10.warmup_bars() == 10
+
+    weights_0 = w_no_warmup.generate_weights(universe)
+    weights_10 = w_warmup_10.generate_weights(universe)
+
+    expected_first = dates[3]
+    assert weights_0.first_valid_index() == expected_first
+    assert weights_10.first_valid_index() == expected_first
+    # Identical sparse panels: warmup changes nothing in weight generation.
+    pd.testing.assert_frame_equal(weights_0, weights_10)

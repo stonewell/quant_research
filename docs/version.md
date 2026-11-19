@@ -6877,3 +6877,90 @@ Stage-1 报告取归档原文件。**输出只写 `/tmp/opencode/vsB_*/`，未�
 - `pipeline/.venv` 隔离校验：退出码 0（`find_spec("lightgbm") is None`）。
 - 端到端合成冒烟：`run_alpha_mining.py --data-provider synthetic --gp-population 30 --gp-generations 3 --n-splits 3`
   退出码 0，正常写出报告与 OOF 评分面板；独立只读审查零可执行缺陷。
+
+## 49. ML1 三处审计修复：`warmup` 死参数、基线臂退化 IC、`cs_rank` 中性填充残留（`AlphaMiningStrategy` `1.0.0 → 1.1.0`，2026-11-19）
+
+> **本节编号**：接续 §48，仅追加于文件末尾；§1–§48 一字未改。
+> 变更范围严格限定在 `ml/alpha_mining/**` 与 `ml/alpha_mining/README.md`，未触碰 `pipeline/`、
+> `backtester/`、`common/alpha101_operators.py`、`common/factor_analyzer.py` 或任何实盘路径。
+> 任务台账见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.23（`ML1`）。
+
+### 49.1 版本轴与变更范围
+
+| 目标 | 旧版本 | 新版本 | 说明 |
+| :--- | :---: | :---: | :--- |
+| `AlphaMiningStrategy` (`ml/alpha_mining/amine/strategy.py`) | **`1.0.0`** | **`1.1.0`** | 文档/语义澄清（`warmup` 仅服务 `warmup_bars()`），权重生成逻辑零改动 |
+| `common/alpha101_operators.py` | 无版本轴 | 无版本轴（**未改**） | 共享算子文件严格不动；`cs_rank` 的 `fillna(0.5)` 保留原语义 |
+| `common/factor_analyzer.py` | 无版本轴 | 无版本轴（**未改**） | 常量截面固定 `ic=0.0` 的既有口径不动，改由调用方显式 opt-out |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.1.0` | `2.1.0`（不变） | 未触碰 blend 引擎与实盘路径 |
+
+- **未触发 `--dump-strategies`**：`grep -n "alpha_mining\|AlphaMining" pipeline/research_strategy/strategies_config.json`
+  零命中，即 `AlphaMiningStrategy` 仍未接入 `strategies_config.json` / `common/strategy_spec.py` /
+  `run_screener.py` / `backtester/` / `scripts/run_live_strategy.py`；因此不重跑 dump，现网
+  `strategy_dumps/*.json` 保持零改动（避免上一轮已发生的「部署模式被静默改写」回归）。
+- **版本断言同步**：`common/tests/test_strategy_versioning.py` 与
+  `pipeline/research_strategy/tests/test_blend_strategy_versioning.py` 中**不存在** ML1 /
+  `AlphaMiningStrategy` / `alpha_mining` 的任何断言（逐文件 grep 零命中），故无需修改；
+  ML1 自身的版本断言在 `ml/alpha_mining/tests/test_am_strategy.py`、`tests/test_am_cli.py` 内同步更新。
+
+### 49.2 三处修复的量化与信号逻辑
+
+1. **`warmup` 死参数（仅文档/语义修复，零行为变更）**：
+   - 事实口径：`amine/benchmark.py` 旧代码把 `max_warmup` 作为构造参数传入 `AlphaMiningStrategy`，
+     但 `generate_weights()` 从不读取 `_warmup_bars`，且该路径下 `warmup_bars()` 从不被调用；
+     `max_warmup` 也**未写入**报告 JSON（仅用于构造函数调用）。故直接删除该段无用管线
+     （`max_warmup` 计算、`_evaluate_arm(..., warmup=...)` 形参、`common_bt_kwargs["warmup"]`），
+     而非保留一个 no-op。**未删除** `stage1_gp.factors[*].max_window`（这是每因子诊断字段，继续保留）。
+   - **明确不做**「首部跳过」：`common/allocation_search.py` 的 `run_walkforward` 已前置 warmup 折叠缓冲，
+     若 `generate_weights` 再次按 `warmup` 跳行即**双重计量**。因此只澄清 `generate_weights` 的
+     `params` 覆盖清单（真实读取 `score_panel` / `top_n` / `rebalance_every` 或 `holding_period`），
+     并在类注释、方法 docstring、首根有效 bar 处三处写明该不对称语义。
+2. **基线臂 (b) 退化 IC（`equal_weight_universe`）**：
+   - 事实口径：该臂 `scores_b` 是常量 `1.0` 面板，旧代码仍调用 `factor_ic_summary`，
+     由 `common/factor_analyzer.py` 的常量截面硬编码分支产出伪造的 `mean_ic=0.0, t_stat=0.0`
+     且 `n_obs=355`（满覆盖）。现改为 `_evaluate_arm(..., compute_ic: bool = True)`，
+     对 `equal_weight_universe` 传 `compute_ic=False`，报告输出 `ic_summary: null`（显式 `null`，
+     不省略字段）。
+   - 消费方加固：`run_alpha_mining.py` 的五臂打印循环对 `None` 输出 `IC=n/a`，不再抛
+     `TypeError`；`evaluate_rule9_gate` **行为零改动**（只读 a/c/d 三臂）。
+3. **`cs_rank` 中性填充残留（`amine/gp.py` 逐节点有效性掩码）**：
+   - 事实口径：`cs_rank` 的 `fillna(0.5)`（以及 `cs_zscore`/`ts_corr` 的 `fillna(0.0)`）会为
+     **输入非有限**的单元格伪造中性分位；`build_terminals` 的可用性掩码只按 `Close` 是否有限判定，
+     因此「`close` 有限、但 `volume`/`open`/`high`/`low` 为 `NaN`」的单元格仍可把 0.5 喂进 GP 适应度/IC。
+   - 修复：在 `evaluate_node` 中贯穿**逐节点有效性掩码**——终端节点掩码为 `isfinite(terminal)`，
+     派生节点掩码为其面板子节点掩码的 AND（再与该节点自身的有限性 AND）；`_sanitize_panel` 新增
+     `input_validity` 参数，在 `±inf -> NaN` 与 `Close` 可用性掩码之上把无效输入单元格强制置 `NaN`。
+     算子语义（含 `cs_rank` 的 0.5 填充）一律保留，`common/alpha101_operators.py` 未改。
+     注意该掩码**只做收紧**：不会填补任何既有 `NaN`，符号方向与常驻基座完全不变。
+
+### 49.3 验证结果（100% 离线合成数据，Rule 1）
+
+`cd ml/alpha_mining && uv run pytest tests -q -m "not slow"`：**38 passed**（基线 34 passed + 4 个新增
+用例：`warmup` 不移动首根调仓 bar、臂 (b) `ic_summary is None` 且回测指标与旧路径逐字段一致、
+Rule-9 门禁对臂 (b) IC 为 `None`/退化值的结果完全等价、`cs_rank` 非有限输入单元格必须为 `NaN`）。
+`pipeline/.venv/bin/python -m pytest common/tests/test_alpha101_operators.py -q`：**10 passed**（零失败）。
+
+Rule-9 端到端同种子（`--data-provider synthetic --small-data --seed 42`）修复前 / 修复后对比：
+
+| 指标 | 修复前 | 修复后 |
+| :--- | :---: | :---: |
+| `lgbm_top_n` holdout RankIC | `+0.0367 (t=+2.30)` | `+0.0367 (t=+2.30)` |
+| `equal_weight_universe` RankIC | `+0.0000 (t=+0.00)`（伪造，`n_obs=355`） | **`null`** |
+| `best_single_seed` RankIC | `+0.0255 (t=+1.68)` | `+0.0255 (t=+1.68)` |
+| `equal_weight_gp_combo` RankIC | `+0.0139 (t=+0.87)` | `+0.0139 (t=+0.87)` |
+| `lgbm_lowdin_on` RankIC | `+0.0562 (t=+3.72)` | `+0.0562 (t=+3.72)` |
+| 五臂 Sharpe / CAGR (%) | `1.84/14.0`、`1.83/9.3`、`1.41/10.4`、`1.04/8.1`、`1.29/9.3` | 逐字段完全相同 |
+| 五臂 调仓/成交 笔数 | `73`；`401/350/360/330/396` | 逐字段完全相同 |
+| Stage-2 OOF `mean_ic` / `t_stat` / `ic_ir` / `n_obs` | `-0.0036` / `-0.31` / `-0.20` / `616` | 逐字段完全相同 |
+| Rule-9 门禁 | `FAIL`（唯一失败项 `no_monitoring_alarm`） | `FAIL`（检查项逐项相同） |
+| Stage-1 `gp_03` 发现期 IC `n_obs` / `mean_ic` | `812` / `0.016049` | `811` / `0.016069` |
+
+- **预期漂移解释**：唯一数值变化来自修复 3——`gp_03 = ts_sum(ts_corr(open, returns, 40), 40)` 在
+  `returns` 首行为 `NaN` 的边界单元格上，旧代码把 `ts_corr` 的伪造 `0.0` 继续计入 `ts_sum`；
+  收紧后该单元格为 `NaN`，发现期有效观测由 `812` 降为 `811`（−0.12%），该因子发现期 IC 因此
+  微升 `+0.00002`。**五因子表达式、选择顺序、Stage-2 OOF 与五臂 holdout 全部逐字段不变**，
+  即非退化成立；合成数据中 `close` 有限而其他 OHLCV 非有限的单元格极少，故全局影响可忽略。
+- **窗口口径留痕（诊断，无窗口变更）**：报告新增 `window_alignment` 块——`holdout_backtest_bars=361`、
+  `holdout_ic_valid_bars=355`、`holdout_trailing_unlabeled_bars=6`（恒等于 `h = k + exec_lag = 5 + 1`），
+  并记录两窗首末日（回测 `2023-08-15 → 2024-12-31`，IC 有效 `2023-08-15 → 2024-12-23`）。
+  即 holdout Sharpe/CAGR 比 IC/`t_stat` 验证多覆盖 6 根 bar；README 已同步说明。

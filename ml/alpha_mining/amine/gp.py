@@ -14,7 +14,14 @@ Critical Safeguards:
    emit ``inf`` on constant windows. Every node evaluation immediately maps
    ``±inf -> NaN`` and re-applies the tradability availability mask
    (``NaN`` where ``Close`` is ``NaN``) so untradable assets never get
-   fabricated values.
+   fabricated values. Additionally a **per-node validity mask** is threaded
+   through the tree: a terminal's mask is ``isfinite(terminal)``, a derived
+   node's mask is the AND of its children's masks (further AND-ed with the
+   node's own finiteness). Any cell whose contributing inputs were non-finite
+   is therefore re-set to ``NaN``, even when the shared alpha101 operator
+   fabricated a neutral fill (``cs_rank`` -> 0.5, ``cs_zscore`` -> 0.0). This
+   matters when, e.g., ``volume`` is NaN while ``close`` is finite: the cell is
+   tradable, but any expression consuming ``volume`` there is not.
 2. **Causal prefix-invariance**: every terminal and operator is strictly
    backward-looking or same-day cross-sectional, so perturbing future rows
    never alters past node outputs.
@@ -25,7 +32,7 @@ Critical Safeguards:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -241,11 +248,20 @@ def _sanitize_panel(
     avail_arr: np.ndarray,
     index: pd.Index,
     columns: pd.Index,
+    input_validity: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
-    """Map ±inf -> NaN and re-apply the tradability availability mask."""
+    """Map ±inf -> NaN, re-apply the tradability mask, and drop invalid-input cells.
+
+    ``input_validity`` carries the AND of the contributing children's validity
+    masks; cells where any contributing input was non-finite are forced to
+    ``NaN`` so an operator's neutral fill (``cs_rank`` -> 0.5,
+    ``cs_zscore`` -> 0.0) can never masquerade as a real percentile/value.
+    """
     arr = df.to_numpy(dtype=float, copy=True)
     arr[~np.isfinite(arr)] = np.nan
     arr[~avail_arr] = np.nan
+    if input_validity is not None:
+        arr[~input_validity] = np.nan
     return pd.DataFrame(arr, index=index, columns=columns)
 
 
@@ -256,23 +272,48 @@ def evaluate_node(
     *,
     op_table: Optional[Mapping[str, OpSpec]] = None,
 ) -> pd.DataFrame:
-    """Evaluate a GP expression tree, sanitizing NaN/inf after every node."""
+    """Evaluate a GP expression tree, sanitizing NaN/inf after every node.
+
+    Validity masks are threaded through the recursion: ``terminal`` masks are
+    ``isfinite(terminal)`` and derived-node masks are the AND of their panel
+    children's masks (AND-ed with the node's own finiteness after sanitizing).
+    This keeps neutral operator fills from re-introducing fabricated values on
+    cells whose contributing inputs were non-finite (e.g. ``volume`` NaN while
+    ``close`` is finite).
+    """
     table = op_table if op_table is not None else OPERATOR_TABLE
     avail_arr = availability_mask.to_numpy(dtype=bool)
     index = availability_mask.index
     columns = availability_mask.columns
 
     def _eval(n: GPNode):
+        """Return ``(panel_or_window, validity_mask_or_None)`` for ``n``."""
         if n.is_window():
-            return int(n.value)  # type: ignore[arg-type]
+            return int(n.value), None  # type: ignore[arg-type]
         if n.is_terminal():
-            return terminals[str(n.value)]
+            panel = terminals[str(n.value)]
+            return panel, np.isfinite(panel.to_numpy(dtype=float))
         spec = table[n.op]
-        args = [_eval(c) for c in n.children]
+        args: List[Any] = []
+        child_masks: List[np.ndarray] = []
+        for c in n.children:
+            value, mask = _eval(c)
+            args.append(value)
+            if mask is not None:
+                child_masks.append(mask)
         raw = spec.fn(*args)
-        return _sanitize_panel(raw, avail_arr, index, columns)
+        input_validity = None
+        if child_masks:
+            input_validity = child_masks[0]
+            for mask in child_masks[1:]:
+                input_validity = input_validity & mask
+        panel = _sanitize_panel(
+            raw, avail_arr, index, columns, input_validity=input_validity
+        )
+        return panel, np.isfinite(panel.to_numpy(dtype=float))
 
-    return _eval(node)
+    panel, _ = _eval(node)
+    return panel
 
 
 # ---------------------------------------------------------------------------

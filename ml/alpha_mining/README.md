@@ -62,8 +62,14 @@ All 12 core time-series/cross-sectional operators (`ts_sum`, `ts_std`,
 `ts_delta`, `ts_mean`, `ts_min`, `ts_max`, `cs_scale`, `cs_indneutralize`,
 `sigmoid`, and `signed_log` are imported directly from
 `common/alpha101_operators.py` without reimplementation. Every GP node
-immediately maps `±inf -> NaN` and re-applies the tradability availability mask
-(`Close` finite) so untradable assets never receive fabricated values.
+immediately maps `±inf -> NaN`, re-applies the tradability availability mask
+(`Close` finite), and applies a **per-node validity mask**: a terminal's mask is
+`isfinite(terminal)`, a derived node's mask is the AND of its panel children's
+masks (further AND-ed with the node's own finiteness). Cells whose contributing
+inputs were non-finite are therefore forced to `NaN` even when a shared operator
+fabricated a neutral fill (`cs_rank` -> 0.5, `cs_zscore`/`ts_corr` -> 0.0). This
+matters when, e.g., `volume` is NaN while `close` is finite: the cell is
+tradable, but any expression consuming `volume` there is not.
 
 | File | Responsibility |
 | :--- | :--- |
@@ -75,19 +81,42 @@ immediately maps `±inf -> NaN` and re-applies the tradability availability mask
 | `amine/fitness.py` | Vectorized `fast_rank_ic` (parity with `compute_rank_ic` to `1e-10`), daily IR fitness, turnover/correlation penalties, greedy top-K |
 | `amine/combiner.py` | Native `lightgbm.train` (`lambdarank` / `regression`), fixed boost rounds, `run_purged_cv_oof`, `fit_predict_holdout` |
 | `amine/monitoring.py` | Report-only v1 diagnostics: Mann-Whitney adversarial validation (`AUC > 0.70`), importance decay, 20d turnover breaker (`> 0.30/day`) |
-| `amine/strategy.py` | Standalone `AlphaMiningStrategy(AllocationTemplate)` (`version = "1.0.0"`), **zero `lightgbm` imports**, strict sparse weights |
+| `amine/strategy.py` | Standalone `AlphaMiningStrategy(AllocationTemplate)` (`version = "1.1.0"`), **zero `lightgbm` imports**, strict sparse weights |
 | `amine/benchmark.py` | 5-arm holdout comparison via `run_allocation_backtest` + `factor_ic_summary` and Rule-9 empirical gate |
 | `run_alpha_mining.py` | Offline-default CLI writing `alpha_mining_report.json` and `oof_scores.csv` |
 
-## Standalone `AlphaMiningStrategy` (`version = "1.0.0"`)
+## Standalone `AlphaMiningStrategy` (`version = "1.1.0"`)
 
 `amine/strategy.py` exposes `AlphaMiningStrategy(AllocationTemplate)` with
-`version = "1.0.0"` and **zero `lightgbm` imports** (even transitively, thanks
+`version = "1.1.0"` and **zero `lightgbm` imports** (even transitively, thanks
 to lazy PEP 562 `__getattr__` in `amine/__init__.py`). It consumes a precomputed
 OOF/holdout score panel without in-backtest training, rebalances every `k`
 trading bars to equal-weight top-N (`1/M`, sum `<= 1.0`), writes **explicit
 `0.0`** for excluded symbols on rebalance rows, and leaves non-rebalance rows
 strictly `NaN` (no `ffill`).
+
+`warmup` is a `warmup_bars()`-only knob: it exists so external walkforward
+drivers can prepend a fold warmup buffer (`common/allocation_search.py`'s
+`run_walkforward` already does this). `generate_weights` deliberately does
+**not** skip leading bars from `warmup` -- the score panel is pre-warmed over
+full history, so skipping again would double-count the warmup.
+
+### Holdout Window vs. IC Window (disclosed mismatch)
+
+The holdout backtest window runs to the last data row, while forward labels
+leave the trailing `h = holding_period + exec_lag` rows `NaN`. Holdout
+Sharpe/CAGR therefore cover `h` bars more than the holdout RankIC/`t_stat`
+validation window. The report's `window_alignment` block makes this explicit
+(`holdout_backtest_bars`, `holdout_ic_valid_bars`, `holdout_trailing_unlabeled_bars`,
+plus first/last dates for each window); the trailing-unlabeled count always
+equals `holding_period + exec_lag`. The window itself is intentionally unchanged.
+
+### Holdout Arm (b) IC
+
+`equal_weight_universe` uses a constant score panel, so its `holdout_arms`
+entry reports `ic_summary: null` instead of a degenerate
+`mean_ic=0.0 / t_stat=0.0` fabricated by `factor_ic_summary`'s constant-input
+handling. The Rule-9 gate only reads arms (a)/(c)/(d) and is unaffected.
 
 ## CLI Usage (100% Offline Synthetic Default)
 
