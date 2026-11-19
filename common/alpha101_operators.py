@@ -269,3 +269,45 @@ def ternary(cond: Union[pd.DataFrame, pd.Series],
 
     res = np.where(bool_mask, val_a, val_b)
     return pd.DataFrame(res, index=cond_df.index, columns=cond_df.columns)
+
+
+def _wrap_like(
+    x: Union[pd.DataFrame, pd.Series, np.ndarray],
+    values: np.ndarray,
+) -> Union[pd.DataFrame, pd.Series, np.ndarray]:
+    """Wrap a numpy result back into the input container type and axes."""
+    if isinstance(x, pd.DataFrame):
+        return pd.DataFrame(values, index=x.index, columns=x.columns)
+    if isinstance(x, pd.Series):
+        return pd.Series(values, index=x.index, name=x.name)
+    return values
+
+
+def sigmoid(
+    x: Union[pd.DataFrame, pd.Series, np.ndarray],
+) -> Union[pd.DataFrame, pd.Series, np.ndarray]:
+    """Element-wise numerically stable logistic sigmoid: 1 / (1 + exp(-x)).
+
+    Uses ``exp(-|x|)`` so both positive and negative extreme inputs (e.g. ±1000)
+    evaluate without overflow warnings. Preserves input container type, axes,
+    and ``NaN`` entries (deliberately not zero-filled).
+    """
+    a = np.asarray(x, dtype=float)
+    e = np.exp(-np.abs(a))
+    out = np.where(a >= 0.0, 1.0 / (1.0 + e), e / (1.0 + e))
+    return _wrap_like(x, out)
+
+
+def signed_log(
+    x: Union[pd.DataFrame, pd.Series, np.ndarray],
+) -> Union[pd.DataFrame, pd.Series, np.ndarray]:
+    """Element-wise signed log transform: sign(x) * log(1 + |x|).
+
+    Odd, strictly monotone, smooth at zero (``signed_log(0) == 0``), and
+    compresses heavy-tailed factor distributions without discarding sign.
+    Preserves input container type, axes, and ``NaN`` entries (deliberately
+    not zero-filled).
+    """
+    a = np.asarray(x, dtype=float)
+    out = np.sign(a) * np.log1p(np.abs(a))
+    return _wrap_like(x, out)

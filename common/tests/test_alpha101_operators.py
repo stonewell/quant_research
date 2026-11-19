@@ -21,6 +21,8 @@ from common.alpha101_operators import (
     cs_rank,
     cs_scale,
     cs_zscore,
+    sigmoid,
+    signed_log,
     signed_power,
     ternary,
     ts_argmax,
@@ -182,4 +184,87 @@ def test_vwap_proxy_with_and_without_vwap():
     assert res_partial.loc[dates[1], "A"] == 11.5
     assert res_partial.loc[dates[0], "B"] == 20.2
     assert res_partial.loc[dates[1], "B"] == typical.loc[dates[1], "B"]
+
+
+def test_sigmoid_properties_and_stability():
+    import warnings
+
+    dates = pd.bdate_range("2023-01-01", periods=4)
+    df = pd.DataFrame(
+        {
+            "A": [0.0, 1000.0, -1000.0, np.nan],
+            "B": [2.5, -2.5, 0.75, -0.75],
+        },
+        index=dates,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = sigmoid(df)
+
+    assert isinstance(out, pd.DataFrame)
+    assert out.index.equals(df.index)
+    assert out.columns.equals(df.columns)
+    assert np.isclose(out.loc[dates[0], "A"], 0.5)
+    assert np.isclose(out.loc[dates[1], "A"], 1.0)
+    assert np.isclose(out.loc[dates[2], "A"], 0.0)
+    assert np.isnan(out.loc[dates[3], "A"])
+
+    # Symmetry: s(x) + s(-x) == 1
+    out_neg = sigmoid(-df)
+    valid = df.notna()
+    np.testing.assert_allclose(
+        (out + out_neg).to_numpy()[valid.to_numpy()],
+        1.0,
+        atol=1e-12,
+    )
+
+    # Series input preserves Series type, index, name, and NaNs
+    s = pd.Series([0.0, 1000.0, -1000.0, np.nan], index=dates, name="sig_s")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        s_out = sigmoid(s)
+    assert isinstance(s_out, pd.Series)
+    assert s_out.index.equals(s.index)
+    assert s_out.name == "sig_s"
+    assert np.isclose(s_out.iloc[0], 0.5)
+    assert np.isclose(s_out.iloc[1], 1.0)
+    assert np.isclose(s_out.iloc[2], 0.0)
+    assert np.isnan(s_out.iloc[3])
+
+
+def test_signed_log_properties():
+    dates = pd.bdate_range("2023-01-01", periods=5)
+    df = pd.DataFrame(
+        {
+            "A": [-10.0, -1.0, 0.0, 1.0, 10.0],
+            "B": [np.nan, -0.25, 0.5, 3.0, 100.0],
+        },
+        index=dates,
+    )
+    out = signed_log(df)
+    assert isinstance(out, pd.DataFrame)
+    assert out.index.equals(df.index)
+    assert out.columns.equals(df.columns)
+
+    # NaN preserved
+    assert np.isnan(out.loc[dates[0], "B"])
+
+    # Odd function: signed_log(-x) == -signed_log(x)
+    out_neg = signed_log(-df)
+    valid = df.notna().to_numpy()
+    np.testing.assert_allclose(out_neg.to_numpy()[valid], -out.to_numpy()[valid], atol=1e-12)
+
+    # Equals log1p(x) for x >= 0
+    non_neg = df["A"] >= 0.0
+    np.testing.assert_allclose(
+        out.loc[non_neg, "A"].to_numpy(),
+        np.log1p(df.loc[non_neg, "A"].to_numpy()),
+        atol=1e-12,
+    )
+
+    # Strictly monotone on sorted strictly increasing values
+    diffs = np.diff(out["A"].to_numpy())
+    assert np.all(diffs > 0.0)
+
 
