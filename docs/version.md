@@ -6810,3 +6810,70 @@ Stage-1 报告取归档原文件。**输出只写 `/tmp/opencode/vsB_*/`，未�
   （`rs/config.py`、`chan_four_state_blend.py`、`run_live_multi_strategy.py`）与
   `web/livetrading/tests/test_multi_strategy_intraday_5m.py` 的一处历史注释（该套件归属另一批次，
   本轮不改）。没有任何可执行代码再引用这六个键。
+
+## 48. 新增 ML1 独立子项目 `ml/alpha_mining` 与 `AlphaMiningStrategy`（`version = 1.0.0`，2026-11-18）
+
+> **本节编号**：接续 §47，仅追加于文件末尾；§1–§47 一字未改。
+> 任务台账与验收记录见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.23（`ML1`）。
+
+### 48.1 版本轴与变更范围
+
+| 目标 | 旧版本 | 新版本 | 说明 |
+| :--- | :---: | :---: | :--- |
+| `AlphaMiningStrategy` (`ml/alpha_mining/amine/strategy.py`) | —（新增） | **`1.0.0`** | 独立 `AllocationTemplate` 子类，消费预计算评分面板，零 `lightgbm` 依赖 |
+| `common/alpha101_operators.py` | 无版本轴 | — | 仅追加 `sigmoid(x)` 与 `signed_log(x)` 两条纯函数，未改任何既有算子 |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.1.0` | `2.1.0`（不变） | 未触碰 `pipeline/`、`blend_base.py`、`strategies_config.json` 或实盘路径 |
+
+- **未触发 `--dump-strategies`**：`AlphaMiningStrategy` 尚未接入 `common/strategy_spec.py`、
+  `strategies_config.json`、`run_screener.py`、`backtester/` 或 `scripts/run_live_strategy.py`，
+  对现网 58 份 `strategy_dumps/*.json` 与所有既有回测结果保持零改动。
+
+### 48.2 核心量化与工程设计
+
+1. **隔离 `uv` 环境（`ml/alpha_mining/pyproject.toml`）**：
+   - 与 `ml/bnn_forecaster` 同构，独立管理 `lightgbm>=4.3`（搭配 `pandas`/`numpy`/`scipy`/`duckdb`/`yfinance`，
+     零 `scikit-learn`/`DEAP`/`gplearn`），`pipeline/.venv` 严格不含 `lightgbm`。
+   - `amine/__init__.py` 仅急切导入纯标准库 `amine.config`，并通过 PEP 562 `__getattr__` 延迟加载
+     `AlphaMiningStrategy`，确保 `import amine.strategy` 在未安装 `lightgbm` 的环境中仍可安全执行。
+2. **算子层复用与补齐（`common/alpha101_operators.py`）**：
+   - 追加数值稳定 `sigmoid(x)`（基于 `exp(-|x|)`，对 `±1000` 零溢出告警）与 `signed_log(x)`
+     （`sign(x) * log1p(|x|)`），严格保留 `DataFrame`/`Series`/`ndarray` 类型、轴索引与 `NaN`。
+   - Stage-1 GP 直接复用 `common/alpha101_operators.py` 的全部 12 项核心算子与 `ts_*`/`cs_*` 原语，
+     且在每个树节点后执行 `±inf -> NaN` 映射并重套 `Close` 有效交易掩码，防止 `cs_rank`（填 `0.5`）
+     或 `cs_zscore`/`ts_corr`（填 `0.0` 或产出 `inf`）为停牌/不可交易标的伪造信号。
+3. **三段隔离与闭区间精确对称 Purged CV（`amine/labels.py`、`amine/purged_cv.py`）**：
+   - 标签默认 `raw_return` + `exec_lag=1`（次日收盘入场，规避同日收盘偏差），`market_residual` /
+     `specific_residual`（复用 `common/specific_alpha.py`）与 `sector_neutral`（复用 `cs_indneutralize` +
+     `common/sector_metadata.py`）均为显式 opt-in；末尾 `h = k + exec_lag` 行严格置 `NaN`。
+   - 时间轴三段隔离：`[GP discovery] -> gap(h+e) -> [Combiner Purged WF CV] -> gap(h+e) -> [Holdout]`。
+   - `PurgedGroupTimeSeriesCV` 纯 `numpy`/`pandas` 实现：测试块 `[a, b]` 前段清除 `[a - h, a - 1]`
+     （保留 `a - h - 1`）；`train_side="both"` 后段清除 `[b + 1, b + h + e]`（保留 `b + h + e + 1`，
+     即便 `e = 0` 也与 `[a, b + h]` 严格不相交）；默认 `train_side="past"` 保证因果扩展窗口。
+4. **Stage-1 GP、Stage-2 LightGBM、Löwdin 正交化与报告型监控**：
+   - `amine/fitness.py` 提供向量化 `fast_rank_ic`（与 `common.factor_analyzer.compute_rank_ic` 误差
+     ≤ `1e-10`），适应度采用日频 `IR` 与符号定向 `s * expr`，并叠加换手、库相关性（`C > 0.6`）与
+     节点长度惩罚；最终报告与门禁指标一律由 `common.factor_analyzer.factor_ic_summary` 生成。
+   - `amine/orthogonalize.py` 实现带符号横截面 Löwdin 对称正交化（`n_valid < m + 2` 退化保护、
+     特征值下限 `max(λ) * 1e-6`、恢复 `NaN` 行、不裁剪不重标度），默认用于线性 GP 组合基线，
+     LightGBM 默认关闭并在五臂 Holdout 消融中提供开关对照。
+   - `amine/combiner.py` 仅使用原生 `lightgbm.train`（`lambdarank` 分桶相关性 + 按日 `group`，或
+     高斯秩 `regression`），固定 `num_boost_round` 避免早停泄漏，每折强制校验 `assert_no_leakage`。
+   - `amine/monitoring.py` 提供 v1 仅报告型监控：纯 Mann-Whitney `compute_roc_auc` 对抗性验证
+     （`AUC > 0.70`）、折间特征重要性衰减（`Spearman < 0.30` 或原前三份额跌超 `50%`）、
+     20 日滚动单边换手熔断（`> 0.30/日`，仅报告 `"freeze holdings"` 建议）。
+5. **独立策略模板与五臂 Holdout 基准（`amine/strategy.py`、`amine/benchmark.py`、`run_alpha_mining.py`）**：
+   - `AlphaMiningStrategy` 严格遵守稀疏权重契约：非调仓日全行 `NaN`（禁止 `ffill`），每 `k` 交易日
+     调仓行对 Top-N 等权分配（行和 ≤ `1.0`）并对落选标的写入显式 `0.0`。
+   - CLI 默认 `--data-provider synthetic`（100% 离线），输出 `alpha_mining_report.json` 与 `oof_scores.csv`。
+
+### 48.3 验证结果（100% 离线合成数据）
+
+- `cd ml/alpha_mining && uv sync`：退出码 0（独立环境安装 `lightgbm==4.7.0` 等 31 个包）。
+- `cd pipeline && uv run pytest ../common/tests/test_alpha101_operators.py -q`：**10 passed**。
+- `cd pipeline && uv run pytest ../common/tests -q`：**1533 passed, 1 skipped**。
+- `cd ml/alpha_mining && uv run pytest tests -q -m "not slow"`：**34 passed**（覆盖 9 个测试模块，
+  含闭区间 Purge/Embargo 边界、`fast_rank_ic` 精度 `1e-10` 对齐、植入因子恢复、纯噪声零假设 `OOF t < 2.0`
+  及屏蔽 `lightgbm` 后的 `amine.strategy` 导入测试）。
+- `pipeline/.venv` 隔离校验：退出码 0（`find_spec("lightgbm") is None`）。
+- 端到端合成冒烟：`run_alpha_mining.py --data-provider synthetic --gp-population 30 --gp-generations 3 --n-splits 3`
+  退出码 0，正常写出报告与 OOF 评分面板；独立只读审查零可执行缺陷。

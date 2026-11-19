@@ -16,7 +16,8 @@ plus shared infrastructure at the repo root:
   pipeline). `pipeline/run_pipeline.py` chains the first 4 stages plus `backtester` via subprocess.
 - **`ml/`** -- ML/DL-based strategy projects, each with its OWN isolated `uv` environment (heavier,
   version-sensitive dependency stacks that would conflict with `pipeline/`'s): currently
-  `bnn_forecaster` (AutoBNN probabilistic forecasting).
+  `bnn_forecaster` (AutoBNN probabilistic forecasting) and `alpha_mining` (two-stage GP + LightGBM
+  cross-sectional alpha mining, `ML1`).
 - `common/` and `backtester/` stay at the repo root, shared by both groups, with **no
   `pyproject.toml`/venv of their own** -- reached via `sys.path` injection from whichever group's
   venv is running them (see below).
@@ -31,6 +32,7 @@ cd pipeline && uv sync                             # pipeline/'s shared env (res
                                                     # instrument_selection, pattern_mining,
                                                     # strategy_generator, fundamental_screener)
 cd ml/bnn_forecaster && uv sync                    # bnn_forecaster's own isolated env
+cd ml/alpha_mining && uv sync                      # alpha_mining's own isolated env (lightgbm)
 cd web/livetrading && uv sync                      # web/livetrading's own isolated env (fastapi, pydantic)
 
 # from inside pipeline/ (or via pipeline/.venv/Scripts/python.exe from anywhere):
@@ -54,7 +56,7 @@ available in the current shell.
 - Each project has its own `tests/` directory (`common/tests`, `pipeline/research_strategy/tests`,
   `pipeline/instrument_selection/tests`, `pipeline/pattern_mining/tests`,
   `pipeline/strategy_generator/tests`, `pipeline/fundamental_screener/tests`, `pipeline/tests`,
-  `backtester/tests`, `ml/bnn_forecaster/tests`, `web/livetrading/tests`). Note: `web/livetrading`
+  `backtester/tests`, `ml/bnn_forecaster/tests`, `ml/alpha_mining/tests`, `web/livetrading/tests`). Note: `web/livetrading`
   is a third isolated `uv` environment (`web/livetrading/.venv`); its tests must run with its own
   interpreter, not `pipeline/.venv` (missing `fastapi`/`pydantic`). None has an `__init__.py`, and several projects
   share identically-named test files (`test_allocation_templates.py`, `test_indicators.py`, ...), so

@@ -18,6 +18,7 @@ shared infrastructure at the repo root:
   - `run_pipeline.py`: Chains research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester` end-to-end via subprocess.
 - **`ml/`** -- ML/DL-based strategy projects, each with its OWN isolated `uv` environment:
   - `bnn_forecaster/`: Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener.
+  - `alpha_mining/`: Standalone (not pipeline-wired) two-stage Genetic Programming + LightGBM cross-sectional alpha mining sub-project (`ML1`), with pure-NumPy/Pandas Purged Group TimeSeries CV + Embargo and report-only drift/turnover monitoring.
 - **`web/`** -- Interactive web applications:
   - `livetrading/`: Institutional-grade live trading deployment web station & execution workstation (Stage 1 Health Gate + Stage 2 Live Trading Ticket Generation).
 - **Shared at the repo root** (reached via `sys.path` injection or standalone execution):
@@ -85,13 +86,14 @@ details on the cache schema, dynamic resampling, and earliest date tracking.
 
 ## Setup & Environment
 
-`pipeline/` and `ml/bnn_forecaster/` each manage their own `uv` environment. Initialize/synchronize
-whichever one you need:
+`pipeline/`, `ml/bnn_forecaster/`, and `ml/alpha_mining/` each manage their own `uv` environment.
+Initialize/synchronize whichever one you need:
 
 ```bash
 cd pipeline && uv sync              # research_strategy, instrument_selection, pattern_mining,
                                      # strategy_generator, fundamental_screener, run_pipeline.py
 cd ml/bnn_forecaster && uv sync      # bnn_forecaster's own isolated environment (AutoBNN/JAX/TFP)
+cd ml/alpha_mining && uv sync        # alpha_mining's own isolated environment (LightGBM + GP)
 ```
 
 `common/` and `backtester/` (repo root) have no environment of their own -- run them with whichever
@@ -371,6 +373,9 @@ uv run pytest tests -v                        # run_pipeline.py's own tests
 # from inside ml/bnn_forecaster/ (its own isolated venv)
 uv run pytest tests -v
 
+# from inside ml/alpha_mining/ (its own isolated venv)
+uv run pytest tests -v -m "not slow"
+
 # from either venv (repo root, common/backtester have no venv of their own)
 pipeline/.venv/Scripts/python.exe -m pytest common/tests -v
 pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
@@ -395,6 +400,7 @@ pipeline/.venv/Scripts/python.exe -m pytest backtester/tests -v
 | `pipeline/live_signal/` | Standalone (not pipeline-wired) point-in-time buy/sell signal + holdings-aware rebalance instruction for an already-generated `strategy.json`, as of today or any given date | `pipeline/live_signal/run_live_signal.py` | `pipeline/live_signal/README.md` |
 | `pipeline/run_pipeline.py` | Chains research_strategy -> instrument_selection -> pattern_mining -> strategy_generator -> `backtester` end-to-end via subprocess, auto-wiring each step's output into the next | `pipeline/run_pipeline.py` | This README |
 | `ml/bnn_forecaster/` | Standalone (not pipeline-wired) AutoBNN probabilistic-forecast buy/sell screener; own isolated `uv` environment (see its README) | `ml/bnn_forecaster/run_bnn_forecaster.py` | `ml/bnn_forecaster/README.md` |
+| `ml/alpha_mining/` | Standalone (not pipeline-wired) two-stage GP + LightGBM cross-sectional alpha mining sub-project (`ML1`); own isolated `uv` environment (see its README) | `ml/alpha_mining/run_alpha_mining.py` | `ml/alpha_mining/README.md` |
 | `web/livetrading/` | Responsive live trading deployment web station & workstation (Stage 1 Health Gate + Stage 2 Ticket Generation) | `web/livetrading/app.py` | `web/livetrading/README.md` |
 | `scripts/` | Standalone live trading health audit (`check_live_portfolio_health.py`) and universal deployment runner (`run_live_strategy.py`) | `scripts/run_live_strategy.py` | `scripts/results/live/` |
 | `docs/universe/` | Pre-screened core-satellite asset pools for China A-Shares, US equities, and Hong Kong stocks | N/A (Data/Documentation) | `docs/universe/` |
