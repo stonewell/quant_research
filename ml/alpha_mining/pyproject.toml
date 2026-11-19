@@ -1,0 +1,32 @@
+[project]
+name = "alpha-mining"
+version = "0.1.0"
+requires-python = ">=3.11"
+# Deliberately its OWN isolated uv project/venv, separate from pipeline/'s
+# pyproject.toml/uv.lock so lightgbm is never installed into pipeline/.venv.
+# `common/` is NOT installed as a package -- it is reached via the same
+# repo-root sys.path injection used by ml/bnn_forecaster and pipeline projects,
+# so this project provides common's runtime dependencies (pandas, numpy, scipy,
+# duckdb, yfinance) alongside lightgbm.
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "lightgbm>=4.3",
+    "duckdb>=1.1",
+    "yfinance>=0.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.uv]
+environments = [
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: exercises larger GP / LightGBM runs -- deselect with -m 'not slow' for a fast run.",
+]
