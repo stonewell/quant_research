@@ -115,6 +115,31 @@ Outputs written to `--output-dir`:
   `lgbm_lowdin_on`), report-only monitoring diagnostics, and Rule-9 gate status.
 - `oof_scores.csv`: date × symbol out-of-fold combiner score panel.
 
+### CLI Options Reference
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--universe` | 12 US tickers | Candidate symbol list (also supports `--universe-file` / `--universe-provider`) |
+| `--data-provider` | `synthetic` | Market data provider (`synthetic` offline default, `yfinance`, `csv`) |
+| `--start` / `--end` | `2018-01-01` / `2024-12-31` | History date range (`YYYY-MM-DD`) |
+| `--interval` | `1d` | Bar interval |
+| `--k` / `--holding-period` | `5` | Forward label holding period `k` in trading bars |
+| `--exec-lag` | `1` | Execution delay in trading bars (`1` = enter at next close) |
+| `--embargo-days` | `5` | Post-test embargo length in trading bars |
+| `--label-mode` | `raw_return` | Label mode: `raw_return`, `market_residual`, or `specific_residual` |
+| `--sector-neutral` | `false` | Cross-sectionally demean labels within sectors via `cs_indneutralize` |
+| `--objective` | `lambdarank` | LightGBM objective: `lambdarank` or `regression` |
+| `--gp-population` | `200` (`30` with `--small-data`) | Stage-1 GP population size |
+| `--gp-generations` | `20` (`3` with `--small-data`) | Stage-1 GP number of generations |
+| `--top-k-factors` | `10` (`5` with `--small-data`) | Maximum non-redundant GP factors selected (`C <= 0.6`) |
+| `--n-splits` | `5` (`3` with `--small-data`) | Number of Purged Walk-Forward CV splits |
+| `--top-n` | `5` | Top-N equal-weight holdings in the backtest book |
+| `--lowdin-combiner` | `false` | Enable signed Löwdin orthogonalization before LightGBM combiner |
+| `--small-data` | `false` | Use compact GP/LightGBM/CV profile for fast synthetic runs |
+| `--seed` | `42` | Deterministic RNG seed |
+| `--no-cache` | `false` | Disable shared DuckDB OHLCV caching |
+| `--output-dir` | `ml/alpha_mining/results` | Output directory for `alpha_mining_report.json` and `oof_scores.csv` |
+
 ## Offline Tests
 
 All unit tests run 100% offline on synthetic data (no network, no `tests/__init__.py`):

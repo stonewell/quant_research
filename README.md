@@ -351,14 +351,15 @@ from `--pattern-report` or `--research-strategy` respectively (see `pipeline/str
 
 All unit tests across the repository run offline without requiring external network access or live market data, utilizing synthetic data generation (`SyntheticDataProvider` or Brownian motion generators in `common/testing.py`).
 
-Each project's test suite must be run separately, one path at a time -- none of the 9 `tests/`
-directories (including `pipeline/tests/`, covering `run_pipeline.py`) has an `__init__.py`,
+Each project's test suite must be run separately, one path at a time -- none of the per-project
+`tests/` directories (including `pipeline/tests/`, covering `run_pipeline.py`) has an `__init__.py`,
 so collecting more than one in a single `pytest` invocation (e.g. a bare `uv run pytest` from the
 repo root) fails with `import file mismatch` errors on the handful of same-named test files
 (`test_allocation_templates.py`, `test_indicators.py`, etc.) that exist in more than one project.
-There is no single command that runs every test in the workspace at once (and `pipeline/`'s vs.
-`ml/bnn_forecaster/`'s own isolated venv must each be used for their own projects' tests --
-`common`'s and `backtester`'s tests can be run from either):
+There is no single command that runs every test in the workspace at once (each isolated `uv`
+environment — `pipeline/`, `ml/bnn_forecaster/`, `ml/alpha_mining/`, and `web/livetrading/` — must
+be used for its own project's tests; `common`'s and `backtester`'s tests can run from `pipeline/`
+or either `ml/*` venv):
 
 ```bash
 # from inside pipeline/ (its own venv)

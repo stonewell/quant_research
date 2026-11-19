@@ -1,5 +1,10 @@
 # LightGBM 与遗传规划（GP）中短期量化 Alpha 投研体系研究
 
+> **任务状态与工程落地（Rule 2 SSOT）**：本体系已作为独立子项目 `ML1` 完成交付，任务台账与验收记录见
+> [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.23（`ML1` `[x]`），
+> 版本与设计变更日志见 [`docs/version.md`](file:///home/stone/Work/github/quant/docs/version.md) §48，
+> 项目运行与离线测试说明见 [`ml/alpha_mining/README.md`](file:///home/stone/Work/github/quant/ml/alpha_mining/README.md)。
+
 ## 目录
 
 1. [核心架构与理论互补性](#一核心架构与理论互补性)
