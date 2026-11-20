@@ -2839,3 +2839,375 @@ def test_l2_27_deadline_geometry_still_comes_from_the_clock_only():
     holidays_src = inspect.getsource(holidays_mod)
     assert "(11, 27, 13, 0)" in holidays_src, "US early-close data must live in market_holidays"
     assert "(12, 24, 12, 0)" in holidays_src, "HK half-day data must live in market_holidays"
+
+
+# =============================================================================
+# MS4: Pure Causal 5m Microstructure Operators & Daily Fallback Proxy
+# =============================================================================
+
+
+def _ms4_day_5m(day: str) -> pd.DatetimeIndex:
+    morning = pd.date_range(f"{day} 09:35:00", f"{day} 11:30:00", freq="5min")
+    afternoon = pd.date_range(f"{day} 13:05:00", f"{day} 15:00:00", freq="5min")
+    return morning.append(afternoon)
+
+
+def test_detect_limit_pct_and_tick_public_alias():
+    from common.intraday_features import _detect_limit_pct_and_tick, detect_limit_pct_and_tick
+
+    assert detect_limit_pct_and_tick is _detect_limit_pct_and_tick
+    assert detect_limit_pct_and_tick("600000.SH") == (0.10, 0.01)
+    assert detect_limit_pct_and_tick("300750.SZ") == (0.20, 0.01)
+    assert detect_limit_pct_and_tick("688981.SH") == (0.20, 0.01)
+    assert detect_limit_pct_and_tick("830799.BJ") == (0.30, 0.01)
+    assert detect_limit_pct_and_tick("ST600001.SH") == (0.05, 0.01)
+
+
+def test_ms4_core_intraday_return_strips_morning_noise():
+    from common.intraday_features import compute_core_intraday_return_5m
+
+    idx = _ms4_day_5m("2025-05-06")
+    n = len(idx)
+    close = np.full(n, 100.0)
+    # 09:35..09:55 (bars 0..4): wild +4% retail spike and reversal; 10:00 (bar 5) == 100.0
+    close[:5] = [104.0, 103.0, 97.0, 102.0, 101.0]
+    close[5] = 100.0
+    # 10:05..15:00 (bars 6..47): clean +2% institutional trend to 102.0
+    close[6:] = np.linspace(100.1, 102.0, n - 6)
+    df = pd.DataFrame(
+        {
+            "Open": close,
+            "High": close + 0.2,
+            "Low": close - 0.2,
+            "Close": close,
+            "Volume": np.full(n, 1000.0),
+        },
+        index=idx,
+    )
+
+    ret = compute_core_intraday_return_5m(df)
+    assert ret.name == "Core_Intraday_Ret_5m"
+    assert ret.iloc[0] == pytest.approx(0.02, abs=1e-12)
+
+
+def test_ms4_ofi_norm_and_iceberg_accumulation_sideways_positive_ofi():
+    from common.intraday_features import compute_ofi_norm_5m, iceberg_accumulation_score
+
+    idx1 = _ms4_day_5m("2025-05-06")  # tight sideways + strong positive OFI
+    idx2 = _ms4_day_5m("2025-05-07")  # wide breakout + same positive OFI
+    idx3 = _ms4_day_5m("2025-05-08")  # tight sideways + negative OFI distribution
+
+    n = len(idx1)
+    d1 = pd.DataFrame(
+        {
+            "Open": np.full(n, 100.0),
+            "High": np.full(n, 100.20),
+            "Low": np.full(n, 99.80),
+            "Close": np.full(n, 100.18),  # w_plus = 0.95 -> OFI = +0.90
+            "Volume": np.full(n, 1000.0),
+        },
+        index=idx1,
+    )
+    d2_c = np.linspace(100.0, 108.0, n)
+    d2 = pd.DataFrame(
+        {
+            "Open": d2_c - 0.2,
+            "High": d2_c + 0.02,
+            "Low": d2_c - 0.38,
+            "Close": d2_c,  # w_plus = 0.95 -> OFI = +0.90, but huge range
+            "Volume": np.full(n, 1000.0),
+        },
+        index=idx2,
+    )
+    d3 = pd.DataFrame(
+        {
+            "Open": np.full(n, 100.0),
+            "High": np.full(n, 100.20),
+            "Low": np.full(n, 99.80),
+            "Close": np.full(n, 99.82),  # w_plus = 0.05 -> OFI = -0.90
+            "Volume": np.full(n, 1000.0),
+        },
+        index=idx3,
+    )
+    bars = pd.concat([d1, d2, d3])
+
+    ofi = compute_ofi_norm_5m(bars)
+    ice = iceberg_accumulation_score(bars)
+
+    assert ofi.iloc[0] > 0.7
+    assert ice.iloc[0] > 0.5
+    assert ice.iloc[0] > ice.iloc[1]  # tight sideways beats wide breakout
+    assert ice.iloc[2] < -0.5         # distribution is negative
+
+
+def test_ms4_smart_money_flow_divergence_contrarian_accumulation():
+    from common.intraday_features import smart_money_flow_divergence
+
+    idx = _ms4_day_5m("2025-05-06")
+    n = len(idx)
+    opens = np.linspace(100.0, 97.0, n)  # down day (-3%)
+    highs = opens + 0.5
+    lows = opens - 0.5
+    closes = lows.copy()  # default small bars close at low (retail selling, w_plus=0)
+    vols = np.full(n, 500.0)
+
+    # Top 20% (~10 bars) are huge-volume institutional bars closing at high (w_plus=1)
+    large_idx = np.arange(0, n, 5)[:10]
+    vols[large_idx] = 5000.0
+    closes[large_idx] = highs[large_idx]
+
+    df = pd.DataFrame(
+        {"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": vols},
+        index=idx,
+    )
+    div = smart_money_flow_divergence(df)
+    assert div.name == "smart_money_flow_divergence"
+    assert div.iloc[0] > 0.5
+    assert "SmartMoney_Q_5m" not in df.columns
+
+
+def test_ms4_daily_fallback_proxy_and_degradation_trace():
+    from common.intraday_coverage import DUAL_MODE_DEGRADATION_POLICY
+    from common.intraday_features import (
+        compute_core_intraday_return_5m,
+        compute_ofi_norm_5m,
+        iceberg_accumulation_score,
+        smart_money_flow_divergence,
+    )
+
+    daily = pd.DataFrame(
+        {
+            "Open": [100.0, 102.0],
+            "High": [103.0, 104.0],
+            "Low": [99.0, 101.0],
+            "Close": [102.0, 103.5],
+            "Volume": [10000.0, 12000.0],
+        },
+        index=pd.bdate_range("2025-05-06", periods=2),
+    )
+    trace: dict = {}
+    for fn in (
+        compute_core_intraday_return_5m,
+        compute_ofi_norm_5m,
+        iceberg_accumulation_score,
+        smart_money_flow_divergence,
+    ):
+        s = fn(None, daily_df=daily, symbol="600900.SH", degradation_trace=trace)
+        assert len(s) == 2
+        assert s.notna().all()
+
+    assert trace["count"] == 4
+    assert all(d["policy"] == DUAL_MODE_DEGRADATION_POLICY for d in trace["degradations"])
+
+
+def test_ms4_causality_and_cutoff_equivalence_via_ms12_harness():
+    from common.intraday_features import (
+        compute_core_intraday_return_5m,
+        compute_ofi_norm_5m,
+        iceberg_accumulation_score,
+        smart_money_flow_divergence,
+    )
+    from common.lookahead_checks import (
+        assert_cutoff_truncation_equivalent,
+        assert_future_append_invariant,
+    )
+
+    rng = np.random.default_rng(77)
+    idx = _ms4_day_5m("2025-05-06").append(_ms4_day_5m("2025-05-07")).append(_ms4_day_5m("2025-05-08"))
+    n = len(idx)
+    c = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.002, size=n)))
+    o = np.r_[100.0, c[:-1]]
+    h = np.maximum(o, c) * (1.0 + rng.uniform(0.0005, 0.003, size=n))
+    l = np.minimum(o, c) * (1.0 - rng.uniform(0.0005, 0.003, size=n))
+    v = rng.integers(1000, 50000, size=n, dtype=np.int64)
+    bars = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c, "Volume": v}, index=idx)
+
+    for fn in (
+        compute_core_intraday_return_5m,
+        compute_ofi_norm_5m,
+        iceberg_accumulation_score,
+        smart_money_flow_divergence,
+    ):
+        assert_future_append_invariant(lambda b, _fn=fn: _fn(b), bars, [47, 95])
+        assert_cutoff_truncation_equivalent(
+            lambda b, ct, _fn=fn: _fn(b, cutoff_time=ct),
+            bars,
+            "14:15",
+            method="truncate",
+        )
+        assert_cutoff_truncation_equivalent(
+            lambda b, ct, _fn=fn: _fn(b, cutoff_time=ct),
+            bars,
+            "14:15",
+            method="perturb",
+        )
+
+
+# =============================================================================
+# MS17, MS18, MS20: Late-Day Volume Share, Intraday Shape & Volume-Bucket VPIN
+# =============================================================================
+
+
+def test_ms17_late_day_volume_share_cutoff_and_half_day():
+    from common.intraday_features import late_day_volume_share
+    from common.lookahead_checks import (
+        assert_cutoff_truncation_equivalent,
+        assert_future_append_invariant,
+    )
+
+    idx1 = _ms4_day_5m("2025-05-06")
+    idx2 = _ms4_day_5m("2025-05-07")
+    vols1 = np.full(len(idx1), 100.0)
+    # Bars from 14:30..15:00 are indices 41..47 (7 bars)
+    late_mask = idx1.time >= datetime.time(14, 30)
+    vols1[late_mask] = 500.0
+    d1 = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": vols1},
+        index=idx1,
+    )
+    d2 = d1.copy()
+    d2.index = idx2
+    bars = pd.concat([d1, d2])
+
+    s_full = late_day_volume_share(bars)
+    expected = float(vols1[late_mask].sum() / vols1.sum())
+    assert s_full.iloc[0] == pytest.approx(expected, abs=1e-12)
+    assert s_full.iloc[1] == pytest.approx(expected, abs=1e-12)
+
+    # Live cutoff_time="14:15" -> strictly NaN (never 0.0 or partial-day ratio)
+    s_1415 = late_day_volume_share(bars, cutoff_time="14:15")
+    assert s_1415.isna().all()
+
+    # Half-day session (09:35..11:30, 24 bars < 45) -> NaN
+    half = d1.loc[d1.index.time <= datetime.time(11, 30)]
+    assert late_day_volume_share(half).isna().all()
+
+    # MS12 causality & cutoff equivalence
+    assert_future_append_invariant(late_day_volume_share, bars, [47])
+    assert_cutoff_truncation_equivalent(
+        lambda b, ct: late_day_volume_share(b, cutoff_time=ct), bars, "14:15", method="truncate"
+    )
+    assert_cutoff_truncation_equivalent(
+        lambda b, ct: late_day_volume_share(b, cutoff_time=ct), bars, "14:15", method="perturb"
+    )
+
+
+def test_ms18_intraday_shape_factor_zero_range_and_cutoff():
+    from common.intraday_features import intraday_shape_factor
+    from common.lookahead_checks import (
+        assert_cutoff_truncation_equivalent,
+        assert_future_append_invariant,
+    )
+
+    idx1 = _ms4_day_5m("2025-05-06")
+    idx2 = _ms4_day_5m("2025-05-07")
+    c1 = np.linspace(100.0, 104.0, len(idx1))
+    d1 = pd.DataFrame(
+        {"Open": c1, "High": c1 + 0.5, "Low": c1 - 0.5, "Close": c1, "Volume": 1000.0},
+        index=idx1,
+    )
+    # Day 2: zero price range (flat) -> NaN
+    d2 = pd.DataFrame(
+        {"Open": 100.0, "High": 100.0, "Low": 100.0, "Close": 100.0, "Volume": 1000.0},
+        index=idx2,
+    )
+    bars = pd.concat([d1, d2])
+
+    shape = intraday_shape_factor(bars)
+    assert shape.iloc[0] > 0.5
+    assert np.isnan(shape.iloc[1])  # zero range -> NaN, never 0.0
+    assert intraday_shape_factor(bars, cutoff_time="14:15").isna().all()
+
+    # Half-day session -> NaN
+    half = d1.loc[d1.index.time <= datetime.time(11, 30)]
+    assert intraday_shape_factor(half).isna().all()
+
+    assert_future_append_invariant(intraday_shape_factor, bars, [47])
+    assert_cutoff_truncation_equivalent(
+        lambda b, ct: intraday_shape_factor(b, cutoff_time=ct), bars, "14:15", method="truncate"
+    )
+    assert_cutoff_truncation_equivalent(
+        lambda b, ct: intraday_shape_factor(b, cutoff_time=ct), bars, "14:15", method="perturb"
+    )
+
+
+def test_ms20_volume_bucket_vpin_5m_bucketing_and_non_interchangeability():
+    from common.intraday_features import (
+        IntradayFeatureConfig,
+        compute_daily_intraday_features,
+        volume_bucket_vpin_5m,
+    )
+    from common.lookahead_checks import (
+        assert_cutoff_truncation_equivalent,
+        assert_future_append_invariant,
+    )
+
+    idx = _ms4_day_5m("2025-05-06")
+    n = len(idx)  # 48 bars
+
+    # (i) Balanced 50/50 bars (w_plus == 0.5) -> VPIN == 0.0
+    bal = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 1000.0},
+        index=idx,
+    )
+    assert volume_bucket_vpin_5m(bal, n_buckets=48).iloc[0] == pytest.approx(0.0, abs=1e-12)
+
+    # (ii) All-buy (w_plus == 1.0) & all-sell (w_plus == 0.0) -> VPIN == 1.0
+    all_buy = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 101.0, "Volume": 1000.0},
+        index=idx,
+    )
+    all_sell = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 99.0, "Volume": 1000.0},
+        index=idx,
+    )
+    assert volume_bucket_vpin_5m(all_buy, n_buckets=48).iloc[0] == pytest.approx(1.0, abs=1e-12)
+    assert volume_bucket_vpin_5m(all_sell, n_buckets=48).iloc[0] == pytest.approx(1.0, abs=1e-12)
+
+    # (iii) Alternating [1, 0, 1, 0, ...] bars:
+    # UpVol_Ratio_5m == 0.5, while VPIN(n_buckets=48) == 1.0 > 0 (proves non-interchangeability!),
+    # and VPIN(n_buckets=24) == 0.0 (each bucket merges 1 buy + 1 sell bar -> cancellation!)
+    alt_close = np.where(np.arange(n) % 2 == 0, 101.0, 99.0)
+    alt = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": alt_close, "Volume": 1000.0},
+        index=idx,
+    )
+    daily_feats = compute_daily_intraday_features(
+        alt, IntradayFeatureConfig(enable_chan_5m=False)
+    )
+    assert daily_feats["UpVol_Ratio_5m"].iloc[0] == pytest.approx(0.5, abs=1e-12)
+    assert volume_bucket_vpin_5m(alt, n_buckets=48).iloc[0] == pytest.approx(1.0, abs=1e-12)
+    assert volume_bucket_vpin_5m(alt, n_buckets=24).iloc[0] == pytest.approx(0.0, abs=1e-12)
+    for retired in _RETIRED_5M_COLUMNS:
+        assert retired not in daily_feats.columns
+
+    # (iv) Skewed giant-volume bar proves cumsum(Volume) bucketing differs from equal-time average:
+    # Bar 0 has 90% of volume with w_plus=1.0; bars 1..47 have 10% total volume with w_plus=0.5.
+    # Equal-time average |2w-1| = 1/48 ~= 0.021, whereas cumsum volume-bucket VPIN ~= 0.90!
+    skew_close = np.full(n, 100.0)
+    skew_close[0] = 101.0
+    skew_vol = np.full(n, 100.0 / 47.0)
+    skew_vol[0] = 900.0
+    skew = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": skew_close, "Volume": skew_vol},
+        index=idx,
+    )
+    vpin_skew = volume_bucket_vpin_5m(skew, n_buckets=50).iloc[0]
+    assert vpin_skew > 0.85
+
+    # Cutoff & half-day & MS12 checks
+    assert volume_bucket_vpin_5m(alt, cutoff_time="14:15").isna().all()
+    half = alt.loc[alt.index.time <= datetime.time(11, 30)]
+    assert volume_bucket_vpin_5m(half).isna().all()
+
+    idx2 = _ms4_day_5m("2025-05-07")
+    alt2 = alt.copy()
+    alt2.index = idx2
+    two_days = pd.concat([alt, alt2])
+    assert_future_append_invariant(volume_bucket_vpin_5m, two_days, [47])
+    assert_cutoff_truncation_equivalent(
+        lambda b, ct: volume_bucket_vpin_5m(b, cutoff_time=ct), two_days, "14:15", method="truncate"
+    )
+    assert_cutoff_truncation_equivalent(
+        lambda b, ct: volume_bucket_vpin_5m(b, cutoff_time=ct), two_days, "14:15", method="perturb"
+    )

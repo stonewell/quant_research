@@ -109,6 +109,118 @@ DAILY_FACTOR_WEIGHTS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Track MS (MS15-MS18, MS20) independent factor registration channel
+# ---------------------------------------------------------------------------
+# Registered separately from DAILY_FACTOR_RAW_COLUMNS so the M3.1 3-tuple
+# contract (pinned by test_scoring.py:586-607) stays bit-identical.
+#
+# W1b STATUS ("可交付但未点火" / DELIVERED BUT UN-IGNITED):
+# pipeline/instrument_selection/run_screener.py:242-248 calls score_universe()
+# without passing daily_data, intraday_5m_data, use_daily_factors=True, or
+# use_ms_factors=True. All MS_FACTOR_WEIGHTS default to 0.0 so
+# overall_selection_score is bit-identical unless a caller explicitly opts in
+# and supplies non-zero weights.
+MS_FACTOR_RAW_COLUMNS = (
+    "amihud_illiquidity_ratio",
+    "max_return",
+    "late_day_volume_share",
+    "intraday_shape_factor",
+    "volume_bucket_vpin_5m",
+)
+MS_FACTOR_SCORE_COLUMNS = tuple(f"{c}_score" for c in MS_FACTOR_RAW_COLUMNS)
+MS_FACTOR_WEIGHTS = {
+    "amihud_illiquidity_ratio_score": 0.0,
+    "max_return_score": 0.0,
+    "late_day_volume_share_score": 0.0,
+    "intraday_shape_factor_score": 0.0,
+    "volume_bucket_vpin_5m_score": 0.0,
+}
+
+
+def _augment_with_ms_factors(
+    df: pd.DataFrame,
+    daily_data: Optional[dict],
+    intraday_5m_data: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Attach Track MS (MS15-MS18, MS20) raw columns and 0-100 rank scores.
+
+    ADDITIVE ONLY: leaves all pre-existing columns and ``overall_selection_score``
+    untouched because ``MS_FACTOR_WEIGHTS`` are all ``0.0`` and ``DEFAULT_WEIGHTS``
+    is unchanged.
+    """
+    from common.intraday_features import (
+        intraday_shape_factor,
+        late_day_volume_share,
+        volume_bucket_vpin_5m,
+    )
+
+    sym_keys = [str(s) for s in df.index]
+
+    # 1. Daily MS15 & MS16 factors
+    if daily_data:
+        close_cols, vol_cols, amt_cols = {}, {}, {}
+        has_any_amt = False
+        for sym, frame in daily_data.items():
+            if hasattr(frame, "columns") and "Close" in frame.columns and "Volume" in frame.columns:
+                close_cols[str(sym)] = frame["Close"].astype(float)
+                vol_cols[str(sym)] = frame["Volume"].astype(float)
+                if "Amount" in frame.columns:
+                    amt_cols[str(sym)] = frame["Amount"].astype(float)
+                    has_any_amt = True
+        if close_cols:
+            close_p = pd.DataFrame(close_cols).sort_index()
+            vol_p = pd.DataFrame(vol_cols).reindex(index=close_p.index, columns=close_p.columns)
+            amt_p = (
+                pd.DataFrame(amt_cols).reindex(index=close_p.index, columns=close_p.columns)
+                if has_any_amt
+                else None
+            )
+            if "amihud_illiquidity_ratio" not in df.columns:
+                amihud_last = daily_factors.amihud_illiquidity_ratio(
+                    close_p, vol_p, amount=amt_p
+                ).iloc[-1]
+                df["amihud_illiquidity_ratio"] = [
+                    float(amihud_last.get(s, np.nan)) for s in sym_keys
+                ]
+            if "max_return" not in df.columns:
+                max_last = daily_factors.max_return(close_p).iloc[-1]
+                df["max_return"] = [float(max_last.get(s, np.nan)) for s in sym_keys]
+
+    # 2. Intraday 5m MS17, MS18, MS20 factors (default cutoff_time="15:00")
+    if intraday_5m_data:
+        for col_name, fn in (
+            ("late_day_volume_share", late_day_volume_share),
+            ("intraday_shape_factor", intraday_shape_factor),
+            ("volume_bucket_vpin_5m", volume_bucket_vpin_5m),
+        ):
+            if col_name not in df.columns:
+                vals = []
+                for s in sym_keys:
+                    bars_5m = intraday_5m_data.get(s)
+                    if bars_5m is None or getattr(bars_5m, "empty", True):
+                        vals.append(np.nan)
+                    else:
+                        ser = fn(bars_5m)
+                        vals.append(float(ser.iloc[-1]) if len(ser) > 0 else np.nan)
+                df[col_name] = vals
+
+    # Ensure all 5 raw columns exist (NaN where source data was omitted)
+    for col in MS_FACTOR_RAW_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+
+    # Higher-is-better directions: max_return & volume_bucket_vpin_5m are negative factors
+    df["amihud_illiquidity_ratio_score"] = _pct_rank(df["amihud_illiquidity_ratio"]) * 100.0
+    df["max_return_score"] = (1.0 - _pct_rank(df["max_return"])) * 100.0
+    df["late_day_volume_share_score"] = _pct_rank(df["late_day_volume_share"]) * 100.0
+    df["intraday_shape_factor_score"] = _pct_rank(df["intraday_shape_factor"]) * 100.0
+    df["volume_bucket_vpin_5m_score"] = (1.0 - _pct_rank(df["volume_bucket_vpin_5m"])) * 100.0
+    return df
+
+
 def _latest_daily_factor_values(daily_data, vwap_lookback, ivol_lookback, mom_skip):
     """Latest-bar value of each M3.1 factor, one row per symbol.
 
@@ -223,7 +335,10 @@ def score_universe(metrics: pd.DataFrame, weights: dict = None,
                    factor_vwap_lookback: int = 20,
                    factor_ivol_lookback: int = 63,
                    factor_mom_1m_1w_skip: int = 5,
-                   daily_data: Optional[dict] = None) -> pd.DataFrame:
+                   daily_data: Optional[dict] = None,
+                   *,
+                   use_ms_factors: bool = False,
+                   intraday_5m_data: Optional[dict] = None) -> pd.DataFrame:
     df = metrics.copy()
 
     # --- Task M3.1 opt-in guard. MUST stay first ---------------------------
@@ -241,6 +356,8 @@ def score_universe(metrics: pd.DataFrame, weights: dict = None,
             factor_ivol_lookback,
             factor_mom_1m_1w_skip,
         )
+    if use_ms_factors:
+        df = _augment_with_ms_factors(df, daily_data, intraday_5m_data)
     if weights is None:
         if "strategy_fit_score" in df.columns:
             weights = dict(STRATEGY_FIT_DEFAULT_WEIGHTS)

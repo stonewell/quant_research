@@ -329,3 +329,110 @@ def test_invalid_lookbacks_are_rejected():
         vwap_slope(close, volume, 1)
     with pytest.raises(ValueError):
         momentum_1m_1w(close, skip=20, lookback=20)
+
+
+# =============================================================================
+# MS4: Overnight/Intraday Return Split & Limit-Up Magnet / Break
+# =============================================================================
+
+
+def test_overnight_and_intraday_return_exact_compound_identity():
+    from common.daily_factors import intraday_return, overnight_return
+
+    rng = np.random.default_rng(101)
+    dates = _dates(25)
+    cols = ["600000.SH", "300750.SZ"]
+    close = pd.DataFrame(
+        10.0 * np.exp(np.cumsum(rng.normal(0.001, 0.02, size=(25, 2)), axis=0)),
+        index=dates,
+        columns=cols,
+    )
+    open_ = close.shift(1).fillna(close.iloc[0]) * np.exp(rng.normal(0.0, 0.005, size=(25, 2)))
+
+    r_on = overnight_return(open_, close)
+    r_id = intraday_return(open_, close)
+
+    assert r_on.iloc[0].isna().all()
+    compound = (1.0 + r_on) * (1.0 + r_id)
+    expected = close / close.shift(1)
+    np.testing.assert_allclose(
+        compound.iloc[1:].to_numpy(), expected.iloc[1:].to_numpy(), atol=1e-12
+    )
+
+    # Non-positive prices yield NaN (never 0.0)
+    bad_open = open_.copy()
+    bad_open.iloc[5, 0] = 0.0
+    assert np.isnan(overnight_return(bad_open, close).iloc[5, 0])
+    assert np.isnan(intraday_return(bad_open, close).iloc[5, 0])
+
+
+def test_limit_up_magnet_and_break_board_detection_and_scenarios():
+    from common.daily_factors import limit_up_magnet_and_break
+
+    dates = _dates(5)
+    # 4 boards: Main 10%, ChiNext 20%, BSE 30%, ST 5%
+    cols = ["600000.SH", "300750.SZ", "830799.BJ", "ST600001.SH"]
+    close = pd.DataFrame(10.0, index=dates, columns=cols)
+    open_ = pd.DataFrame(10.0, index=dates, columns=cols)
+    high = pd.DataFrame(10.1, index=dates, columns=cols)
+    low = pd.DataFrame(9.9, index=dates, columns=cols)
+    vol = pd.DataFrame(1000.0, index=dates, columns=cols)
+
+    # Day 1: Sealed limit-up / one-word board on each board's exact limit!
+    # 10% -> 11.0, 20% -> 12.0, 30% -> 13.0, 5% -> 10.5
+    limits = [11.0, 12.0, 13.0, 10.5]
+    for c, lim in zip(cols, limits):
+        open_.loc[dates[1], c] = lim
+        high.loc[dates[1], c] = lim
+        low.loc[dates[1], c] = lim
+        close.loc[dates[1], c] = lim
+
+    # Day 2: Reset baseline to 10.0
+    # Day 3: Touch-and-break ("炸板") on 600000.SH (high=11.0, close=10.1, 3x vol)
+    high.loc[dates[3], "600000.SH"] = 11.0
+    close.loc[dates[3], "600000.SH"] = 10.1
+    vol.loc[dates[3], "600000.SH"] = 3000.0
+
+    # Day 4: Same break on 600000.SH with even higher 5x volume -> strictly more negative
+    close.loc[dates[3], "300750.SZ"] = 10.0
+    high.loc[dates[4], "600000.SH"] = 11.11  # 10.1 * 1.10 = 11.11
+    close.loc[dates[4], "600000.SH"] = 10.20
+    vol.loc[dates[4], "600000.SH"] = 5000.0
+
+    score = limit_up_magnet_and_break(open_, high, low, close, vol)
+    assert score.iloc[0].isna().all()
+    # Day 1 sealed boards across all 4 board limits -> score == 1.0 > 0.5
+    for c in cols:
+        assert score.loc[dates[1], c] > 0.5
+    # Day 3 broken board -> strongly negative
+    assert score.loc[dates[3], "600000.SH"] < -0.5
+    # Day 4 higher volume break -> strictly more negative than Day 3
+    assert score.loc[dates[4], "600000.SH"] < score.loc[dates[3], "600000.SH"]
+
+
+def test_ms4_daily_factors_causality_via_ms12_harness():
+    from common.daily_factors import (
+        intraday_return,
+        limit_up_magnet_and_break,
+        overnight_return,
+    )
+    from common.lookahead_checks import assert_future_append_invariant
+
+    close, vol = _synthetic_panel(n=30, n_symbols=3)
+    open_ = close * 0.998
+    high = close * 1.02
+    low = close * 0.98
+
+    assert_future_append_invariant(
+        lambda d: overnight_return(open_.loc[d.index], d), close, [10, 20]
+    )
+    assert_future_append_invariant(
+        lambda d: intraday_return(open_.loc[d.index], d), close, [10, 20]
+    )
+    assert_future_append_invariant(
+        lambda d: limit_up_magnet_and_break(
+            open_.loc[d.index], high.loc[d.index], low.loc[d.index], d, vol.loc[d.index]
+        ),
+        close,
+        [10, 20],
+    )

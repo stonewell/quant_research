@@ -195,8 +195,8 @@ def _parse_time_cutoff(val: Optional[Union[str, datetime.time]]) -> Optional[dat
     return t
 
 
-def _detect_limit_pct_and_tick(symbol: Optional[str]) -> Tuple[float, float]:
-    """Determine price limit ratio and tick size based on asset classification (R10)."""
+def detect_limit_pct_and_tick(symbol: Optional[str]) -> Tuple[float, float]:
+    """Determine price limit ratio and tick size based on asset classification (R10 / MS4)."""
     if not symbol:
         return 0.10, 0.01
 
@@ -220,6 +220,87 @@ def _detect_limit_pct_and_tick(symbol: Optional[str]) -> Tuple[float, float]:
 
     # Main Board Equities
     return 0.10, 0.01
+
+
+# Backward-compatible private alias for internal callers and existing tests (MS4).
+_detect_limit_pct_and_tick = detect_limit_pct_and_tick
+
+
+#: Single shared set of A-share 5m session timeslice constants (MS4 / MS17 / MS18 / MS20).
+SESSION_OPEN_START_5M: str = "09:30"
+MORNING_OPEN_END_5M: str = "10:00"
+CORE_END_5M: str = "14:15"
+LATE_SESSION_START_5M: str = "14:30"
+SESSION_CLOSE_5M: str = "15:00"
+
+
+def _compute_bar_buy_weights(
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+) -> np.ndarray:
+    """Compute bar-level BVC buy weight ``w_j^+ in [0, 1]`` with robust ``H == L`` handling.
+
+    Shared single source of truth used by ``_compute_day_microstructure`` (``UpVol_Ratio_5m``),
+    MS4's ``compute_ofi_norm_5m`` / ``smart_money_flow_divergence``, and MS20's
+    ``volume_bucket_vpin_5m``.
+    """
+    m = len(closes)
+    hl_diff = highs - lows
+    w_plus = np.zeros(m, dtype=np.float64)
+    for j in range(m):
+        if hl_diff[j] > 1e-9:
+            w_plus[j] = (closes[j] - lows[j]) / hl_diff[j]
+        elif j == 0:
+            if closes[0] > opens[0]:
+                w_plus[0] = 1.0
+            elif closes[0] < opens[0]:
+                w_plus[0] = 0.0
+            else:
+                w_plus[0] = 0.5
+        else:
+            if closes[j] > closes[j - 1]:
+                w_plus[j] = 1.0
+            elif closes[j] < closes[j - 1]:
+                w_plus[j] = 0.0
+            else:
+                w_plus[j] = 0.5
+    return np.clip(w_plus, 0.0, 1.0)
+
+
+def _slice_intraday_time_window(
+    day_bars: pd.DataFrame,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    *,
+    start_inclusive: bool = True,
+    end_inclusive: bool = True,
+) -> pd.DataFrame:
+    """Slice a single-day 5m DataFrame to ``[start_time, end_time]`` (shared by MS17 & MS18)."""
+    if day_bars.empty:
+        return day_bars
+    times = day_bars.index.time
+    mask = np.ones(len(day_bars), dtype=bool)
+    if start_time is not None:
+        parts = [int(p) for p in str(start_time).strip().split(":")]
+        t_start = datetime.time(parts[0], parts[1] if len(parts) > 1 else 0, parts[2] if len(parts) > 2 else 0)
+        mask &= (times >= t_start) if start_inclusive else (times > t_start)
+    if end_time is not None:
+        parts = [int(p) for p in str(end_time).strip().split(":")]
+        t_end = datetime.time(parts[0], parts[1] if len(parts) > 1 else 0, parts[2] if len(parts) > 2 else 0)
+        mask &= (times <= t_end) if end_inclusive else (times < t_end)
+    return day_bars.loc[mask]
+
+
+def _get_ohlcv_col(df: pd.DataFrame, name: str) -> pd.Series:
+    """Read Capitalized OHLCV column primarily, falling back to lowercase if needed."""
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce")
+    low = name.lower()
+    if low in df.columns:
+        return pd.to_numeric(df[low], errors="coerce")
+    raise KeyError(f"Missing required column {name!r} (or {low!r}) in 5m bars")
 
 
 def _compute_day_microstructure(
@@ -282,30 +363,8 @@ def _compute_day_microstructure(
     res["Signed_Jump_5m"] = signed_jump
 
     # 3. Signed Up-Volume Ratio (Bulk Volume Classification, Easley et al. 2012)
-    # w_j^+ in [0, 1] with robust H == L handling
-    hl_diff = highs - lows
-    w_plus = np.zeros(m_count, dtype=float)
-
-    for j in range(m_count):
-        if hl_diff[j] > 1e-9:
-            w_plus[j] = (closes[j] - lows[j]) / hl_diff[j]
-        else:
-            if j == 0:
-                if closes[0] > opens[0]:
-                    w_plus[0] = 1.0
-                elif closes[0] < opens[0]:
-                    w_plus[0] = 0.0
-                else:
-                    w_plus[0] = 0.5
-            else:
-                if closes[j] > closes[j - 1]:
-                    w_plus[j] = 1.0
-                elif closes[j] < closes[j - 1]:
-                    w_plus[j] = 0.0
-                else:
-                    w_plus[j] = 0.5
-
-    w_plus = np.clip(w_plus, 0.0, 1.0)
+    # w_j^+ in [0, 1] with robust H == L handling (shared helper with MS4 & MS20).
+    w_plus = _compute_bar_buy_weights(opens, highs, lows, closes)
     if tot_vol > 0:
         upvol_ratio = float((vols * w_plus).sum() / tot_vol)
     else:
@@ -1888,3 +1947,587 @@ def load_intraday_5m_universe(
         out[sym] = df_sym
 
     return out
+
+
+# =============================================================================
+# MS4: Pure Causal 5m Microstructure Operators (Stratified from <45 Gate)
+# =============================================================================
+
+
+def _compute_bvc_w_plus(
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+) -> np.ndarray:
+    """Alias delegating to shared ``_compute_bar_buy_weights``."""
+    return _compute_bar_buy_weights(opens, highs, lows, closes)
+
+
+def _filter_5m_by_cutoff(
+    df_5m: pd.DataFrame,
+    cutoff_time: Optional[Union[str, datetime.time]],
+) -> pd.DataFrame:
+    """Validate DatetimeIndex, sort if needed, and apply causal time <= cutoff_time filter."""
+    if not isinstance(df_5m.index, pd.DatetimeIndex):
+        raise TypeError("df_5m index must be a pd.DatetimeIndex")
+    work = df_5m.sort_index() if not df_5m.index.is_monotonic_increasing else df_5m
+    cutoff_t = _parse_time_cutoff(cutoff_time)
+    if cutoff_t is not None:
+        return work.loc[work.index.time <= cutoff_t]
+    return work
+
+
+def compute_core_intraday_return_5m(
+    df_5m: Optional[pd.DataFrame],
+    *,
+    daily_df: Optional[pd.DataFrame] = None,
+    morning_noise_end: str = "10:00",
+    cutoff_time: Optional[Union[str, datetime.time]] = "15:00",
+    symbol: Optional[str] = None,
+    degradation_trace: Optional[Dict[str, Any]] = None,
+) -> pd.Series:
+    """Compute core intraday return stripping the first 30m opening noise (MS4).
+
+    Pure causal window operator stratified from ``compute_daily_intraday_features``'s
+    ``full_bars < 45`` gate so cutoff-truncation equivalence tests pass cleanly.
+    When ``df_5m`` is missing/empty and ``daily_df`` is provided, falls back to
+    daily ``Close / Open - 1`` and logs a degradation trace via
+    ``common.intraday_coverage.record_5m_degradation_trace``.
+    """
+    from common.intraday_coverage import record_5m_degradation_trace
+
+    anchor_t = _parse_time_cutoff(morning_noise_end)
+    if anchor_t is None:
+        anchor_t = datetime.time(10, 0)
+
+    vals: Dict[pd.Timestamp, float] = {}
+    if df_5m is not None and not df_5m.empty:
+        df_cut = _filter_5m_by_cutoff(df_5m, cutoff_time)
+        for day_ts, day_bars in df_cut.groupby(df_cut.index.normalize()):
+            after_anchor = day_bars.loc[day_bars.index.time > anchor_t]
+            if after_anchor.empty:
+                vals[day_ts] = np.nan
+                continue
+            at_or_before = day_bars.loc[day_bars.index.time <= anchor_t]
+            if not at_or_before.empty:
+                p_anchor = float(at_or_before["Close"].iloc[-1])
+            else:
+                p_anchor = float(after_anchor["Open"].iloc[0])
+            p_end = float(after_anchor["Close"].iloc[-1])
+            if np.isfinite(p_anchor) and p_anchor > 0.0 and np.isfinite(p_end) and p_end > 0.0:
+                vals[day_ts] = (p_end / p_anchor) - 1.0
+            else:
+                vals[day_ts] = np.nan
+
+    if daily_df is not None and not daily_df.empty:
+        daily_idx = (
+            daily_df.index.normalize()
+            if isinstance(daily_df.index, pd.DatetimeIndex)
+            else pd.to_datetime(daily_df.index).normalize()
+        )
+        missing_dates = [d for d in daily_idx if d not in vals]
+        if missing_dates:
+            record_5m_degradation_trace(
+                degradation_trace,
+                symbol=symbol or "<unknown>",
+                operator="Core_Intraday_Ret_5m",
+                reason="missing_5m_bars",
+                fallback_used="daily_close_over_open",
+            )
+            o_arr = pd.to_numeric(daily_df["Open"], errors="coerce").to_numpy(dtype=np.float64)
+            c_arr = pd.to_numeric(daily_df["Close"], errors="coerce").to_numpy(dtype=np.float64)
+            for d_ts, o_v, c_v in zip(daily_idx, o_arr, c_arr):
+                if d_ts not in vals:
+                    vals[d_ts] = (
+                        (c_v / o_v) - 1.0
+                        if (np.isfinite(o_v) and o_v > 0.0 and np.isfinite(c_v) and c_v > 0.0)
+                        else np.nan
+                    )
+
+    if not vals:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="Core_Intraday_Ret_5m")
+    idx = pd.DatetimeIndex(sorted(vals.keys()))
+    return pd.Series([vals[d] for d in idx], index=idx, dtype=np.float64, name="Core_Intraday_Ret_5m")
+
+
+def compute_ofi_norm_5m(
+    df_5m: Optional[pd.DataFrame],
+    *,
+    daily_df: Optional[pd.DataFrame] = None,
+    cutoff_time: Optional[Union[str, datetime.time]] = "15:00",
+    symbol: Optional[str] = None,
+    degradation_trace: Optional[Dict[str, Any]] = None,
+) -> pd.Series:
+    """Compute normalized 5m BVC order-flow imbalance ``OFI_Norm_5m`` in ``[-1, 1]`` (MS4).
+
+    DISCLOSED APPROXIMATION: approximates order flow imbalance from 5m OHLCV bars via
+    Bulk Volume Classification ``(2 * w_j^+ - 1) * V_j / sum(V_j)`` rather than L2
+    limit-order-book events. Zero-volume days return ``NaN`` (never ``0.0``).
+    """
+    from common.intraday_coverage import record_5m_degradation_trace
+
+    vals: Dict[pd.Timestamp, float] = {}
+    if df_5m is not None and not df_5m.empty:
+        df_cut = _filter_5m_by_cutoff(df_5m, cutoff_time)
+        for day_ts, day_bars in df_cut.groupby(df_cut.index.normalize()):
+            opens = day_bars["Open"].to_numpy(dtype=np.float64, copy=False)
+            highs = day_bars["High"].to_numpy(dtype=np.float64, copy=False)
+            lows = day_bars["Low"].to_numpy(dtype=np.float64, copy=False)
+            closes = day_bars["Close"].to_numpy(dtype=np.float64, copy=False)
+            vols = day_bars["Volume"].to_numpy(dtype=np.float64, copy=False)
+            tot_vol = float(np.nansum(vols))
+            if not np.isfinite(tot_vol) or tot_vol <= 0.0:
+                vals[day_ts] = np.nan
+                continue
+            w_plus = _compute_bvc_w_plus(opens, highs, lows, closes)
+            signed_vol = (2.0 * w_plus - 1.0) * vols
+            vals[day_ts] = float(np.clip(np.nansum(signed_vol) / tot_vol, -1.0, 1.0))
+
+    if daily_df is not None and not daily_df.empty:
+        daily_idx = (
+            daily_df.index.normalize()
+            if isinstance(daily_df.index, pd.DatetimeIndex)
+            else pd.to_datetime(daily_df.index).normalize()
+        )
+        missing_dates = [d for d in daily_idx if d not in vals]
+        if missing_dates:
+            record_5m_degradation_trace(
+                degradation_trace,
+                symbol=symbol or "<unknown>",
+                operator="OFI_Norm_5m",
+                reason="missing_5m_bars",
+                fallback_used="daily_close_open_over_range",
+            )
+            o_arr = pd.to_numeric(daily_df["Open"], errors="coerce").to_numpy(dtype=np.float64)
+            h_arr = pd.to_numeric(daily_df["High"], errors="coerce").to_numpy(dtype=np.float64)
+            l_arr = pd.to_numeric(daily_df["Low"], errors="coerce").to_numpy(dtype=np.float64)
+            c_arr = pd.to_numeric(daily_df["Close"], errors="coerce").to_numpy(dtype=np.float64)
+            v_arr = pd.to_numeric(daily_df["Volume"], errors="coerce").to_numpy(dtype=np.float64)
+            for d_ts, o_v, h_v, l_v, c_v, v_v in zip(daily_idx, o_arr, h_arr, l_arr, c_arr, v_arr):
+                if d_ts not in vals:
+                    if (
+                        np.isfinite(v_v)
+                        and v_v > 0.0
+                        and np.isfinite(h_v)
+                        and np.isfinite(l_v)
+                        and h_v >= l_v > 0.0
+                        and np.isfinite(o_v)
+                        and np.isfinite(c_v)
+                    ):
+                        vals[d_ts] = float(np.clip((c_v - o_v) / (h_v - l_v + 1e-8), -1.0, 1.0))
+                    else:
+                        vals[d_ts] = np.nan
+
+    if not vals:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="OFI_Norm_5m")
+    idx = pd.DatetimeIndex(sorted(vals.keys()))
+    return pd.Series([vals[d] for d in idx], index=idx, dtype=np.float64, name="OFI_Norm_5m")
+
+
+def iceberg_accumulation_score(
+    df_5m: Optional[pd.DataFrame],
+    *,
+    daily_df: Optional[pd.DataFrame] = None,
+    cutoff_time: Optional[Union[str, datetime.time]] = "15:00",
+    range_scale: float = 0.02,
+    symbol: Optional[str] = None,
+    degradation_trace: Optional[Dict[str, Any]] = None,
+) -> pd.Series:
+    """Compute signed iceberg accumulation score: ``OFI_Norm * W_flat`` (MS4).
+
+    Positive normalized order-flow imbalance paired with tight sideways price
+    compression indicates stealth institutional accumulation. Wide-range breakout
+    days are dampened by ``W_flat = 1 / (1 + amp / range_scale + abs_ret / range_scale)``.
+    """
+    from common.intraday_coverage import record_5m_degradation_trace
+
+    if not np.isfinite(range_scale) or range_scale <= 0.0:
+        raise ValueError(f"range_scale must be positive and finite, got {range_scale!r}")
+
+    ofi_5m = (
+        compute_ofi_norm_5m(df_5m, cutoff_time=cutoff_time)
+        if (df_5m is not None and not df_5m.empty)
+        else pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]))
+    )
+
+    vals: Dict[pd.Timestamp, float] = {}
+    if df_5m is not None and not df_5m.empty:
+        df_cut = _filter_5m_by_cutoff(df_5m, cutoff_time)
+        for day_ts, day_bars in df_cut.groupby(df_cut.index.normalize()):
+            ofi_val = float(ofi_5m.get(day_ts, np.nan))
+            if not np.isfinite(ofi_val):
+                vals[day_ts] = np.nan
+                continue
+            high_max = float(day_bars["High"].max())
+            low_min = float(day_bars["Low"].min())
+            close_mean = float(day_bars["Close"].mean())
+            open_first = float(day_bars["Open"].iloc[0])
+            close_last = float(day_bars["Close"].iloc[-1])
+            if not (np.isfinite(close_mean) and close_mean > 0.0 and np.isfinite(open_first) and open_first > 0.0):
+                vals[day_ts] = np.nan
+                continue
+            amp = max(0.0, (high_max - low_min) / close_mean)
+            abs_ret = abs((close_last - open_first) / open_first)
+            w_flat = 1.0 / (1.0 + (amp / range_scale) + (abs_ret / range_scale))
+            vals[day_ts] = ofi_val * w_flat
+
+    if daily_df is not None and not daily_df.empty:
+        daily_idx = (
+            daily_df.index.normalize()
+            if isinstance(daily_df.index, pd.DatetimeIndex)
+            else pd.to_datetime(daily_df.index).normalize()
+        )
+        missing_dates = [d for d in daily_idx if d not in vals]
+        if missing_dates:
+            record_5m_degradation_trace(
+                degradation_trace,
+                symbol=symbol or "<unknown>",
+                operator="iceberg_accumulation_score",
+                reason="missing_5m_bars",
+                fallback_used="daily_proxy_ofi_flatness",
+            )
+            o_arr = pd.to_numeric(daily_df["Open"], errors="coerce").to_numpy(dtype=np.float64)
+            h_arr = pd.to_numeric(daily_df["High"], errors="coerce").to_numpy(dtype=np.float64)
+            l_arr = pd.to_numeric(daily_df["Low"], errors="coerce").to_numpy(dtype=np.float64)
+            c_arr = pd.to_numeric(daily_df["Close"], errors="coerce").to_numpy(dtype=np.float64)
+            v_arr = pd.to_numeric(daily_df["Volume"], errors="coerce").to_numpy(dtype=np.float64)
+            for d_ts, o_v, h_v, l_v, c_v, v_v in zip(daily_idx, o_arr, h_arr, l_arr, c_arr, v_arr):
+                if d_ts not in vals:
+                    if (
+                        np.isfinite(v_v)
+                        and v_v > 0.0
+                        and np.isfinite(o_v)
+                        and o_v > 0.0
+                        and np.isfinite(c_v)
+                        and c_v > 0.0
+                        and np.isfinite(h_v)
+                        and np.isfinite(l_v)
+                        and h_v >= l_v > 0.0
+                    ):
+                        ofi_p = float(np.clip((c_v - o_v) / (h_v - l_v + 1e-8), -1.0, 1.0))
+                        amp = max(0.0, (h_v - l_v) / c_v)
+                        abs_ret = abs((c_v - o_v) / o_v)
+                        w_flat = 1.0 / (1.0 + (amp / range_scale) + (abs_ret / range_scale))
+                        vals[d_ts] = ofi_p * w_flat
+                    else:
+                        vals[d_ts] = np.nan
+
+    if not vals:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="iceberg_accumulation_score")
+    idx = pd.DatetimeIndex(sorted(vals.keys()))
+    return pd.Series(
+        [vals[d] for d in idx], index=idx, dtype=np.float64, name="iceberg_accumulation_score"
+    )
+
+
+def smart_money_flow_divergence(
+    df_5m: Optional[pd.DataFrame],
+    *,
+    daily_df: Optional[pd.DataFrame] = None,
+    cutoff_time: Optional[Union[str, datetime.time]] = "15:00",
+    large_order_quantile: float = 0.80,
+    symbol: Optional[str] = None,
+    degradation_trace: Optional[Dict[str, Any]] = None,
+) -> pd.Series:
+    """Compute large-bar vs small-bar net inflow divergence (MS4).
+
+    Completely new semantics distinct from (and never reviving) the retired
+    ``SmartMoney_Q_5m`` column: compares BVC signed net-inflow rate on top-quantile
+    institutional-size bars against remaining retail-size bars, amplified on
+    downward price sessions to capture contrarian bottom accumulation.
+    """
+    from common.intraday_coverage import record_5m_degradation_trace
+
+    if not (0.5 <= large_order_quantile < 1.0):
+        raise ValueError(
+            f"large_order_quantile must lie in [0.5, 1.0), got {large_order_quantile!r}"
+        )
+
+    vals: Dict[pd.Timestamp, float] = {}
+    if df_5m is not None and not df_5m.empty:
+        df_cut = _filter_5m_by_cutoff(df_5m, cutoff_time)
+        for day_ts, day_bars in df_cut.groupby(df_cut.index.normalize()):
+            opens = day_bars["Open"].to_numpy(dtype=np.float64, copy=False)
+            highs = day_bars["High"].to_numpy(dtype=np.float64, copy=False)
+            lows = day_bars["Low"].to_numpy(dtype=np.float64, copy=False)
+            closes = day_bars["Close"].to_numpy(dtype=np.float64, copy=False)
+            vols = day_bars["Volume"].to_numpy(dtype=np.float64, copy=False)
+            pos_vol = np.isfinite(vols) & (vols > 0.0)
+            if int(pos_vol.sum()) < 5:
+                vals[day_ts] = np.nan
+                continue
+
+            w_plus = _compute_bvc_w_plus(opens, highs, lows, closes)
+            signed_flow = (2.0 * w_plus - 1.0) * vols
+            if "Amount" in day_bars.columns and day_bars["Amount"].notna().all():
+                trade_size = day_bars["Amount"].to_numpy(dtype=np.float64, copy=False)
+            else:
+                trade_size = vols * ((highs + lows + closes) / 3.0)
+
+            thresh = float(np.quantile(trade_size[pos_vol], large_order_quantile))
+            large_mask = pos_vol & (trade_size >= thresh)
+            small_mask = pos_vol & (~large_mask)
+            if not bool(large_mask.any()) or not bool(small_mask.any()):
+                vals[day_ts] = np.nan
+                continue
+
+            v_large = float(np.sum(vols[large_mask]))
+            v_small = float(np.sum(vols[small_mask]))
+            if v_large <= 0.0 or v_small <= 0.0:
+                vals[day_ts] = np.nan
+                continue
+
+            r_large = float(np.sum(signed_flow[large_mask]) / v_large)
+            r_small = float(np.sum(signed_flow[small_mask]) / v_small)
+            open_first = float(opens[0])
+            close_last = float(closes[-1])
+            ret_day = (
+                (close_last / open_first) - 1.0
+                if (np.isfinite(open_first) and open_first > 0.0 and np.isfinite(close_last))
+                else 0.0
+            )
+            contrarian_mult = 1.0 + max(0.0, -ret_day) * 10.0
+            vals[day_ts] = (r_large - r_small) * contrarian_mult
+
+    if daily_df is not None and not daily_df.empty:
+        daily_idx = (
+            daily_df.index.normalize()
+            if isinstance(daily_df.index, pd.DatetimeIndex)
+            else pd.to_datetime(daily_df.index).normalize()
+        )
+        missing_dates = [d for d in daily_idx if d not in vals]
+        if missing_dates:
+            record_5m_degradation_trace(
+                degradation_trace,
+                symbol=symbol or "<unknown>",
+                operator="smart_money_flow_divergence",
+                reason="missing_5m_bars",
+                fallback_used="daily_vwap_midpoint_divergence",
+            )
+            o_arr = pd.to_numeric(daily_df["Open"], errors="coerce").to_numpy(dtype=np.float64)
+            h_arr = pd.to_numeric(daily_df["High"], errors="coerce").to_numpy(dtype=np.float64)
+            l_arr = pd.to_numeric(daily_df["Low"], errors="coerce").to_numpy(dtype=np.float64)
+            c_arr = pd.to_numeric(daily_df["Close"], errors="coerce").to_numpy(dtype=np.float64)
+            v_arr = pd.to_numeric(daily_df["Volume"], errors="coerce").to_numpy(dtype=np.float64)
+            has_amt = "Amount" in daily_df.columns
+            amt_arr = (
+                pd.to_numeric(daily_df["Amount"], errors="coerce").to_numpy(dtype=np.float64)
+                if has_amt
+                else np.full(len(daily_df), np.nan)
+            )
+            for d_ts, o_v, h_v, l_v, c_v, v_v, a_v in zip(
+                daily_idx, o_arr, h_arr, l_arr, c_arr, v_arr, amt_arr
+            ):
+                if d_ts not in vals:
+                    if (
+                        np.isfinite(v_v)
+                        and v_v > 0.0
+                        and np.isfinite(h_v)
+                        and np.isfinite(l_v)
+                        and h_v >= l_v > 0.0
+                        and np.isfinite(o_v)
+                        and np.isfinite(c_v)
+                    ):
+                        tp = (a_v / v_v) if (np.isfinite(a_v) and a_v > 0.0) else ((h_v + l_v + c_v) / 3.0)
+                        mid = 0.5 * (h_v + l_v)
+                        vals[d_ts] = (tp - mid - (c_v - o_v)) / (h_v - l_v + 1e-8)
+                    else:
+                        vals[d_ts] = np.nan
+
+    if not vals:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="smart_money_flow_divergence")
+    idx = pd.DatetimeIndex(sorted(vals.keys()))
+    return pd.Series(
+        [vals[d] for d in idx], index=idx, dtype=np.float64, name="smart_money_flow_divergence"
+    )
+
+
+# =============================================================================
+# MS17, MS18, MS20: Late-Day Volume Share, Intraday Shape & Volume-Bucket VPIN
+# =============================================================================
+
+
+def late_day_volume_share(
+    df_5m: pd.DataFrame,
+    late_start: str = LATE_SESSION_START_5M,
+    late_end: str = SESSION_CLOSE_5M,
+    *,
+    cutoff_time: Optional[Union[str, datetime.time]] = SESSION_CLOSE_5M,
+) -> pd.Series:
+    """Compute late-session volume share ``sum(V_{late}) / sum(V_{session})`` (MS17).
+
+    Requires a complete session (``len(day_bars) >= 45`` after ``cutoff_time``
+    filtering) and a non-empty late slice; live ``cutoff_time="14:15"``, half-day
+    sessions, incomplete sessions (``< 45`` bars), or zero-volume days emit
+    ``NaN`` (never ``0.0`` or partial-day inflated ratios).
+    """
+    if df_5m is None or df_5m.empty:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="late_day_volume_share")
+    df_cut = _filter_5m_by_cutoff(df_5m, cutoff_time)
+    if df_cut.empty:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="late_day_volume_share")
+
+    vals: Dict[pd.Timestamp, float] = {}
+    for day_ts, day_bars in df_cut.groupby(df_cut.index.normalize()):
+        if len(day_bars) < 45:
+            vals[day_ts] = np.nan
+            continue
+        late_bars = _slice_intraday_time_window(day_bars, late_start, late_end)
+        if late_bars.empty:
+            vals[day_ts] = np.nan
+            continue
+        total_vol = float(_get_ohlcv_col(day_bars, "Volume").sum())
+        if not np.isfinite(total_vol) or total_vol <= 0.0:
+            vals[day_ts] = np.nan
+            continue
+        late_vol = float(_get_ohlcv_col(late_bars, "Volume").sum())
+        vals[day_ts] = float(late_vol / total_vol)
+
+    idx = pd.DatetimeIndex(sorted(vals.keys()))
+    return pd.Series(
+        [vals[d] for d in idx], index=idx, dtype=np.float64, name="late_day_volume_share"
+    )
+
+
+def intraday_shape_factor(
+    df_5m: pd.DataFrame,
+    open_end: str = MORNING_OPEN_END_5M,
+    late_start: str = LATE_SESSION_START_5M,
+    *,
+    cutoff_time: Optional[Union[str, datetime.time]] = SESSION_CLOSE_5M,
+) -> pd.Series:
+    """Compute intraday VWAP shape ``(VWAP_late - VWAP_open) / (High - Low)`` (MS18).
+
+    Shares session time constants and ``_slice_intraday_time_window`` with
+    ``late_day_volume_share``. Requires ``len(day_bars) >= 45`` after
+    ``cutoff_time`` filtering; zero price range, empty open/late slices, live
+    ``cutoff_time="14:15"``, or incomplete sessions emit ``NaN`` (never ``0.0``).
+    """
+    if df_5m is None or df_5m.empty:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="intraday_shape_factor")
+    df_cut = _filter_5m_by_cutoff(df_5m, cutoff_time)
+    if df_cut.empty:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="intraday_shape_factor")
+
+    vals: Dict[pd.Timestamp, float] = {}
+    for day_ts, day_bars in df_cut.groupby(df_cut.index.normalize()):
+        if len(day_bars) < 45:
+            vals[day_ts] = np.nan
+            continue
+        open_bars = _slice_intraday_time_window(day_bars, SESSION_OPEN_START_5M, open_end)
+        late_bars = _slice_intraday_time_window(day_bars, late_start, SESSION_CLOSE_5M)
+        if open_bars.empty or late_bars.empty:
+            vals[day_ts] = np.nan
+            continue
+
+        o_h = _get_ohlcv_col(open_bars, "High").to_numpy(dtype=np.float64)
+        o_l = _get_ohlcv_col(open_bars, "Low").to_numpy(dtype=np.float64)
+        o_c = _get_ohlcv_col(open_bars, "Close").to_numpy(dtype=np.float64)
+        o_v = _get_ohlcv_col(open_bars, "Volume").to_numpy(dtype=np.float64)
+        vol_open = float(np.nansum(o_v))
+
+        l_h = _get_ohlcv_col(late_bars, "High").to_numpy(dtype=np.float64)
+        l_l = _get_ohlcv_col(late_bars, "Low").to_numpy(dtype=np.float64)
+        l_c = _get_ohlcv_col(late_bars, "Close").to_numpy(dtype=np.float64)
+        l_v = _get_ohlcv_col(late_bars, "Volume").to_numpy(dtype=np.float64)
+        vol_late = float(np.nansum(l_v))
+
+        day_high = float(_get_ohlcv_col(day_bars, "High").max())
+        day_low = float(_get_ohlcv_col(day_bars, "Low").min())
+        day_range = day_high - day_low
+
+        if (
+            not np.isfinite(vol_open)
+            or vol_open <= 0.0
+            or not np.isfinite(vol_late)
+            or vol_late <= 0.0
+            or not np.isfinite(day_range)
+            or day_range <= 0.0
+        ):
+            vals[day_ts] = np.nan
+            continue
+
+        vwap_open = float(np.nansum(((o_h + o_l + o_c) / 3.0) * o_v) / vol_open)
+        vwap_late = float(np.nansum(((l_h + l_l + l_c) / 3.0) * l_v) / vol_late)
+        vals[day_ts] = float((vwap_late - vwap_open) / day_range)
+
+    idx = pd.DatetimeIndex(sorted(vals.keys()))
+    return pd.Series(
+        [vals[d] for d in idx], index=idx, dtype=np.float64, name="intraday_shape_factor"
+    )
+
+
+def volume_bucket_vpin_5m(
+    df_5m: pd.DataFrame,
+    n_buckets: int = 50,
+    *,
+    cutoff_time: Optional[Union[str, datetime.time]] = SESSION_CLOSE_5M,
+) -> pd.Series:
+    """Compute 5m BVC cumulative-volume-bucketed VPIN approximation (Task MS20).
+
+    DISCLOSED APPROXIMATION & HONEST MATHEMATICAL NOTE
+    --------------------------------------------------
+    - This is a **5-minute bar-level BVC approximation** of Easley, López de Prado
+      & O'Hara (2012) VPIN, **NOT** tick/Level-2 trade-classified true VPIN.
+    - It is strictly distinct from and non-interchangeable with ``UpVol_Ratio_5m``
+      (which aggregates a single daily ratio without equal-volume bucketing).
+    - Reuses ``_compute_bar_buy_weights`` (``w_plus in [0, 1]``) and partitions
+      cumulative daily volume ``cumsum(Volume)`` into ``n_buckets`` equal-volume
+      buckets of size ``V_B = total_vol / n_buckets`` via exact interval overlap:
+      ``VPIN = sum_tau |V_{tau, B} - V_{tau, S}| / total_vol in [0, 1]``.
+    - Under this exact formula, balanced 50/50 order flow (``w_plus == 0.5``) yields
+      ``VPIN == 0.0``, while one-sided flow (``w_plus == 1.0`` or ``0.0``) yields
+      ``VPIN == 1.0`` (note: archive §4.44 B3 prose inverted this wording).
+    - Requires ``len(day_bars) >= 45`` after ``cutoff_time`` filtering; live
+      ``cutoff_time="14:15"``, half-day sessions, or zero-volume days emit ``NaN``.
+    """
+    if int(n_buckets) < 1:
+        raise ValueError(f"n_buckets must be >= 1, got {n_buckets!r}")
+    if df_5m is None or df_5m.empty:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="volume_bucket_vpin_5m")
+
+    df_cut = _filter_5m_by_cutoff(df_5m, cutoff_time)
+    if df_cut.empty:
+        return pd.Series(dtype=np.float64, index=pd.DatetimeIndex([]), name="volume_bucket_vpin_5m")
+
+    nb = int(n_buckets)
+    vals: Dict[pd.Timestamp, float] = {}
+    for day_ts, day_bars in df_cut.groupby(df_cut.index.normalize()):
+        if len(day_bars) < 45:
+            vals[day_ts] = np.nan
+            continue
+        opens = _get_ohlcv_col(day_bars, "Open").to_numpy(dtype=np.float64)
+        highs = _get_ohlcv_col(day_bars, "High").to_numpy(dtype=np.float64)
+        lows = _get_ohlcv_col(day_bars, "Low").to_numpy(dtype=np.float64)
+        closes = _get_ohlcv_col(day_bars, "Close").to_numpy(dtype=np.float64)
+        vols = np.maximum(
+            np.nan_to_num(_get_ohlcv_col(day_bars, "Volume").to_numpy(dtype=np.float64), nan=0.0),
+            0.0,
+        )
+        total_vol = float(np.sum(vols))
+        if not np.isfinite(total_vol) or total_vol <= 0.0:
+            vals[day_ts] = np.nan
+            continue
+
+        w_plus = _compute_bar_buy_weights(opens, highs, lows, closes)
+        density = 2.0 * w_plus - 1.0  # (V_buy - V_sell) per unit volume in [-1, 1]
+
+        bar_ends = np.cumsum(vols)
+        bar_starts = np.r_[0.0, bar_ends[:-1]]
+        bucket_edges = np.linspace(0.0, total_vol, nb + 1)
+        bucket_lows = bucket_edges[:-1]
+        bucket_highs = bucket_edges[1:]
+
+        overlap = np.maximum(
+            0.0,
+            np.minimum(bucket_highs[:, None], bar_ends[None, :])
+            - np.maximum(bucket_lows[:, None], bar_starts[None, :]),
+        )
+        bucket_imbalance = np.abs(overlap @ density)
+        vals[day_ts] = float(np.clip(np.sum(bucket_imbalance) / total_vol, 0.0, 1.0))
+
+    idx = pd.DatetimeIndex(sorted(vals.keys()))
+    return pd.Series(
+        [vals[d] for d in idx], index=idx, dtype=np.float64, name="volume_bucket_vpin_5m"
+    )

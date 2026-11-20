@@ -677,3 +677,30 @@ def test_daily_factors_invalid_daily_data_frame_is_rejected():
     bad = {"TRENDY": pd.DataFrame({"Close": [1.0, 2.0]})}  # no Volume column
     with pytest.raises(ValueError, match="missing column"):
         score_universe(metrics, use_daily_factors=True, daily_data=bad)
+
+
+def test_ms_factors_independent_channel_preserves_overall_score_and_m31():
+    from selectorbot.scoring import (
+        MS_FACTOR_RAW_COLUMNS,
+        MS_FACTOR_SCORE_COLUMNS,
+        MS_FACTOR_WEIGHTS,
+    )
+
+    metrics = make_metrics()
+    daily_data = _daily_frames({"TRENDY": 0.002, "MEANREVY": -0.002, "NEUTRAL": 0.0})
+
+    # All MS_FACTOR_WEIGHTS default to 0.0 (W1b un-ignited contract)
+    assert all(w == 0.0 for w in MS_FACTOR_WEIGHTS.values())
+    assert set(DAILY_FACTOR_RAW_COLUMNS) == {"vwap_slope", "ivol_residual", "momentum_1m_1w"}
+
+    off = score_universe(metrics)
+    on = score_universe(metrics, use_ms_factors=True, daily_data=daily_data)
+
+    expected_new = set(MS_FACTOR_RAW_COLUMNS) | set(MS_FACTOR_SCORE_COLUMNS)
+    assert set(on.columns) - set(off.columns) == expected_new
+    # Pre-existing columns including overall_selection_score are bit-identical
+    pd.testing.assert_frame_equal(on[list(off.columns)], off, atol=0.0, rtol=0.0)
+    # Daily MS15/MS16 populated; missing 5m data stays NaN (never 0.0)
+    assert on["amihud_illiquidity_ratio"].notna().all()
+    assert on["max_return"].notna().all()
+    assert on["late_day_volume_share"].isna().all()
