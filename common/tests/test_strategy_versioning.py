@@ -227,6 +227,10 @@ def test_research_strategies_versioning():
     - ChanVolumeProfileHybridStrategy: HVN validation now uses the same-window
       value area (VAL/VAH) instead of the stale confirmed pivot [ZD, ZG].
     """
+    from pipeline.research_strategy.rs.microstructure_alpha_strategy import (
+        MicrostructureAlphaCompositeStrategy,
+    )
+
     expected_versions = {
         ChanThreeTypeStrategy: "1.0.0",
         ChanVaaCompoundStrategy: "1.0.0",
@@ -237,6 +241,7 @@ def test_research_strategies_versioning():
         WyckoffChanSpringStrategy: "1.1.0",
         ChanMeanReversionDivergenceStrategy: "1.1.0",
         ChanVolumeProfileHybridStrategy: "1.1.0",
+        MicrostructureAlphaCompositeStrategy: "1.0.0",
     }
     for cls, expected in expected_versions.items():
         s = cls()

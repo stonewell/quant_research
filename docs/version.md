@@ -7008,3 +7008,55 @@ opt-in Ledoit-Wolf 稳健协方差开关的版本演进与验证记录。
   `test_turnover_penalized_qp.py`、`test_strategy_versioning.py`、`test_blend_strategy_versioning.py`
   全量通过。
 
+---
+
+## 51. Track MS (MS7): 新增微观结构多因子复合策略 MicrostructureAlphaCompositeStrategy（version = 1.0.0，2026-11-19）
+
+本节记录 Track MS Phase P2/P3（任务 `MS7` 与 `MS13`）新增独立注册的微观结构多因子复合策略
+`MicrostructureAlphaCompositeStrategy`（`version = "1.0.0"`）及其离线退场门禁验证脚本
+`scripts/verify_ms7_exit_gate.py`。
+
+### 51.1 版本双轴与配置注册（遵循 `AGENTS.md` Rule 7）
+
+| 构件 / 策略 | 旧版本 | 新版本 | 变更说明 |
+| :--- | :---: | :---: | :--- |
+| `MicrostructureAlphaCompositeStrategy` | —（新增） | **`1.0.0`** | 全新独立微观结构多因子复合策略，不继承 `BaseBlendAllocationStrategy`（`base_version = null`） |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.1.0` | **`2.1.0`（不变）** | `blend_base.py` 与所有既有 blend 策略未改动；`chan_four_state_blend` 保持 `regime_ic_ir_hybrid` |
+
+### 51.2 六阶段量化架构与零僵尸参数核验（`P1.7`）
+
+1. **多因子族提取（`MS2` / `MS3` / `MS4` / `MS16`）**：串联 CYQ 筹码成本偏离与 90-10 分位宽
+   （`cyq_cost_deviation`、`cyq_quantile_spread_90_10`）、Ledoit-Wolf 偏相关同业动量溢出与筹码交互
+   （`compute_peer_momentum_spillover`、`compute_peer_chip_interaction_alpha`）、隔夜/日内收益拆解与
+   涨停磁吸/炸板惩罚（`overnight_return`、`intraday_return`、`limit_up_magnet_and_break`）、
+   日线代理微观结构指标（`iceberg_accumulation_score`、`smart_money_flow_divergence`）及动量-防彩票
+   （`roc` - `max_return`）。
+2. **截面净化与因子级 Löwdin 正交化（`MS1`）**：执行 `cs_mad_winsorize` $\to$ 可选
+   `cs_neutralize_ols`（含小样本自由度降级阶梯）$\to$ `cs_rank_gaussian_or_uniform(method="gaussian")`
+   $\to$ 可选 `cs_lowdin_orthogonalize`。
+3. **非对称迟滞选股带（复用 `M1.2`）**：直接调用 `common/selection_band.py::RankBandSelection`
+   （`ms7_buy_band_pct=0.25`、`ms7_sell_band_pct=0.50`、`ms7_delta_score_sigma=0.25`），零重复实现。
+4. **带 $L_{1.5}$ 冲击惩罚的凸优化配权（`MS3` + `MS6`）**：使用 `ledoit_wolf_shrinkage`、
+   `compute_almgren_chriss_impact_coefficients` 与 `_alpha_impact_penalized_weights` 求解幸存标的最优权重；
+   严格遵守稀疏权重契约（非调仓日全 `NaN`，调仓日未选中或退出标的显式写 `0.0`，余量入 `cash_proxy`）。
+5. **零僵尸参数（`P1.7`）**：`StrategyConfig` 新增 13 个 `ms7_*` 字段均在
+   `microstructure_alpha_strategy.py` 业务逻辑中消费，`pipeline/tests/test_config_wiring.py` 100% 通过。
+
+### 51.3 离线退场门禁与配置同步（`MS13`，100% 离线，Rule 1 / Rule 4 / Rule 9）
+
+- 已运行 `pipeline/research_strategy/run_research_strategy.py --dump-strategies` 刷新全量 59 份策略
+  dump（含 `microstructure_alpha_composite_strategy.json`）。
+- 离线验证脚本 `scripts/verify_ms7_exit_gate.py --n-days 520 --n-symbols 10 --n-folds 4 --ers-n-random 25 --seed 42`
+  已完成全部非空洞 Rule 9 门禁核验（`opt_in_exit_gate_passed = true`），关键指标如下：
+
+| 指标 | MS7（含 BIL） | MS7（纯风险资产） | M1.2（CSMom+RankBand） | M1.3（MinVar+L1） |
+| :--- | :---: | :---: | :---: | :---: |
+| Sharpe Ratio | **1.5932** | **1.5934** | 1.5258 | 1.1922 |
+| CAGR | **26.20%** | **26.19%** | 23.73% | 14.76% |
+| Max Drawdown | 14.43% | 14.44% | 13.76% | 12.10% |
+| DSR（`n_obs=519`） | **1.0000** | — | — | — |
+| 单次 ERS 分位（`ers_called_count=1`） | **100.0%（`trusted=true`）** | — | — | — |
+| 换手率消融（惩罚 vs 无惩罚） | **15.1351 vs 29.2595（-48.3%）** | — | — | — |
+
+- 作为 opt-in 注册策略上线，不修改任何默认推荐生产策略配置（`modifies_default_config = false`）。
+

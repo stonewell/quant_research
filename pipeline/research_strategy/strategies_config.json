@@ -1206,6 +1206,29 @@
       "cash_proxy": "BIL"
     },
     "factors": ["mean_reversion", "regime_trend_strength"]
+  },
+  "microstructure_alpha_composite": {
+    "name": "Microstructure Multi-Factor Composite Strategy (MS7)",
+    "type": "class",
+    "class_name": "MicrostructureAlphaCompositeStrategy",
+    "description": "Track MS (MS7) institutional short-to-medium horizon composite strategy chaining MS1 cross-sectional MAD/OLS/Lowdin purification, MS2 CYQ cost deviation & 90-10 chip spread, MS3 Ledoit-Wolf partial-correlation peer momentum spillover, MS4 overnight/intraday split & microstructure accumulation, M1.2 RankBandSelection hysteresis buffer, and MS6 L1.5 Almgren-Chriss impact-penalized convex optimization.",
+    "parameters": {
+      "ms7_rebalance_freq_days": 10,
+      "ms7_lookback_days": 20,
+      "ms7_mad_n": 3.0,
+      "ms7_buy_band_pct": 0.25,
+      "ms7_sell_band_pct": 0.50,
+      "ms7_delta_score_sigma": 0.25,
+      "ms7_risk_aversion": 2.0,
+      "ms7_turnover_penalty_l1": 0.05,
+      "ms7_impact_penalty_l15": 0.10,
+      "ms7_single_stock_cap": 0.35,
+      "ms7_cash_allowance": 0.20,
+      "ms7_enable_lowdin_ortho": true,
+      "ms7_enable_ols_neutralize": true,
+      "cash_proxy": "BIL"
+    },
+    "factors": ["relative_momentum", "mean_reversion", "volatility_targeting"]
   }
 }
 

@@ -2100,6 +2100,8 @@ class AdaptiveAssetAllocation(AllocationTemplate):
 # `common/README.md`'s cross-project import convention note for how a consumer
 # reaches this module.
 
+from .microstructure_alpha_strategy import MicrostructureAlphaCompositeStrategy
+
 STRATEGY_CLASS_MAP = {
     "AcceleratingDualMomentum": AcceleratingDualMomentum,
     "AdaptiveAssetAllocation": AdaptiveAssetAllocation,
@@ -2134,6 +2136,7 @@ STRATEGY_CLASS_MAP = {
     "GTJAAlphaStrategy": GTJAAlphaStrategy,
     "HFEAStrategy": HFEAStrategy,
     "HybridAssetAllocationStrategy": HybridAssetAllocationStrategy,
+    "MicrostructureAlphaCompositeStrategy": MicrostructureAlphaCompositeStrategy,
     "MultiStrategyAlphaBookStrategy": MultiStrategyAlphaBookStrategy,
     "NaturalLanguageStrategy": NaturalLanguageStrategy,
     "PermanentPortfolioStrategy": PermanentPortfolioStrategy,

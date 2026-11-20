@@ -1032,6 +1032,21 @@ class StrategyConfig:
     hk_trading: bool = False                 # Apply HK market rules (board lot, 0.1085% dual-sided stamp/levies, T+0)
     chan_causal_signals: bool = True         # Strictly causal point-in-time signal generation for Chan strategies (default ON)
 
+    # --- Track MS (MS7) Microstructure Alpha Composite Strategy ---
+    ms7_rebalance_freq_days: int = 10
+    ms7_lookback_days: int = 20
+    ms7_mad_n: float = 3.0
+    ms7_buy_band_pct: float = 0.25
+    ms7_sell_band_pct: float = 0.50
+    ms7_delta_score_sigma: float = 0.25
+    ms7_risk_aversion: float = 2.0
+    ms7_turnover_penalty_l1: float = 0.05
+    ms7_impact_penalty_l15: float = 0.10
+    ms7_single_stock_cap: float = 0.35
+    ms7_cash_allowance: float = 0.20
+    ms7_enable_lowdin_ortho: bool = True
+    ms7_enable_ols_neutralize: bool = True
+
     def __post_init__(self):
         """Validates only the handful of fields used downstream as divisors,
         loop bounds, or array indices (`strategy.py`'s generate_weights
@@ -1053,6 +1068,29 @@ class StrategyConfig:
             raise ValueError(f"StrategyConfig.slippage_pct must be >= 0, got {self.slippage_pct}")
         if self.initial_capital <= 0:
             raise ValueError(f"StrategyConfig.initial_capital must be > 0, got {self.initial_capital}")
+        if self.ms7_rebalance_freq_days <= 0:
+            raise ValueError(f"StrategyConfig.ms7_rebalance_freq_days must be > 0, got {self.ms7_rebalance_freq_days}")
+        if self.ms7_lookback_days < 5:
+            raise ValueError(f"StrategyConfig.ms7_lookback_days must be >= 5, got {self.ms7_lookback_days}")
+        if self.ms7_mad_n <= 0.0:
+            raise ValueError(f"StrategyConfig.ms7_mad_n must be > 0, got {self.ms7_mad_n}")
+        if not (0.0 < self.ms7_buy_band_pct < self.ms7_sell_band_pct <= 1.0):
+            raise ValueError(
+                f"StrategyConfig requires 0 < ms7_buy_band_pct ({self.ms7_buy_band_pct}) "
+                f"< ms7_sell_band_pct ({self.ms7_sell_band_pct}) <= 1"
+            )
+        if self.ms7_delta_score_sigma < 0.0:
+            raise ValueError(f"StrategyConfig.ms7_delta_score_sigma must be >= 0, got {self.ms7_delta_score_sigma}")
+        if self.ms7_risk_aversion <= 0.0:
+            raise ValueError(f"StrategyConfig.ms7_risk_aversion must be > 0, got {self.ms7_risk_aversion}")
+        if self.ms7_turnover_penalty_l1 < 0.0:
+            raise ValueError(f"StrategyConfig.ms7_turnover_penalty_l1 must be >= 0, got {self.ms7_turnover_penalty_l1}")
+        if self.ms7_impact_penalty_l15 < 0.0:
+            raise ValueError(f"StrategyConfig.ms7_impact_penalty_l15 must be >= 0, got {self.ms7_impact_penalty_l15}")
+        if not (0.0 < self.ms7_single_stock_cap <= 1.0):
+            raise ValueError(f"StrategyConfig.ms7_single_stock_cap must be in (0, 1], got {self.ms7_single_stock_cap}")
+        if not (0.0 <= self.ms7_cash_allowance < 1.0):
+            raise ValueError(f"StrategyConfig.ms7_cash_allowance must be in [0, 1), got {self.ms7_cash_allowance}")
         if not isinstance(self.min_shares, int) or self.min_shares < 1:
             raise ValueError(f"StrategyConfig.min_shares must be an integer >= 1, got {self.min_shares!r}")
         if not isinstance(self.china_trading, bool):
