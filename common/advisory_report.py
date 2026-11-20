@@ -60,6 +60,7 @@ it by a caller.
 from __future__ import annotations
 
 import math
+import numbers
 from typing import Any, Dict, Iterable, Optional
 
 from common.live_capacity import (
@@ -76,6 +77,7 @@ __all__ = [
     "ADVISORY_PHASES",
     "DD_TROUGH_BASIS_DAILY_HWM",
     "build_advisory_block",
+    "factor_crowding_to_dict",
     "r1_decision_to_dict",
 ]
 
@@ -157,6 +159,63 @@ def r1_decision_to_dict(
     }
 
 
+def factor_crowding_to_dict(crowding: Any) -> Dict[str, Any]:
+    """Pure field extraction from `common.factor_crowding.compute_factor_crowding_metrics` output.
+
+    Preserves the advisory-only fence (`advisory: True`, `gates_orders: False`)
+    and converts every numeric field via `_json_number` so NaN/Infinity become
+    `None` (strict JSON). Contains zero threshold literals.
+    """
+    if isinstance(crowding, dict):
+        src = crowding
+    elif hasattr(crowding, "to_dict"):
+        src = crowding.to_dict()
+    else:
+        src = {
+            "status": getattr(crowding, "status", None),
+            "top_pairwise_corr": getattr(crowding, "top_pairwise_corr", None),
+            "top_turnover_concentration": getattr(
+                crowding, "top_turnover_concentration", None
+            ),
+            "dispersion_compression_ratio": getattr(
+                crowding, "dispersion_compression_ratio", None
+            ),
+            "n_assets": getattr(crowding, "n_assets", None),
+            "n_cross_section": getattr(crowding, "n_cross_section", None),
+            "top_pool_size": getattr(crowding, "top_pool_size", None),
+            "n_top_bucket": getattr(crowding, "n_top_bucket", None),
+            "reason": getattr(crowding, "reason", None),
+        }
+
+    n_cs = src.get("n_assets") if src.get("n_assets") is not None else src.get("n_cross_section")
+    n_top = src.get("top_pool_size") if src.get("top_pool_size") is not None else src.get("n_top_bucket")
+    return {
+        "advisory": True,
+        "gates_orders": False,
+        "status": str(src.get("status") or "INSUFFICIENT_HISTORY"),
+        "top_pairwise_corr": _json_number(src.get("top_pairwise_corr")),
+        "top_turnover_concentration": _json_number(
+            src.get("top_turnover_concentration")
+        ),
+        "dispersion_compression_ratio": _json_number(
+            src.get("dispersion_compression_ratio")
+        ),
+        "n_cross_section": (
+            int(n_cs)
+            if isinstance(n_cs, numbers.Integral) and not isinstance(n_cs, bool)
+            else None
+        ),
+        "n_top_bucket": (
+            int(n_top)
+            if isinstance(n_top, numbers.Integral) and not isinstance(n_top, bool)
+            else None
+        ),
+        "reason": (
+            str(src.get("reason")) if src.get("reason") is not None else None
+        ),
+    }
+
+
 def build_advisory_block(
     *,
     phase: str,
@@ -166,6 +225,7 @@ def build_advisory_block(
     as_of: Any = None,
     r1: Any = None,
     real_buy_scale: Any = None,
+    factor_crowding: Any = None,
 ) -> Dict[str, Any]:
     """Build the one advisory dict every pass (`P1`/`P2`/`P3`) writes.
 
@@ -243,5 +303,8 @@ def build_advisory_block(
         multiplier = _json_number((block.get("r1") or {}).get("multiplier"))
         if multiplier is not None:
             block["shadow_buy_scale"] = _json_number(buy_scale * multiplier)
+
+    if factor_crowding is not None:
+        block["factor_crowding"] = factor_crowding_to_dict(factor_crowding)
 
     return block

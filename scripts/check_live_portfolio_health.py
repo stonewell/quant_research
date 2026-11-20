@@ -2486,6 +2486,34 @@ VOL_SCOPE_BASIS_CROSS_SECTIONAL = "cross_sectional_median"
 VOL_SCOPE_RATIO_WARN_THRESHOLD = 1.5
 
 
+def compute_stage1_factor_crowding_advisory(
+    factor_scores: Any = None,
+    returns_panel: Any = None,
+    turnover_panel: Any = None,
+    *,
+    enabled: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Optional Stage-1 advisory-only factor crowding report helper (MS14 / AT7 P1).
+
+    When ``enabled=False`` (default), returns ``None`` so ``build_advisory_block``
+    remains byte-for-byte identical to pre-MS14. When ``enabled=True``, evaluates
+    ``common.factor_crowding.compute_factor_crowding_metrics`` (emitting
+    ``INSUFFICIENT_HISTORY`` on empty or ``N < 15`` inputs, never ``NORMAL``) and
+    wraps it with ``factor_crowding_to_dict`` (always ``advisory=True``,
+    ``gates_orders=False``; mutually exclusive with LV18 vol de-risking).
+    """
+    if not enabled:
+        return None
+    from common.advisory_report import factor_crowding_to_dict
+    from common.factor_crowding import compute_factor_crowding_metrics
+
+    f_df = factor_scores if isinstance(factor_scores, pd.DataFrame) else pd.DataFrame()
+    r_df = returns_panel if isinstance(returns_panel, pd.DataFrame) else pd.DataFrame()
+    t_df = turnover_panel if isinstance(turnover_panel, pd.DataFrame) else None
+    raw = compute_factor_crowding_metrics(f_df, r_df, t_df)
+    return factor_crowding_to_dict(raw)
+
+
 def carry_dd_trough_basis_into_r1(
     advisory: Optional[Dict[str, Any]],
     intraday_5m_info: Optional[Dict[str, Any]],
@@ -5616,14 +5644,16 @@ def main(cli_args: Optional[List[str]] = None):
         single_stock_cap=single_stock_cap,
     )
 
-    # (`AT7` P1) One advisory block for this run, built from HONEST EMPTY INPUTS:
+    # (`AT7` P1 / `MS14`) One advisory block for this run, built from HONEST EMPTY INPUTS:
     # no cross-sectional score source exists in the live chain yet
     # (`common/signal_snapshot.py:12-38`) and there is no executed-notional
     # ledger, so the matrix renders INSUFFICIENT and both capacity labels
     # render MISSING. Nothing is fabricated to make the report look measured.
+    factor_crowding_block = compute_stage1_factor_crowding_advisory(enabled=False)
     advisory_block = build_advisory_block(
         phase=ADVISORY_PHASE_P1,
         as_of=as_of_date,
+        factor_crowding=factor_crowding_block,
     )
     # (2026-11-16) The R1 block, when one is present, now says WHICH drawdown it read;
     # `dd_source="dd_trough"` only names the field. No-op for today's P1 shape (no `r1`

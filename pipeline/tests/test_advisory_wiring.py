@@ -1225,3 +1225,151 @@ def test_p3_enforced_run_marks_r1_gates_orders(stage2):
                     seen.append(node)
     assert len(seen) == 1, "exactly one `advisory_block['r1']['gates_orders'] = True`"
     assert _assigns_true(seen[0])
+
+
+# =============================================================================
+# MS14: Stage-1 Factor Crowding Advisory Wiring (AT7 P1 Fence)
+# =============================================================================
+
+
+def test_ms14_factor_crowding_omitted_is_bit_identical():
+    from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
+
+    b1 = build_advisory_block(phase=ADVISORY_PHASE_P1, as_of="2026-11-19")
+    b2 = build_advisory_block(phase=ADVISORY_PHASE_P1, as_of="2026-11-19", factor_crowding=None)
+    assert b1 == b2
+    assert "factor_crowding" not in b1
+
+
+def test_ms14_factor_crowding_insufficient_history_and_three_states():
+    import numpy as np
+
+    from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
+    from common.factor_crowding import (
+        CROWDING_STATUS_INSUFFICIENT,
+        CROWDING_STATUS_NORMAL,
+        CROWDING_STATUS_QUAKE,
+        CROWDING_STATUS_WATCH,
+        compute_factor_crowding_metrics,
+    )
+    from scripts.check_live_portfolio_health import compute_stage1_factor_crowding_advisory
+
+    # Disabled returns None (zero drift)
+    assert compute_stage1_factor_crowding_advisory(enabled=False) is None
+
+    # Enabled with empty / N < 15 emits INSUFFICIENT_HISTORY (never NORMAL, never 0.0)
+    insuff = compute_stage1_factor_crowding_advisory(enabled=True)
+    assert insuff is not None
+    assert insuff["status"] == CROWDING_STATUS_INSUFFICIENT
+    assert insuff["advisory"] is True
+    assert insuff["gates_orders"] is False
+    assert insuff["top_pairwise_corr"] is None
+
+    small_df = pd.DataFrame(np.ones((25, 10)), index=pd.bdate_range("2025-01-02", periods=25))
+    small_res = compute_factor_crowding_metrics(small_df, small_df)
+    blk_small = build_advisory_block(
+        phase=ADVISORY_PHASE_P1, as_of="2026-11-19", factor_crowding=small_res
+    )
+    assert blk_small["factor_crowding"]["status"] == CROWDING_STATUS_INSUFFICIENT
+    assert blk_small["factor_crowding"]["gates_orders"] is False
+
+    # All three measured states round-trip cleanly with advisory=True, gates_orders=False
+    for st in (CROWDING_STATUS_NORMAL, CROWDING_STATUS_WATCH, CROWDING_STATUS_QUAKE):
+        blk = build_advisory_block(
+            phase=ADVISORY_PHASE_P1,
+            as_of="2026-11-19",
+            factor_crowding={
+                "status": st,
+                "top_pairwise_corr": 0.42,
+                "top_turnover_concentration": 0.25,
+                "dispersion_compression_ratio": 0.90,
+                "n_assets": 30,
+                "top_pool_size": 6,
+                "reason": "ok",
+            },
+        )
+        fc = blk["factor_crowding"]
+        assert fc["status"] == st
+        assert fc["advisory"] is True
+        assert fc["gates_orders"] is False
+        assert fc["n_cross_section"] == 30
+        assert fc["n_top_bucket"] == 6
+
+
+def test_ms14_factor_crowding_strict_json_roundtrip():
+    import json
+
+    import numpy as np
+
+    from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
+
+    blk = build_advisory_block(
+        phase=ADVISORY_PHASE_P1,
+        as_of="2026-11-19",
+        factor_crowding={
+            "status": "QUANT_QUAKE_RISK",
+            "top_pairwise_corr": np.float64(0.88),
+            "top_turnover_concentration": float("nan"),
+            "dispersion_compression_ratio": float("inf"),
+            "n_assets": 30,
+            "top_pool_size": 6,
+            "reason": "ok",
+        },
+    )
+    raw = json.dumps(blk, ensure_ascii=False, allow_nan=False)
+    parsed = json.loads(raw)
+    assert parsed["factor_crowding"]["top_pairwise_corr"] == pytest.approx(0.88)
+    assert parsed["factor_crowding"]["top_turnover_concentration"] is None
+    assert parsed["factor_crowding"]["dispersion_compression_ratio"] is None
+
+
+def test_ms14_factor_crowding_never_changes_stage2_orders(stage2):
+    from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
+
+    mod = stage2
+    cash_proxy = "511880.SH"
+    target = pd.Series({"000001.SZ": 0.32, "600519.SH": 0.18, cash_proxy: 0.50})
+    current = pd.Series({"000001.SZ": 0.10, "600519.SH": 0.24, cash_proxy: 0.66})
+
+    quake_block = build_advisory_block(
+        phase=ADVISORY_PHASE_P1,
+        as_of="2026-11-19",
+        factor_crowding={"status": "QUANT_QUAKE_RISK", "top_pairwise_corr": 0.90, "n_assets": 30},
+    )
+    plain_report = {"gate_code": "CAUTION_INTRADAY_DISTRIBUTION", "intraday_buy_scale": 0.50}
+    crowded_report = dict(plain_report, advisory=quake_block)
+
+    t_plain = mod.apply_intraday_distribution_gate(
+        target.copy(), current, cash_proxy, health_report=plain_report, account_state={}
+    )
+    t_crowded = mod.apply_intraday_distribution_gate(
+        target.copy(), current, cash_proxy, health_report=crowded_report, account_state={}
+    )
+    pd.testing.assert_series_equal(t_plain, t_crowded)
+
+    def _row(with_adv: bool):
+        detail = {"summary_reason": "ms14-test"}
+        if with_adv:
+            detail["advisory"] = quake_block
+        return {
+            "symbol": "600519.SH",
+            "price": 1680.0,
+            "target_shares": 100,
+            "current_shares": 0,
+            "delta_shares": 100,
+            "current_weight": 0.0,
+            "trade_value": 168000.0,
+            "trade_value_rmb": 168000.0,
+            "reason": "",
+            "summary_reason": "",
+            "detail_reason": detail,
+        }
+
+    r_plain = mod.apply_market_value_cap(
+        _row(False), portfolio_value=1_000_000.0, max_weight=0.10, lot_size=100, enforce=True
+    )
+    r_crowded = mod.apply_market_value_cap(
+        _row(True), portfolio_value=1_000_000.0, max_weight=0.10, lot_size=100, enforce=True
+    )
+    for k in ("target_shares", "current_shares", "delta_shares", "trade_value"):
+        assert r_plain[k] == r_crowded[k]

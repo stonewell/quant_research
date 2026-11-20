@@ -6964,3 +6964,47 @@ Rule-9 端到端同种子（`--data-provider synthetic --small-data --seed 42`�
   `holdout_ic_valid_bars=355`、`holdout_trailing_unlabeled_bars=6`（恒等于 `h = k + exec_lag = 5 + 1`），
   并记录两窗首末日（回测 `2023-08-15 → 2024-12-31`，IC 有效 `2023-08-15 → 2024-12-23`）。
   即 holdout Sharpe/CAGR 比 IC/`t_stat` 验证多覆盖 6 根 bar；README 已同步说明。
+
+---
+
+## 50. MS6: 带 L1.5 非线性冲击惩罚的 SLSQP 凸优化求解器与稳健协方差源接入（MinimumVarianceAllocation 1.1.0 → 1.2.0, HierarchicalRiskParityAllocation 1.0.0 → 1.1.0，2026-11-19）
+
+本节记录 Track MS Phase P1（任务 `MS6`）在 `common/allocation_templates.py` 中新增
+Almgren-Chriss $L_{1.5}$ 市场冲击惩罚 SLSQP 凸优化求解器，并为静态组合模板接入
+opt-in Ledoit-Wolf 稳健协方差开关的版本演进与验证记录。
+
+### 50.1 版本双轴变更（遵循 `AGENTS.md` Rule 7）
+
+| 构件 / 模板 | 旧版本 | 新版本 | 变更说明 |
+| :--- | :---: | :---: | :--- |
+| `MinimumVarianceAllocation` | `1.1.0` | **`1.2.0`** | 新增默认关闭的 `min_var_robust_cov: bool = False`（不入 `param_grid`），开启后以 `ledoit_wolf_shrinkage` 替代 `denoise_covariance` |
+| `HierarchicalRiskParityAllocation` | `1.0.0` | **`1.1.0`** | 新增默认关闭的 `hrp_robust_cov: bool = False`（不入 `param_grid`），开启后以 `ledoit_wolf_shrinkage` 替代 `denoise_covariance` |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.1.0` | **`2.1.0`（不变）** | `blend_base.py` 未改动，底座引擎版本零变动 |
+
+### 50.2 核心量化与求解器逻辑
+
+- **Almgren-Chriss 冲击系数与 $L_{1.5}$ 求解器（`common/allocation_templates.py`）**：
+  - 冻结平滑底数 `SMOOTH_TURNOVER_EPS = 1e-6`（对齐 `M1.3` `_turnover_penalized_weights`）。
+  - 新增 `compute_almgren_chriss_impact_coefficients(volatility, adv)`，计算
+    $\kappa_i \propto \sigma_i / \sqrt{\max(\text{ADV}_i, \text{min\_adv})}$（默认按中位数无量纲化为 1.0）。
+  - 新增 `_alpha_impact_penalized_weights`，基于纯 `scipy.optimize.minimize(..., method="SLSQP")`
+    与解析雅可比矩阵（`jac`）最小化
+    $-w^T\alpha + \frac{\lambda}{2} w^T \Sigma w + \gamma_{\text{lin}} \sum \sqrt{\Delta w_i^2 + \epsilon}
+    + \gamma_{\text{imp}} \sum \kappa_i (\Delta w_i^2 + \epsilon)^{0.75}$。
+  - 严格继承 `M1.3` 现金箱约束 $1 - \text{opt\_cash\_allowance} \le \sum w \le 1$ 与行业偏离约束；
+    当 $\alpha = 0$、$\gamma_{\text{imp}} = 0$ 且 $\lambda = 2.0$ 时严格退化等价于
+    `_turnover_penalized_weights`；配备 5 级优雅降级阶梯（永不抛未捕获异常）。
+- **稳健协方差二选一互斥契约**：
+  - `min_var_robust_cov=False` / `hrp_robust_cov=False` 时逐位等价于旧路径（零漂移）。
+  - 开启后直接调用 `common.covariance.ledoit_wolf_shrinkage`，不再调用 `denoise_covariance`，
+    严格遵守 2026-11-14 互斥裁定，避免双重压缩特征值谱并消除病态/秩亏矩阵导致的 HRP `IndexError`。
+
+### 50.3 同步配置与离线验证（100% 离线，Rule 1）
+
+- 已运行 `pipeline/research_strategy/run_research_strategy.py --dump-strategies`：静态模板不在
+  `strategy_dumps/*.json` 序列化，`strategies_config.json` 与 `chan_four_state_blend`
+  （`regime_ic_ir_hybrid`）零漂移。
+- 离线单测：`test_factor_analyzer.py`、`test_factor_crowding.py`、`test_allocation_templates.py`、
+  `test_turnover_penalized_qp.py`、`test_strategy_versioning.py`、`test_blend_strategy_versioning.py`
+  全量通过。
+

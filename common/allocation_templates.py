@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 
-from common.covariance import denoise_correlation, denoise_covariance
+from common.covariance import denoise_correlation, denoise_covariance, ledoit_wolf_shrinkage
 from common.indicator_features import compute_feature
 from common.indicators import realized_vol, roc, rsi
 from common.position_policy import kernel_apply_asset_inertia
@@ -121,7 +121,7 @@ def _hrp_portfolio(cov: np.ndarray) -> np.ndarray:
         link_mat = link_mat.astype(int)
         sort_idx = [link_mat[-1, 0], link_mat[-1, 1]]
         num_items = link_mat[-1, 3]
-        while sort_idx[0] >= num_items or sort_idx[1] >= num_items:
+        while max(sort_idx) >= num_items:
             for i in range(len(sort_idx)):
                 if sort_idx[i] >= num_items:
                     idx = sort_idx[i] - num_items
@@ -537,6 +537,285 @@ def _turnover_penalized_weights(
     return _equal_weight_rung()
 
 
+#: Frozen smoothing floor matching M1.3 `_turnover_penalized_weights`.
+SMOOTH_TURNOVER_EPS: float = 1e-6
+
+
+def compute_almgren_chriss_impact_coefficients(
+    volatility: Union[np.ndarray, pd.Series],
+    adv: Union[np.ndarray, pd.Series],
+    *,
+    reference_scale: Optional[float] = None,
+    min_adv: float = 1e-6,
+) -> np.ndarray:
+    """Compute Almgren-Chriss (2000) square-root market impact coefficients (MS6).
+
+    Computes ``kappa_i = scale * sigma_i / sqrt(max(ADV_i, min_adv))``. By default
+    (``reference_scale=None``), normalizes by the median valid raw coefficient so
+    ``kappa`` is dimensionless with median 1.0 while preserving exact relative
+    proportionality ``kappa_i / kappa_j``.
+    """
+    vol_arr = np.asarray(volatility, dtype=np.float64).ravel()
+    adv_arr = np.asarray(adv, dtype=np.float64).ravel()
+    if vol_arr.shape != adv_arr.shape:
+        raise ValueError(
+            f"volatility and adv must have matching lengths, got {vol_arr.shape} vs {adv_arr.shape}"
+        )
+    if vol_arr.size == 0:
+        return np.empty(0, dtype=np.float64)
+
+    valid_vol = np.isfinite(vol_arr) & (vol_arr > 0.0)
+    fallback_vol = float(np.median(vol_arr[valid_vol])) if np.any(valid_vol) else 0.02
+    safe_vol = np.where(valid_vol, vol_arr, fallback_vol)
+
+    valid_adv = np.isfinite(adv_arr) & (adv_arr > min_adv)
+    safe_adv = np.where(valid_adv, adv_arr, float(min_adv))
+
+    raw = safe_vol / np.sqrt(safe_adv)
+    if reference_scale is not None:
+        return raw * float(reference_scale)
+
+    med = float(np.median(raw[np.isfinite(raw) & (raw > 0.0)])) if np.any(raw > 0.0) else 1.0
+    return raw / max(med, 1e-12)
+
+
+def _alpha_impact_penalized_weights(
+    cov: np.ndarray,
+    w0: np.ndarray,
+    alpha: Optional[np.ndarray] = None,
+    *,
+    risk_aversion: float = 2.0,
+    turnover_penalty: float = 0.0,
+    impact_penalty: float = 0.0,
+    impact_kappas: Optional[np.ndarray] = None,
+    single_cap: float = 0.20,
+    sector_groups: Optional[List[np.ndarray]] = None,
+    sector_dev: float = 0.03,
+    cash_allowance: float = 0.0,
+    smooth_eps: float = SMOOTH_TURNOVER_EPS,
+) -> np.ndarray:
+    """Long-only SLSQP convex optimizer with L1 turnover + L1.5 Almgren-Chriss impact (MS6).
+
+    Minimizes:
+        J(w) = -w^T alpha + (risk_aversion / 2) * w^T cov w
+               + turnover_penalty * sum_i ((dw_i)^2 + eps)^{1/2}
+               + impact_penalty * sum_i kappa_i * ((dw_i)^2 + eps)^{3/4}
+    subject to ``0 <= w_i <= single_cap``, M1.3 cash-box exposure
+    ``lower_budget <= sum(w) <= upper_budget``, and optional sector deviation bounds.
+
+    When ``alpha`` is zero/None, ``impact_penalty <= 0``, and ``risk_aversion == 2.0``,
+    degenerates identically to ``_turnover_penalized_weights``. Degrades cleanly down a
+    5-rung fallback ladder and never raises uncaught solver exceptions.
+    """
+    from scipy.optimize import minimize
+
+    cov = np.asarray(cov, dtype=np.float64)
+    n = cov.shape[0]
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+
+    w0_arr = np.asarray(w0, dtype=np.float64).ravel()
+    if w0_arr.shape[0] != n:
+        w0_arr = np.zeros(n, dtype=np.float64)
+    w0_arr = np.where(np.isfinite(w0_arr), w0_arr, 0.0)
+
+    gamma_lin = float(max(0.0, turnover_penalty))
+    gamma_imp = float(max(0.0, impact_penalty))
+    lam = float(max(0.0, risk_aversion))
+    eps = float(max(smooth_eps, 1e-12))
+
+    has_alpha = alpha is not None and not np.allclose(
+        np.where(np.isfinite(np.asarray(alpha, dtype=np.float64)), np.asarray(alpha, dtype=np.float64), 0.0),
+        0.0,
+        atol=1e-15,
+    )
+    if (not has_alpha) and (gamma_imp <= 0.0) and abs(lam - 2.0) <= 1e-12:
+        return _turnover_penalized_weights(
+            cov,
+            w0_arr,
+            turnover_penalty=gamma_lin,
+            single_cap=single_cap,
+            sector_groups=sector_groups,
+            sector_dev=sector_dev,
+            cash_allowance=cash_allowance,
+        )
+
+    alpha_vec = (
+        np.where(np.isfinite(np.asarray(alpha, dtype=np.float64).ravel()), np.asarray(alpha, dtype=np.float64).ravel(), 0.0)
+        if alpha is not None
+        else np.zeros(n, dtype=np.float64)
+    )
+    if alpha_vec.shape[0] != n:
+        raise ValueError(f"alpha length ({alpha_vec.shape[0]}) != cov dimension ({n})")
+
+    if impact_kappas is not None:
+        kappa_vec = np.asarray(impact_kappas, dtype=np.float64).ravel()
+        if kappa_vec.shape[0] != n:
+            raise ValueError(f"impact_kappas length ({kappa_vec.shape[0]}) != cov dimension ({n})")
+        kappa_vec = np.where(np.isfinite(kappa_vec) & (kappa_vec >= 0.0), kappa_vec, 1.0)
+    else:
+        kappa_vec = np.ones(n, dtype=np.float64)
+
+    cap = float(
+        np.clip(
+            single_cap if (single_cap is not None and np.isfinite(single_cap)) else 1.0,
+            0.0,
+            1.0,
+        )
+    )
+    allowance = float(
+        np.clip(
+            cash_allowance if (cash_allowance is not None and np.isfinite(cash_allowance)) else 0.0,
+            0.0,
+            1.0,
+        )
+    )
+    raw_total_cap = float(n * cap)
+    upper_budget = 1.0 if raw_total_cap >= 1.0 - 1e-12 else raw_total_cap
+    lower_budget = float(min(1.0 - allowance, upper_budget))
+    dev = float(max(0.0, sector_dev))
+    groups = [
+        np.asarray(g, dtype=int)
+        for g in (sector_groups or [])
+        if len(g) > 0
+    ]
+    if not np.any(w0_arr > 1e-12):
+        groups = []
+
+    cov_sym = 0.5 * (cov + cov.T)
+
+    def _finalize(w_vec: np.ndarray) -> np.ndarray:
+        arr = np.clip(np.asarray(w_vec, dtype=np.float64), 0.0, cap)
+        total = float(arr.sum())
+        if total > upper_budget + 1e-12:
+            arr = arr * (upper_budget / total)
+            arr = np.clip(arr, 0.0, cap)
+        elif total < lower_budget - 1e-12:
+            deficit = lower_budget - total
+            headroom = cap - arr
+            room = float(headroom.sum())
+            if room > 1e-12:
+                arr = arr + headroom * min(1.0, deficit / room)
+        return arr
+
+    def _equal_weight_rung() -> np.ndarray:
+        return np.full(n, min(1.0 / n, cap), dtype=np.float64)
+
+    def _budget_ok(w_vec: np.ndarray) -> bool:
+        if not np.all(np.isfinite(w_vec)):
+            return False
+        s = float(np.sum(w_vec))
+        return (
+            (s >= lower_budget - 1e-4)
+            and (s <= upper_budget + 1e-4)
+            and (float(np.min(w_vec)) >= -1e-5)
+            and (float(np.max(w_vec)) <= cap + 1e-5)
+        )
+
+    def _obj(w: np.ndarray) -> float:
+        dw = w - w0_arr
+        dw2 = dw * dw + eps
+        val = -float(alpha_vec @ w) + 0.5 * lam * float(w @ cov_sym @ w)
+        if gamma_lin > 0.0:
+            val += gamma_lin * float(np.sum(np.sqrt(dw2)))
+        if gamma_imp > 0.0:
+            val += gamma_imp * float(np.sum(kappa_vec * (dw2 ** 0.75)))
+        return val
+
+    def _jac(w: np.ndarray) -> np.ndarray:
+        dw = w - w0_arr
+        dw2 = dw * dw + eps
+        grad = -alpha_vec + lam * (cov_sym @ w)
+        if gamma_lin > 0.0:
+            grad = grad + gamma_lin * (dw / np.sqrt(dw2))
+        if gamma_imp > 0.0:
+            grad = grad + gamma_imp * 1.5 * kappa_vec * (dw / (dw2 ** 0.25))
+        return grad
+
+    def _build_cons(with_sector: bool) -> list:
+        if lower_budget >= upper_budget - 1e-12:
+            cons: list = [{"type": "eq", "fun": lambda w: float(np.sum(w)) - upper_budget}]
+        else:
+            cons = [
+                {"type": "ineq", "fun": lambda w: upper_budget - float(np.sum(w))},
+                {"type": "ineq", "fun": lambda w: float(np.sum(w)) - lower_budget},
+            ]
+        if with_sector:
+            for idx in groups:
+                prior = float(w0_arr[idx].sum())
+                cons.append(
+                    {
+                        "type": "ineq",
+                        "fun": lambda w, idx=idx, prior=prior: dev - (float(w[idx].sum()) - prior),
+                    }
+                )
+                cons.append(
+                    {
+                        "type": "ineq",
+                        "fun": lambda w, idx=idx, prior=prior: dev + (float(w[idx].sum()) - prior),
+                    }
+                )
+        return cons
+
+    x0 = _finalize(w0_arr) if np.any(w0_arr > 0.0) else _equal_weight_rung()
+    bounds = [(0.0, cap)] * n
+
+    def _try_slsqp(with_sector: bool) -> Optional[np.ndarray]:
+        try:
+            res = minimize(
+                _obj,
+                x0,
+                jac=_jac,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=_build_cons(with_sector),
+                options={"ftol": 1e-10, "maxiter": 500},
+            )
+            if res.success and res.x is not None and _budget_ok(res.x):
+                return _finalize(res.x)
+        except Exception:
+            pass
+        return None
+
+    # Rung 1: full SLSQP (with sector constraints if active)
+    sol = _try_slsqp(bool(groups))
+    if sol is not None:
+        return sol
+
+    # Rung 2: retry SLSQP without sector constraints
+    if groups:
+        sol = _try_slsqp(False)
+        if sol is not None:
+            return sol
+
+    # Rung 3: gamma_imp = 0 fallback via _turnover_penalized_weights
+    try:
+        sol_l1 = _turnover_penalized_weights(
+            cov_sym,
+            w0_arr,
+            turnover_penalty=gamma_lin,
+            single_cap=cap,
+            sector_groups=sector_groups,
+            sector_dev=dev,
+            cash_allowance=allowance,
+        )
+        if _budget_ok(sol_l1):
+            return _finalize(sol_l1)
+    except Exception:
+        pass
+
+    # Rung 4: gamma_lin = 0 min-variance fallback
+    try:
+        legacy = _min_variance_weights(cov_sym)
+        if np.all(np.isfinite(legacy)) and float(np.sum(np.abs(legacy))) > 0.0:
+            return _finalize(legacy)
+    except Exception:
+        pass
+
+    # Rung 5: equal weight clipped to cap
+    return _equal_weight_rung()
+
+
 def _fill_out_columns(daily: pd.DataFrame, symbols: list) -> pd.DataFrame:
     """Ensures `daily` has exactly `symbols` as its columns, in that order --
     any symbol not already present gets an explicit 0.0 column (never NaN,
@@ -946,7 +1225,10 @@ class HierarchicalRiskParityAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63]
     })
     factor_tags: list = field(default_factory=lambda: ["correlation_diversification"])
-    version: str = "1.0.0"
+    version: str = "1.1.0"
+    # MS6: opt-in Ledoit-Wolf shrinkage covariance (mutually exclusive with
+    # denoise_covariance; deliberately absent from param_grid).
+    hrp_robust_cov: bool = False
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict) -> pd.DataFrame:
         symbols = list(universe.keys())
@@ -986,8 +1268,15 @@ class HierarchicalRiskParityAllocation(AllocationTemplate):
             if not valid_symbols:
                 continue
 
-            cov = sub_ret[valid_symbols].cov().to_numpy()
-            cov = denoise_covariance(cov, n_obs=len(sub_ret))
+            use_robust_cov = bool(
+                params.get("hrp_robust_cov", getattr(self, "hrp_robust_cov", False))
+            )
+            if use_robust_cov:
+                cov_df, _ = ledoit_wolf_shrinkage(sub_ret[valid_symbols])
+                cov = np.asarray(cov_df, dtype=float)
+            else:
+                cov = sub_ret[valid_symbols].cov().to_numpy()
+                cov = denoise_covariance(cov, n_obs=len(sub_ret))
             w_hrp = _hrp_portfolio(cov)
             if len(valid_symbols) == len(symbols):
                 weights_rebal.loc[date, :] = w_hrp
@@ -1211,7 +1500,11 @@ class MinimumVarianceAllocation(AllocationTemplate):
         "rebalance_freq_days": [21, 63],
     })
     factor_tags: list = field(default_factory=lambda: ["correlation_diversification"])
-    version: str = "1.1.0"
+    version: str = "1.2.0"
+
+    # MS6: opt-in Ledoit-Wolf shrinkage covariance (mutually exclusive with
+    # denoise_covariance; deliberately absent from param_grid).
+    min_var_robust_cov: bool = False
 
     # --- M1.3: opt-in turnover-penalized long-only QP. ---------------------
     # These knobs are DELIBERATELY absent from `param_grid`: the
@@ -1271,8 +1564,15 @@ class MinimumVarianceAllocation(AllocationTemplate):
             if not valid_symbols:
                 continue
 
-            cov = sub_ret[valid_symbols].cov().to_numpy()
-            cov = denoise_covariance(cov, n_obs=len(sub_ret))
+            use_robust_cov = bool(
+                params.get("min_var_robust_cov", getattr(self, "min_var_robust_cov", False))
+            )
+            if use_robust_cov:
+                cov_df, _ = ledoit_wolf_shrinkage(sub_ret[valid_symbols])
+                cov = np.asarray(cov_df, dtype=float)
+            else:
+                cov = sub_ret[valid_symbols].cov().to_numpy()
+                cov = denoise_covariance(cov, n_obs=len(sub_ret))
             w_mv = _min_variance_weights(cov)
             if len(valid_symbols) == len(symbols):
                 weights_rebal.loc[date, :] = w_mv
@@ -1380,8 +1680,15 @@ class MinimumVarianceAllocation(AllocationTemplate):
                     f"in cash (the cap is a risk limit and is never relaxed)"
                 )
 
-            cov = sub_ret[valid_symbols].cov().to_numpy()
-            cov = denoise_covariance(cov, n_obs=len(sub_ret))
+            use_robust_cov = bool(
+                params.get("min_var_robust_cov", getattr(self, "min_var_robust_cov", False))
+            )
+            if use_robust_cov:
+                cov_df, _ = ledoit_wolf_shrinkage(sub_ret[valid_symbols])
+                cov = np.asarray(cov_df, dtype=float)
+            else:
+                cov = sub_ret[valid_symbols].cov().to_numpy()
+                cov = denoise_covariance(cov, n_obs=len(sub_ret))
             # w0 for symbols that are no longer valid is pinned at 0 by
             # construction (they are not in `valid_symbols` and are written as
             # explicit 0.0 below), so only the valid subset enters the solve.

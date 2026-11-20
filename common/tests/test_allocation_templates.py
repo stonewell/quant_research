@@ -195,3 +195,181 @@ def test_apply_asset_inertia_asymmetric_sells_ratio_anchor():
     np.testing.assert_allclose(res_sym.loc[dates[1], "A"], 0.50)
 
 
+# =============================================================================
+# MS6: L1.5 Impact-Penalized SLSQP Solver & Robust Covariance Integration
+# =============================================================================
+
+
+def _ms6_synthetic_universe(n_days: int = 120, n_assets: int = 6, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2024-01-02", periods=n_days)
+    universe = {}
+    for i in range(n_assets):
+        rets = rng.normal(0.0005, 0.015, size=n_days)
+        close = 100.0 * np.exp(np.cumsum(rets))
+        universe[f"A{i}"] = pd.DataFrame(
+            {"Open": close, "High": close * 1.01, "Low": close * 0.99, "Close": close, "Volume": 1000.0},
+            index=dates,
+        )
+    return universe
+
+
+def test_ms6_min_var_and_hrp_default_off_bit_identical_and_versions_bumped():
+    from common.allocation_templates import (
+        HierarchicalRiskParityAllocation,
+        MinimumVarianceAllocation,
+    )
+
+    mv = MinimumVarianceAllocation()
+    hrp = HierarchicalRiskParityAllocation()
+    assert mv.version == "1.2.0"
+    assert hrp.version == "1.1.0"
+    assert "min_var_robust_cov" not in mv.param_grid
+    assert "hrp_robust_cov" not in hrp.param_grid
+
+    univ = _ms6_synthetic_universe()
+    p_base = {"cov_lookback": 60, "rebalance_freq_days": 21}
+
+    w_mv_default = mv.generate_weights(univ, p_base)
+    w_mv_off = mv.generate_weights(univ, {**p_base, "min_var_robust_cov": False})
+    assert w_mv_default.isna().equals(w_mv_off.isna())
+    np.testing.assert_array_equal(
+        w_mv_default.dropna().to_numpy(), w_mv_off.dropna().to_numpy()
+    )
+
+    w_hrp_default = hrp.generate_weights(univ, p_base)
+    w_hrp_off = hrp.generate_weights(univ, {**p_base, "hrp_robust_cov": False})
+    assert w_hrp_default.isna().equals(w_hrp_off.isna())
+    np.testing.assert_array_equal(
+        w_hrp_default.dropna().to_numpy(), w_hrp_off.dropna().to_numpy()
+    )
+
+
+def test_ms6_robust_cov_eliminates_singular_and_hrp_linkage_degeneracy():
+    from unittest.mock import patch
+
+    import common.allocation_templates as at_mod
+    from common.allocation_templates import (
+        HierarchicalRiskParityAllocation,
+        MinimumVarianceAllocation,
+    )
+
+    # Pathological universe: duplicate collinear columns + short lookback (N > T)
+    rng = np.random.default_rng(99)
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    base_close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.015, size=60)))
+    univ = {}
+    for i in range(15):
+        c = base_close.copy() if i < 5 else 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.015, size=60)))
+        univ[f"S{i:02d}"] = pd.DataFrame(
+            {"Open": c, "High": c * 1.01, "Low": c * 0.99, "Close": c, "Volume": 1000.0},
+            index=dates,
+        )
+
+    mv = MinimumVarianceAllocation()
+    hrp = HierarchicalRiskParityAllocation()
+    params_mv = {"cov_lookback": 10, "rebalance_freq_days": 15, "min_var_robust_cov": True}
+    params_hrp = {"cov_lookback": 10, "rebalance_freq_days": 15, "hrp_robust_cov": True}
+
+    with patch.object(at_mod, "denoise_covariance", wraps=at_mod.denoise_covariance) as spy_denoise:
+        w_mv = mv.generate_weights(univ, params_mv)
+        w_hrp = hrp.generate_weights(univ, params_hrp)
+        # Mutually exclusive: denoise_covariance must NOT be called when *_robust_cov=True
+        assert spy_denoise.call_count == 0
+
+    for w_df in (w_mv, w_hrp):
+        rebal_rows = w_df.dropna(how="all")
+        assert len(rebal_rows) > 0
+        assert np.isfinite(rebal_rows.to_numpy()).all()
+        assert (rebal_rows.to_numpy() >= -1e-12).all()
+        np.testing.assert_allclose(rebal_rows.sum(axis=1).to_numpy(), 1.0, atol=1e-6)
+
+
+def test_ms6_alpha_impact_penalized_weights_degenerates_to_turnover_penalized():
+    from common.allocation_templates import (
+        _alpha_impact_penalized_weights,
+        _turnover_penalized_weights,
+    )
+
+    rng = np.random.default_rng(7)
+    raw = rng.normal(0.0, 0.02, size=(60, 6))
+    cov = np.cov(raw, rowvar=False)
+    w0 = np.array([0.25, 0.25, 0.20, 0.15, 0.10, 0.05])
+    groups = [np.array([0, 1, 2]), np.array([3, 4, 5])]
+
+    for tp in (0.0, 0.005, 0.02):
+        for cash in (0.0, 0.15):
+            w_l1 = _turnover_penalized_weights(
+                cov, w0, turnover_penalty=tp, single_cap=0.30,
+                sector_groups=groups, sector_dev=0.05, cash_allowance=cash,
+            )
+            w_ms6 = _alpha_impact_penalized_weights(
+                cov, w0, alpha=None, risk_aversion=2.0, turnover_penalty=tp,
+                impact_penalty=0.0, single_cap=0.30,
+                sector_groups=groups, sector_dev=0.05, cash_allowance=cash,
+            )
+            np.testing.assert_allclose(w_ms6, w_l1, rtol=1e-7, atol=1e-7)
+
+
+def test_ms6_alpha_impact_penalized_weights_suppresses_low_adv_high_vol_turnover():
+    from common.allocation_templates import (
+        _alpha_impact_penalized_weights,
+        compute_almgren_chriss_impact_coefficients,
+    )
+
+    cov = np.eye(4) * 0.0004
+    w0 = np.zeros(4)
+    alpha = np.full(4, 0.02)
+    # Asset 0: illiquid high vol; Asset 1: liquid low vol; Assets 2 & 3: medium
+    vols = np.array([0.04, 0.01, 0.02, 0.02])
+    advs = np.array([1e5, 1e8, 1e6, 1e6])
+    kappas = compute_almgren_chriss_impact_coefficients(vols, advs)
+    assert kappas[0] > kappas[1] * 50.0
+
+    w_no_imp = _alpha_impact_penalized_weights(
+        cov, w0, alpha=alpha, turnover_penalty=0.0, impact_penalty=0.0,
+        impact_kappas=kappas, single_cap=0.50,
+    )
+    w_imp = _alpha_impact_penalized_weights(
+        cov, w0, alpha=alpha, turnover_penalty=0.0, impact_penalty=0.005,
+        impact_kappas=kappas, single_cap=0.50,
+    )
+    assert w_imp[0] < w_imp[1]
+    assert w_imp[0] < w_no_imp[0]
+
+
+def test_ms6_alpha_impact_cash_box_and_fallback_ladder():
+    from unittest.mock import patch
+
+    import pytest
+    import scipy.optimize
+
+    from common.allocation_templates import _alpha_impact_penalized_weights
+
+    cov = np.eye(4) * 0.0004
+    w0 = np.array([0.25, 0.25, 0.25, 0.25])
+    alpha = np.array([0.03, 0.01, -0.01, -0.02])
+
+    # Cap-constrained cash residual: 4 * 0.20 = 0.80 < 1.0 -> sum(w) == 0.80
+    w_cap = _alpha_impact_penalized_weights(
+        cov, w0, alpha=alpha, impact_penalty=0.002, single_cap=0.20, cash_allowance=0.10
+    )
+    assert np.all(w_cap >= -1e-9) and np.all(w_cap <= 0.20 + 1e-9)
+    assert w_cap.sum() == pytest.approx(0.80, abs=1e-6)
+
+    # Cash-box bounds when cap can fund full book
+    w_box = _alpha_impact_penalized_weights(
+        cov, w0, alpha=alpha, impact_penalty=0.002, single_cap=0.40, cash_allowance=0.25
+    )
+    assert np.all(w_box >= -1e-9) and np.all(w_box <= 0.40 + 1e-9)
+    assert 0.75 - 1e-6 <= w_box.sum() <= 1.0 + 1e-6
+
+    # Monkeypatch scipy.optimize.minimize to fail -> degrades cleanly down fallback ladder
+    with patch.object(scipy.optimize, "minimize", side_effect=RuntimeError("forced slsqp fail")):
+        w_fb = _alpha_impact_penalized_weights(
+            cov, w0, alpha=alpha, impact_penalty=0.005, single_cap=0.40, cash_allowance=0.0
+        )
+    assert np.isfinite(w_fb).all()
+    assert w_fb.sum() == pytest.approx(1.0, abs=1e-6)
+
+

@@ -124,3 +124,108 @@ def test_compute_quantile_returns_monotonicity(sample_market_data):
     mean_spread = q_df["spread"].mean()
     assert mean_spread > 0.0
     assert q_df["Q5"].mean() > q_df["Q1"].mean()
+
+
+# =============================================================================
+# MS5: Asymmetric Long-Only Factor Evaluation
+# =============================================================================
+
+
+def test_asymmetric_long_only_short_leg_illusion_detected():
+    from common.factor_analyzer import (
+        ALERT_SHORT_LEG_ILLUSION,
+        asymmetric_long_only_factor_summary,
+    )
+
+    rng = np.random.default_rng(42)
+    t_len, n_assets = 60, 30
+    dates = pd.bdate_range("2025-01-02", periods=t_len)
+    cols = [f"S{i:02d}" for i in range(n_assets)]
+
+    # Factor values strictly ordered 0..29 each day
+    f_vals = np.tile(np.arange(n_assets, dtype=float), (t_len, 1))
+    # Bottom half (0..14) crashes strongly with factor rank while top half (15..29)
+    # slightly mean-reverts -> strong overall Rank IC (> 0.35) driven almost entirely
+    # by the short leg (long_ic_contribution_ratio < 0.30).
+    r_vals = rng.normal(0.0, 0.001, size=(t_len, n_assets))
+    for i in range(15):
+        r_vals[:, i] = -0.08 + 0.005 * i + rng.normal(0.0, 0.001, size=t_len)
+    for i in range(15, 30):
+        r_vals[:, i] = 0.015 - 0.003 * (i - 15) + rng.normal(0.0, 0.001, size=t_len)
+
+    f_df = pd.DataFrame(f_vals, index=dates, columns=cols)
+    r_df = pd.DataFrame(r_vals, index=dates, columns=cols)
+
+    summary = asymmetric_long_only_factor_summary(f_df, r_df)
+    assert summary["status"] == "OK"
+    assert summary["mean_ic"] > 0.35
+    assert summary["long_ic_contribution_ratio"] < 0.30
+    assert summary["short_leg_illusion"] is True
+    assert ALERT_SHORT_LEG_ILLUSION in summary["alerts"]
+
+
+def test_asymmetric_long_only_genuine_long_alpha_passes():
+    from common.factor_analyzer import asymmetric_long_only_factor_summary
+
+    rng = np.random.default_rng(7)
+    t_len, n_assets = 60, 30
+    dates = pd.bdate_range("2025-01-02", periods=t_len)
+    cols = [f"S{i:02d}" for i in range(n_assets)]
+
+    f_vals = np.tile(np.arange(n_assets, dtype=float), (t_len, 1))
+    r_vals = rng.normal(0.0, 0.005, size=(t_len, n_assets))
+    # Top half strongly outperforms monotonically
+    for i in range(15, 30):
+        r_vals[:, i] = 0.002 * (i - 14) + rng.normal(0.0, 0.002, size=t_len)
+
+    f_df = pd.DataFrame(f_vals, index=dates, columns=cols)
+    r_df = pd.DataFrame(r_vals, index=dates, columns=cols)
+
+    summary = asymmetric_long_only_factor_summary(f_df, r_df)
+    assert summary["status"] == "OK"
+    assert summary["long_ic_contribution_ratio"] > 0.50
+    assert summary["short_leg_illusion"] is False
+    assert summary["top_group_excess_return_ann"] > 0.0
+    assert summary["top_k_turnover_adj_sharpe"] > 1.0
+
+
+def test_asymmetric_long_only_small_cross_section_n_lt_15_returns_insufficient_history():
+    from common.factor_analyzer import asymmetric_long_only_factor_summary
+
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2025-01-02", periods=30)
+    cols = [f"S{i:02d}" for i in range(12)]  # N=12 < 15
+    f_df = pd.DataFrame(rng.normal(size=(30, 12)), index=dates, columns=cols)
+    r_df = pd.DataFrame(rng.normal(size=(30, 12)), index=dates, columns=cols)
+
+    summary = asymmetric_long_only_factor_summary(f_df, r_df)
+    assert summary["status"] == "INSUFFICIENT_HISTORY"
+    assert np.isnan(summary["mean_ic"])
+    assert np.isnan(summary["top_group_excess_return_ann"])
+    assert summary["monotonicity_is_report_only"] is True
+    assert summary["monotonicity_gating_allowed"] is False
+
+
+def test_asymmetric_long_only_n_lt_30_disables_monotonicity_gating():
+    from common.factor_analyzer import asymmetric_long_only_factor_summary
+
+    rng = np.random.default_rng(19)
+    dates = pd.bdate_range("2025-01-02", periods=30)
+
+    # N=20 (15 <= N < 30)
+    cols20 = [f"S{i:02d}" for i in range(20)]
+    f20 = pd.DataFrame(rng.normal(size=(30, 20)), index=dates, columns=cols20)
+    r20 = pd.DataFrame(rng.normal(size=(30, 20)), index=dates, columns=cols20)
+    s20 = asymmetric_long_only_factor_summary(f20, r20)
+    assert s20["status"] == "OK"
+    assert s20["monotonicity_is_report_only"] is True
+    assert s20["monotonicity_gating_allowed"] is False
+
+    # N=35 >= 30
+    cols35 = [f"S{i:02d}" for i in range(35)]
+    f35 = pd.DataFrame(rng.normal(size=(30, 35)), index=dates, columns=cols35)
+    r35 = pd.DataFrame(rng.normal(size=(30, 35)), index=dates, columns=cols35)
+    s35 = asymmetric_long_only_factor_summary(f35, r35)
+    assert s35["status"] == "OK"
+    assert s35["monotonicity_is_report_only"] is True
+    assert s35["monotonicity_gating_allowed"] is True

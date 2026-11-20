@@ -116,7 +116,6 @@ def test_static_templates_versioning():
     static_classes_v100 = [
         EqualWeightAllocation,
         InverseVolatilityAllocation,
-        HierarchicalRiskParityAllocation,
         DualMomentumAllocation,
         MaxDiversificationAllocation,
         MeanReversionAllocation,
@@ -130,17 +129,23 @@ def test_static_templates_versioning():
         v_info = inst.get_version_info()
         assert v_info["version"] == "1.0.0"
 
+    # MS6: opt-in Ledoit-Wolf robust covariance switch (hrp_robust_cov=False) -> 1.0.0 -> 1.1.0.
+    hrp = HierarchicalRiskParityAllocation()
+    assert hrp.version == "1.1.0"
+    assert hrp.version_string == "v1.1.0"
+    assert hrp.get_version_info()["version"] == "1.1.0"
+
     cs_mom = CrossSectionalMomentumAllocation()
     assert cs_mom.version == "1.1.0"
     assert cs_mom.version_string == "v1.1.0"
     assert cs_mom.get_version_info()["version"] == "1.1.0"
 
-    # M1.3: opt-in turnover-penalized long-only QP added (backward-compatible
-    # additive params, default-off) -> version bumped 1.0.0 -> 1.1.0.
+    # M1.3 (1.1.0) + MS6 (1.2.0): opt-in Ledoit-Wolf robust covariance switch
+    # (min_var_robust_cov=False) added -> version bumped 1.1.0 -> 1.2.0.
     min_var = MinimumVarianceAllocation()
-    assert min_var.version == "1.1.0"
-    assert min_var.version_string == "v1.1.0"
-    assert min_var.get_version_info()["version"] == "1.1.0"
+    assert min_var.version == "1.2.0"
+    assert min_var.version_string == "v1.2.0"
+    assert min_var.get_version_info()["version"] == "1.2.0"
 
     # M2.2: new core-satellite static template, initial version.
     sleeve = SleeveAllocator()

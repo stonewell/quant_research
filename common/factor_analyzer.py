@@ -308,3 +308,254 @@ def compute_quantile_returns(
         quantile_records.append(row_vals)
 
     return pd.DataFrame(quantile_records, index=common_idx, columns=cols, dtype=float)
+
+
+# =============================================================================
+# MS5: Asymmetric Long-Only Factor Evaluation (Short-Sale Constrained)
+# =============================================================================
+
+from common.ic_decay_monitor import STATUS_INSUFFICIENT_HISTORY, STATUS_OK
+from common.live_capacity import (
+    TURNOVER_CEILING_ANN_ONE_WAY,
+    TURNOVER_QUALIFIED_ANN_ONE_WAY,
+    turnover_label,
+)
+from common.signal_alerts import (
+    ALERT_LEVEL_GREEN,
+    ALERT_LEVEL_INSUFFICIENT,
+    ALERT_LEVEL_ORANGE,
+    ALERT_LEVEL_RED,
+    ALERT_LEVEL_YELLOW,
+    IC_IR_ORANGE,
+    IC_IR_RED,
+    IC_IR_YELLOW_FLOOR,
+)
+from common.signal_snapshot import MIN_CROSS_SECTION_ASSETS
+
+SHORT_LEG_ILLUSION_THRESHOLD: float = 0.30
+MONOTONICITY_MIN_CROSS_SECTION: int = 30
+ALERT_SHORT_LEG_ILLUSION: str = "SHORT_LEG_ILLUSION"
+
+
+def _classify_ic_ir_tier(ic_ir: float) -> str:
+    """Classify IC-IR using frozen AT5 thresholds from ``common/signal_alerts.py``."""
+    if not np.isfinite(ic_ir):
+        return ALERT_LEVEL_INSUFFICIENT
+    if ic_ir <= IC_IR_RED:
+        return ALERT_LEVEL_RED
+    if ic_ir <= IC_IR_ORANGE:
+        return ALERT_LEVEL_ORANGE
+    if ic_ir < IC_IR_YELLOW_FLOOR:
+        return ALERT_LEVEL_YELLOW
+    return ALERT_LEVEL_GREEN
+
+
+def asymmetric_long_only_factor_summary(
+    factor_df: pd.DataFrame,
+    forward_returns_df: pd.DataFrame,
+    *,
+    n_quantiles: int = 5,
+    top_k: Optional[int] = None,
+    min_assets: int = MIN_CROSS_SECTION_ASSETS,
+    one_way_cost_bps: float = 15.0,
+    annualization_days: int = 252,
+) -> Dict[str, Any]:
+    """Evaluate a cross-sectional factor under A-share / long-only asymmetry (MS5).
+
+    Computes:
+    1. ``top_group_excess_return_ann``: annualized equal-weighted excess return of
+       the top group (``top_k`` or top quantile) over the cross-sectional mean.
+    2. ``long_ic_contribution_ratio`` & ``short_leg_illusion``: additive rank-IC
+       decomposition into long half-plane (above-median factor rank) vs short
+       half-plane; emits ``SHORT_LEG_ILLUSION`` when overall mean IC > 0 but
+       long-side contribution < 30%.
+    3. ``quantile_monotonicity_spearman``: report-only Spearman correlation across
+       quantile mean returns, with ``monotonicity_gating_allowed = False`` whenever
+       median cross-section size < 30.
+    4. ``top_k_turnover_adj_sharpe`` & ``turnover_tier``: net-of-cost top-group
+       Sharpe using ``one_way_cost_bps`` and frozen ``L2.36`` turnover bands.
+
+    Dates with fewer than ``min_assets`` (default 15, ``MIN_CROSS_SECTION_ASSETS``)
+    valid finite assets are excluded (never zero-filled). Fewer than 2 valid dates
+    returns ``status = 'INSUFFICIENT_HISTORY'`` with ``NaN`` metrics.
+    """
+    if n_quantiles < 2:
+        raise ValueError(f"n_quantiles must be >= 2, got {n_quantiles!r}")
+
+    common_idx = factor_df.index.intersection(forward_returns_df.index)
+    common_cols = factor_df.columns.intersection(forward_returns_df.columns)
+
+    n_below_floor = 0
+    valid_n_list: List[int] = []
+    ic_list: List[float] = []
+    ic_long_list: List[float] = []
+    excess_list: List[float] = []
+    turnover_list: List[float] = []
+    q_returns: List[List[float]] = []
+
+    prev_weights: Optional[Dict[Any, float]] = None
+
+    if len(common_idx) > 0 and len(common_cols) >= min_assets:
+        f_sub = factor_df.loc[common_idx, common_cols]
+        r_sub = forward_returns_df.loc[common_idx, common_cols]
+
+        for dt in common_idx:
+            f_row = f_sub.loc[dt]
+            r_row = r_sub.loc[dt]
+            valid_mask = (
+                f_row.notna()
+                & r_row.notna()
+                & np.isfinite(f_row)
+                & np.isfinite(r_row)
+            )
+            n_valid = int(valid_mask.sum())
+            if n_valid < min_assets or n_valid < n_quantiles:
+                n_below_floor += 1
+                continue
+
+            f_valid = f_row[valid_mask].astype(float)
+            r_valid = r_row[valid_mask].astype(float)
+            if f_valid.nunique() <= 1 or r_valid.nunique() <= 1:
+                n_below_floor += 1
+                continue
+
+            valid_n_list.append(n_valid)
+
+            # Exact additive Rank IC decomposition
+            u = f_valid.rank(method="average").to_numpy(dtype=np.float64) - 0.5 * (n_valid + 1.0)
+            v = r_valid.rank(method="average").to_numpy(dtype=np.float64) - 0.5 * (n_valid + 1.0)
+            denom = float(np.sqrt(np.sum(u * u) * np.sum(v * v)))
+            if denom > 1e-12:
+                ic_t = float(np.sum(u * v) / denom)
+                ic_long_t = float(np.sum(u[u > 0.0] * v[u > 0.0]) / denom)
+            else:
+                ic_t = 0.0
+                ic_long_t = 0.0
+            ic_list.append(ic_t)
+            ic_long_list.append(ic_long_t)
+
+            # Quantile returns
+            ranks_first = f_valid.rank(method="first")
+            q_bins = pd.Series(
+                np.floor((ranks_first - 1.0) * n_quantiles / n_valid).astype(int),
+                index=f_valid.index,
+            ).clip(0, n_quantiles - 1)
+            q_row = [float(r_valid[q_bins == q].mean()) for q in range(n_quantiles)]
+            q_returns.append(q_row)
+
+            # Top group selection
+            if top_k is not None and 1 <= int(top_k) < n_valid:
+                k_sel = int(top_k)
+                top_syms = list(f_valid.nlargest(k_sel).index)
+            else:
+                top_syms = list(f_valid.index[q_bins == (n_quantiles - 1)])
+
+            top_ret = float(r_valid.loc[top_syms].mean())
+            mkt_ret = float(r_valid.mean())
+            excess_list.append(top_ret - mkt_ret)
+
+            # One-way turnover of equal-weighted top group
+            w_val = 1.0 / float(len(top_syms))
+            curr_weights = {s: w_val for s in top_syms}
+            if prev_weights is None:
+                turnover_list.append(0.0)
+            else:
+                all_syms = set(prev_weights.keys()) | set(curr_weights.keys())
+                l1 = sum(
+                    abs(curr_weights.get(s, 0.0) - prev_weights.get(s, 0.0))
+                    for s in all_syms
+                )
+                turnover_list.append(0.5 * l1)
+            prev_weights = curr_weights
+    else:
+        n_below_floor = len(common_idx)
+
+    n_obs = len(ic_list)
+    if n_obs < 2:
+        return {
+            "status": STATUS_INSUFFICIENT_HISTORY,
+            "n_obs": n_obs,
+            "n_dates_below_cross_section_floor": int(n_below_floor),
+            "median_cross_section_size": float("nan"),
+            "mean_ic": float("nan"),
+            "mean_ic_long": float("nan"),
+            "ic_ir": float("nan"),
+            "ic_ir_tier": ALERT_LEVEL_INSUFFICIENT,
+            "top_group_excess_return_ann": float("nan"),
+            "long_ic_contribution_ratio": float("nan"),
+            "short_leg_illusion": False,
+            "alerts": [],
+            "quantile_monotonicity_spearman": float("nan"),
+            "monotonicity_is_report_only": True,
+            "monotonicity_gating_allowed": False,
+            "annualized_one_way_turnover": float("nan"),
+            "turnover_tier": "INSUFFICIENT_HISTORY",
+            "turnover_qualified_threshold": TURNOVER_QUALIFIED_ANN_ONE_WAY,
+            "turnover_ceiling_threshold": TURNOVER_CEILING_ANN_ONE_WAY,
+            "top_k_turnover_adj_sharpe": float("nan"),
+        }
+
+    median_n = float(np.median(valid_n_list))
+    ic_arr = np.asarray(ic_list, dtype=np.float64)
+    ic_long_arr = np.asarray(ic_long_list, dtype=np.float64)
+    excess_arr = np.asarray(excess_list, dtype=np.float64)
+    turn_arr = np.asarray(turnover_list, dtype=np.float64)
+
+    mean_ic = float(np.mean(ic_arr))
+    std_ic = float(np.std(ic_arr, ddof=1))
+    ic_ir = float((mean_ic / std_ic) * np.sqrt(annualization_days)) if std_ic > 1e-12 else 0.0
+    mean_ic_long = float(np.mean(ic_long_arr))
+
+    if mean_ic > 1e-12:
+        long_ic_ratio = float(np.clip(mean_ic_long / mean_ic, -1.0, 2.0))
+    else:
+        long_ic_ratio = 0.0 if mean_ic_long <= 0.0 else float("nan")
+
+    alerts: List[str] = []
+    short_leg_illusion = bool(
+        mean_ic > 0.0
+        and np.isfinite(long_ic_ratio)
+        and long_ic_ratio < SHORT_LEG_ILLUSION_THRESHOLD
+    )
+    if short_leg_illusion:
+        alerts.append(ALERT_SHORT_LEG_ILLUSION)
+
+    # Quantile monotonicity (report-only; gating disallowed when median N < 30)
+    q_mean = np.nanmean(np.asarray(q_returns, dtype=np.float64), axis=0)
+    mono_corr, _ = stats.spearmanr(np.arange(1, n_quantiles + 1), q_mean)
+    quantile_mono = float(mono_corr) if np.isfinite(mono_corr) else float("nan")
+
+    # Top-group annualized excess return & net-of-cost Sharpe
+    top_excess_ann = float(np.mean(excess_arr) * annualization_days)
+    ann_one_way_turn = float(np.mean(turn_arr) * annualization_days)
+    cost_rate = float(one_way_cost_bps) * 1e-4
+    net_ret = excess_arr - 2.0 * turn_arr * cost_rate
+    net_std = float(np.std(net_ret, ddof=1))
+    net_sharpe = (
+        float((np.mean(net_ret) / net_std) * np.sqrt(annualization_days))
+        if net_std > 1e-12
+        else 0.0
+    )
+
+    return {
+        "status": STATUS_OK,
+        "n_obs": n_obs,
+        "n_dates_below_cross_section_floor": int(n_below_floor),
+        "median_cross_section_size": median_n,
+        "mean_ic": mean_ic,
+        "mean_ic_long": mean_ic_long,
+        "ic_ir": ic_ir,
+        "ic_ir_tier": _classify_ic_ir_tier(ic_ir),
+        "top_group_excess_return_ann": top_excess_ann,
+        "long_ic_contribution_ratio": long_ic_ratio,
+        "short_leg_illusion": short_leg_illusion,
+        "alerts": alerts,
+        "quantile_monotonicity_spearman": quantile_mono,
+        "monotonicity_is_report_only": True,
+        "monotonicity_gating_allowed": bool(median_n >= MONOTONICITY_MIN_CROSS_SECTION),
+        "annualized_one_way_turnover": ann_one_way_turn,
+        "turnover_tier": turnover_label(ann_one_way_turn),
+        "turnover_qualified_threshold": TURNOVER_QUALIFIED_ANN_ONE_WAY,
+        "turnover_ceiling_threshold": TURNOVER_CEILING_ANN_ONE_WAY,
+        "top_k_turnover_adj_sharpe": net_sharpe,
+    }
