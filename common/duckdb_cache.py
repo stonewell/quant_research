@@ -501,7 +501,7 @@ def _select_output_columns(df: pd.DataFrame, requested: Optional[List[str]], *, 
     if missing:
         raise ValueError(
             f"{context}: requested column(s) {missing} are not available; this table can serve "
-            f"{[c for c in _REQUIRED_OHLCV_COLUMNS + ['Amount'] if c in df.columns]}."
+            f"{[c for c in _REQUIRED_OHLCV_COLUMNS + ['Amount', 'Turn'] if c in df.columns]}."
         )
     return df[list(target)].astype(float)
 
@@ -637,7 +637,7 @@ def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     if not rule:
         return df
 
-    agg_spec: Dict[str, str] = {
+    agg_spec: Dict[str, Any] = {
         "Open": "first",
         "High": "max",
         "Low": "min",
@@ -647,6 +647,8 @@ def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
         agg_spec["Volume"] = "sum"
     if "Amount" in df.columns:
         agg_spec["Amount"] = "sum"
+    if "Turn" in df.columns:
+        agg_spec["Turn"] = lambda s: s.sum(min_count=1)
 
     resampled = df.resample(rule).agg(agg_spec).dropna(subset=["Open", "High", "Low", "Close"])
     if "Volume" in resampled.columns:
@@ -1454,6 +1456,7 @@ class DuckDBCache:
                 close DOUBLE NOT NULL,
                 volume DOUBLE NOT NULL,
                 amount DOUBLE,
+                turn DOUBLE,
                 PRIMARY KEY (provider, symbol, date)
             );
             CREATE TABLE IF NOT EXISTS asset_sync_metadata (
@@ -1564,8 +1567,9 @@ class DuckDBCache:
             self._ensure_column(con, table, "last_probe_result", "VARCHAR")
             self._ensure_column(con, table, "last_probe_time", "TIMESTAMP")
 
-        # M3.6 schema migration: amount and adjustflag columns for raw storage and in-memory derivation
+        # M3.6 / MS10 schema migration: amount, turn, and adjustflag columns
         self._ensure_column(con, "ohlcv_bars", "amount", "DOUBLE")
+        self._ensure_column(con, "ohlcv_bars", "turn", "DOUBLE")
         self._ensure_column(con, "asset_sync_metadata", "adjustflag", "VARCHAR")
         self._ensure_column(con, "intraday_ohlcv_bars", "amount", "DOUBLE")
         self._ensure_column(con, "intraday_ohlcv_bars", "adjustflag", "VARCHAR")
@@ -2479,6 +2483,15 @@ class DuckDBCache:
         else:
             df_to_store["Amount"] = None
 
+        turn_col = next(
+            (c for c in ("Turn", "turn", "Turnover", "turnover") if c in df.columns),
+            None,
+        )
+        if turn_col is not None:
+            df_to_store["Turn"] = pd.to_numeric(df[turn_col], errors="coerce")
+        else:
+            df_to_store["Turn"] = None
+
         # ------------------------------------------------------------------------------
         # NULL-VOLUME GUARD (LV5; frozen contract `docs/data_gap_visibility_schema.md`
         # §4.1-§4.3).
@@ -2539,6 +2552,11 @@ class DuckDBCache:
             "close": df_to_store["Close"].astype(float).values,
             "volume": df_to_store["Volume"].astype(float).values,
             "amount": df_to_store["Amount"].values if ("Amount" in df_to_store.columns and df_to_store["Amount"].notna().any()) else None,
+            "turn": (
+                df_to_store["Turn"].astype(float).values
+                if ("Turn" in df_to_store.columns and df_to_store["Turn"].notna().any())
+                else None
+            ),
         })
 
         con = self._get_connection(read_only=False)
@@ -2726,9 +2744,19 @@ class DuckDBCache:
                     )
 
             con.execute("""
-                INSERT OR REPLACE INTO ohlcv_bars
-                SELECT provider, symbol, date, open, high, low, close, volume, amount
+                INSERT INTO ohlcv_bars (
+                    provider, symbol, date, open, high, low, close, volume, amount, turn
+                )
+                SELECT provider, symbol, date, open, high, low, close, volume, amount, turn
                 FROM temp_bars_to_insert
+                ON CONFLICT (provider, symbol, date) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    volume = excluded.volume,
+                    amount = COALESCE(excluded.amount, ohlcv_bars.amount),
+                    turn = COALESCE(excluded.turn, ohlcv_bars.turn)
             """)
 
             # ------------------------------------------------------------------------------
@@ -3659,6 +3687,7 @@ class DuckDBCache:
                 "close": "Close",
                 "volume": "Volume",
                 "amount": "Amount",
+                "turn": "Turn",
             }
         )
         res_df = _select_output_columns(
@@ -3882,7 +3911,7 @@ class DuckDBCache:
             params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
 
         sql = (
-            f"SELECT date, open, high, low, close, volume, amount FROM ohlcv_bars "
+            f"SELECT date, open, high, low, close, volume, amount, turn FROM ohlcv_bars "
             f"WHERE {' AND '.join(clauses)} ORDER BY date"
         )
 
@@ -3910,6 +3939,7 @@ class DuckDBCache:
                 "close": "Close",
                 "volume": "Volume",
                 "amount": "Amount",
+                "turn": "Turn",
             }
         )
         res_df = _select_output_columns(
@@ -4001,6 +4031,7 @@ class DuckDBCache:
                     "close": "Close",
                     "volume": "Volume",
                     "amount": "Amount",
+                    "turn": "Turn",
                 }
             )
             df = _select_output_columns(
@@ -4063,7 +4094,7 @@ class DuckDBCache:
             params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
 
         sql = (
-            f"SELECT symbol, date, open, high, low, close, volume, amount FROM ohlcv_bars "
+            f"SELECT symbol, date, open, high, low, close, volume, amount, turn FROM ohlcv_bars "
             f"WHERE {' AND '.join(clauses)} ORDER BY symbol, date"
         )
 
@@ -4098,6 +4129,7 @@ class DuckDBCache:
                     "close": "Close",
                     "volume": "Volume",
                     "amount": "Amount",
+                    "turn": "Turn",
                 }
             )
             df = _select_output_columns(

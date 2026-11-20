@@ -71,6 +71,21 @@ STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
 STATUS_INSUFFICIENT = "insufficient"
 
+#: MS9 tri-state session classification labels (zero padding / zero silent fill).
+SESSION_STATE_COMPLETE = "complete"
+SESSION_STATE_MISSING_DAY = "missing_day"
+SESSION_STATE_SHORT_BARS = "short_bars"
+SESSION_STATE_BOUNDARY_MISMATCH = "first_last_bar_mismatch"
+
+#: Matches `common/intraday_features.py:580` (`full_bars < 45` incomplete-session gate).
+MIN_COMPLETE_BARS_5M = 45
+SESSION_FIRST_BAR_5M = dt.time(9, 35)
+SESSION_LAST_BAR_5M = dt.time(15, 0)
+
+#: MS9 explicit degradation policies for MS4 dual-mode operators vs pure-5m columns.
+PURE_5M_DEGRADATION_POLICY = "nan_with_warning"
+DUAL_MODE_DEGRADATION_POLICY = "daily_proxy_with_trace"
+
 #: Cap on how many offending timestamps a report carries inline (reports are printed and
 #: compared; an unbounded tuple would make a broken 100k-bar frame unreadable).
 _MAX_LISTED = 10
@@ -701,3 +716,152 @@ def require_pass(report: Any, *, context: str = "") -> Any:
     raise IntradayCoverageError(
         f"{where}intraday coverage check did not pass (status={status}, reason={reason})"
     )
+
+
+# --------------------------------------------------------------------------------------
+# MS9: Tri-state session matrix & explicit degradation trace helpers
+# --------------------------------------------------------------------------------------
+def audit_universe_5m_tri_state(
+    frames_5m: Mapping[str, Any],
+    expected_sessions: Iterable[Any],
+    *,
+    min_complete_bars: int = MIN_COMPLETE_BARS_5M,
+    bars_per_session: int = BARS_PER_SESSION_5M,
+) -> dict[str, dict[str, Any]]:
+    """Audit a universe of 5m bar frames against expected sessions with tri-state reporting.
+
+    Classifies every expected session per symbol into explicit defect buckets without ever
+    padding missing bars with zero or mean values:
+      - ``missing_days``: expected sessions with 0 bars;
+      - ``short_bar_days``: observed sessions with ``bar_count < min_complete_bars`` (the
+        ``< 45`` incomplete-session gate) or ``bar_count != bars_per_session``;
+      - ``boundary_mismatch_days``: observed sessions whose first bar != ``09:35`` or
+        last bar != ``15:00``;
+      - ``complete_days``: observed sessions with exact ``bars_per_session`` bars, exact
+        ``09:35``..``15:00`` bounds, and zero lunch-break or duplicate-timestamp violations.
+    """
+    expected_dates = sorted({pd.Timestamp(d).date() for d in expected_sessions})
+    expected_isos = [d.isoformat() for d in expected_dates]
+    results: dict[str, dict[str, Any]] = {}
+
+    for sym, frame in frames_5m.items():
+        if (
+            frame is None
+            or not isinstance(frame, pd.DataFrame)
+            or frame.empty
+            or not expected_dates
+        ):
+            results[sym] = {
+                "status": STATUS_INSUFFICIENT,
+                "total_bars": 0,
+                "observed_sessions_count": 0,
+                "expected_sessions_count": len(expected_dates),
+                "missing_days": list(expected_isos),
+                "short_bar_days": {},
+                "boundary_mismatch_days": {},
+                "complete_days": [],
+                "session_states": {iso: SESSION_STATE_MISSING_DAY for iso in expected_isos},
+            }
+            continue
+
+        ts_idx = (
+            frame.index
+            if isinstance(frame.index, pd.DatetimeIndex)
+            else pd.to_datetime(frame.index)
+        )
+        day_groups = ts_idx.groupby(ts_idx.normalize())
+
+        missing_days: list[str] = []
+        short_bar_days: dict[str, int] = {}
+        boundary_mismatch_days: dict[str, dict[str, Any]] = {}
+        complete_days: list[str] = []
+        session_states: dict[str, str] = {}
+
+        for d, d_iso in zip(expected_dates, expected_isos):
+            key = pd.Timestamp(d)
+            day_ts = day_groups.get(key)
+            if day_ts is None or len(day_ts) == 0:
+                missing_days.append(d_iso)
+                session_states[d_iso] = SESSION_STATE_MISSING_DAY
+                continue
+
+            n_bars = int(len(day_ts))
+            first_t = day_ts.min().time()
+            last_t = day_ts.max().time()
+            has_dups = bool(day_ts.duplicated().any())
+            has_lunch = bool(
+                any(LUNCH_BREAK_START < t < LUNCH_BREAK_END for t in day_ts.time)
+            )
+            is_short = (n_bars < min_complete_bars) or (n_bars != bars_per_session)
+            is_boundary = (first_t != SESSION_FIRST_BAR_5M) or (last_t != SESSION_LAST_BAR_5M)
+
+            if is_short:
+                short_bar_days[d_iso] = n_bars
+            if is_boundary:
+                boundary_mismatch_days[d_iso] = {
+                    "first": first_t.strftime("%H:%M"),
+                    "last": last_t.strftime("%H:%M"),
+                    "bars": n_bars,
+                }
+
+            if not is_short and not is_boundary and not has_dups and not has_lunch:
+                complete_days.append(d_iso)
+                session_states[d_iso] = SESSION_STATE_COMPLETE
+            elif is_short:
+                session_states[d_iso] = SESSION_STATE_SHORT_BARS
+            else:
+                session_states[d_iso] = SESSION_STATE_BOUNDARY_MISMATCH
+
+        passed = (
+            not missing_days
+            and not short_bar_days
+            and not boundary_mismatch_days
+            and len(complete_days) == len(expected_dates)
+        )
+        results[sym] = {
+            "status": STATUS_PASS if passed else STATUS_FAIL,
+            "total_bars": int(len(ts_idx)),
+            "observed_sessions_count": int(len(day_groups)),
+            "expected_sessions_count": len(expected_dates),
+            "missing_days": missing_days,
+            "short_bar_days": short_bar_days,
+            "boundary_mismatch_days": boundary_mismatch_days,
+            "complete_days": complete_days,
+            "session_states": session_states,
+        }
+
+    return results
+
+
+def record_5m_degradation_trace(
+    trace_sink: Optional[dict[str, Any]],
+    *,
+    symbol: str,
+    operator: str,
+    reason: str,
+    fallback_used: Optional[str] = None,
+) -> None:
+    """Record a machine-readable degradation event for MS4 dual-mode or pure-5m operators.
+
+    When ``fallback_used`` is ``None``, the event is tagged with
+    ``PURE_5M_DEGRADATION_POLICY`` (pure 5m columns remain ``NaN`` + warning, never
+    silently backfilled with daily values). When ``fallback_used`` names an explicit
+    daily proxy, the event is tagged with ``DUAL_MODE_DEGRADATION_POLICY``.
+    """
+    if trace_sink is None:
+        return
+    policy = (
+        DUAL_MODE_DEGRADATION_POLICY
+        if fallback_used is not None
+        else PURE_5M_DEGRADATION_POLICY
+    )
+    trace_sink.setdefault("degradations", []).append(
+        {
+            "symbol": symbol,
+            "operator": operator,
+            "reason": reason,
+            "policy": policy,
+            "fallback_used": fallback_used,
+        }
+    )
+    trace_sink["count"] = int(trace_sink.get("count", 0)) + 1

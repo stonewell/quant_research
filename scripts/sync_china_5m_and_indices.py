@@ -34,14 +34,18 @@ history re-baseline belongs to `scripts/repair_qfq_alignment.py`, never to an in
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
+import inspect
 import logging
 import math
 import os
 import statistics
 import sys
 import time
+import types
 import warnings
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -1676,6 +1680,7 @@ class Sync5mReport(dict):
         super().__init__()
         self.cache_probes: Dict[str, Dict[str, Any]] = {}
         self.incomplete_symbols: Dict[str, Dict[str, Any]] = {}
+        self.short_session_symbols: Dict[str, Dict[str, int]] = {}
         self.expected_session: Optional[datetime.date] = None
         self.expected_deadline: Optional[str] = None
 
@@ -1692,6 +1697,7 @@ class Sync5mReport(dict):
             "expected_deadline": self.expected_deadline,
             "intraday_incomplete": self.intraday_incomplete,
             "incomplete_symbols": {s: dict(v) for s, v in self.incomplete_symbols.items()},
+            "short_session_symbols": {s: dict(v) for s, v in self.short_session_symbols.items()},
             "cache_probes": {s: dict(v) for s, v in self.cache_probes.items()},
         }
 
@@ -1713,6 +1719,171 @@ def _cross_source_rule_reason(rule: str) -> str:
         "inside-foreign-interval: the batch has dates inside the stored source's covered interval, "
         "so INSERT OR REPLACE would overwrite those rows on a different normalisation basis"
     )
+
+
+def assert_baostock_sequential_sync_contract(
+    module_or_path: Any = None,
+    *,
+    provider_instance: Any = None,
+) -> Dict[str, Any]:
+    """Fail-closed static + runtime guardrail enforcing BaoStock sequential sync (MS9).
+
+    Verifies:
+    1. Zero imports or usages of ``multiprocessing``, ``concurrent.futures``,
+       ``ThreadPoolExecutor``, ``ProcessPoolExecutor``, ``threading.Thread``, or ``joblib``.
+    2. Inside ``sync_5m_intraday`` (when present in the AST), ``BaoStockDataProvider`` is
+       instantiated at most once, never inside a loop, and ``.logout()`` is inside a
+       ``finally:`` block.
+    3. When ``provider_instance`` is supplied: real ``BaoStockDataProvider`` instances must
+       have ``keep_logged_in is True`` and ``adjustflag == "3"``; test doubles that omit
+       those attributes are tolerated, while any explicit ``keep_logged_in=False`` or
+       non-raw ``adjustflag`` fails closed with ``RuntimeError``.
+    """
+    forbidden_modules = ("multiprocessing", "concurrent.futures", "joblib")
+    forbidden_names = {"ThreadPoolExecutor", "ProcessPoolExecutor"}
+
+    if module_or_path is None:
+        src = Path(__file__).read_text(encoding="utf-8")
+        filename = str(Path(__file__))
+    elif isinstance(module_or_path, types.ModuleType):
+        mod_file = getattr(module_or_path, "__file__", None)
+        if mod_file and Path(mod_file).is_file():
+            src = Path(mod_file).read_text(encoding="utf-8")
+            filename = str(mod_file)
+        else:
+            src = inspect.getsource(module_or_path)
+            filename = getattr(module_or_path, "__name__", "<module>")
+    elif isinstance(module_or_path, os.PathLike):
+        p = Path(module_or_path)
+        src = p.read_text(encoding="utf-8")
+        filename = str(p)
+    elif isinstance(module_or_path, str):
+        p = Path(module_or_path)
+        if "\n" not in module_or_path and p.is_file():
+            src = p.read_text(encoding="utf-8")
+            filename = str(p)
+        else:
+            src = module_or_path
+            filename = "<snippet>"
+    else:
+        raise TypeError(f"Unsupported module_or_path type: {type(module_or_path).__name__}")
+
+    tree = ast.parse(src, filename=filename)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for bad in forbidden_modules:
+                    if alias.name == bad or alias.name.startswith(bad + "."):
+                        raise RuntimeError(
+                            f"BaoStock sequential sync contract violated: "
+                            f"forbidden concurrency import {alias.name!r} at {filename}:{node.lineno}"
+                        )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            for bad in forbidden_modules:
+                if mod == bad or mod.startswith(bad + "."):
+                    raise RuntimeError(
+                        f"BaoStock sequential sync contract violated: "
+                        f"forbidden concurrency import from {mod!r} at {filename}:{node.lineno}"
+                    )
+            for alias in node.names:
+                if alias.name in forbidden_names or (mod == "threading" and alias.name == "Thread"):
+                    raise RuntimeError(
+                        f"BaoStock sequential sync contract violated: "
+                        f"forbidden concurrency symbol {alias.name!r} at {filename}:{node.lineno}"
+                    )
+        elif isinstance(node, ast.Attribute):
+            if node.attr in forbidden_names:
+                raise RuntimeError(
+                    f"BaoStock sequential sync contract violated: "
+                    f"forbidden concurrency attribute {node.attr!r} at {filename}:{node.lineno}"
+                )
+            if (
+                node.attr == "Thread"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "threading"
+            ):
+                raise RuntimeError(
+                    f"BaoStock sequential sync contract violated: "
+                    f"forbidden threading.Thread usage at {filename}:{node.lineno}"
+                )
+        elif isinstance(node, ast.Name) and node.id in forbidden_names:
+            raise RuntimeError(
+                f"BaoStock sequential sync contract violated: "
+                f"forbidden concurrency symbol {node.id!r} at {filename}:{node.lineno}"
+            )
+
+    # Check single-session instantiation & finally-logout inside sync_5m_intraday
+    single_session_verified = False
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "sync_5m_intraday":
+            bs_calls = 0
+            has_finally_logout = False
+
+            def _visit(stmt: ast.AST, in_loop: bool) -> None:
+                nonlocal bs_calls, has_finally_logout
+                if isinstance(stmt, ast.Call):
+                    func = stmt.func
+                    is_bs = (
+                        (isinstance(func, ast.Name) and func.id == "BaoStockDataProvider")
+                        or (isinstance(func, ast.Attribute) and func.attr == "BaoStockDataProvider")
+                    )
+                    if is_bs:
+                        bs_calls += 1
+                        if in_loop:
+                            raise RuntimeError(
+                                "BaoStock sequential sync contract violated: "
+                                f"BaoStockDataProvider instantiated inside loop at {filename}:{stmt.lineno}"
+                            )
+                if isinstance(stmt, ast.Try):
+                    for f_node in stmt.finalbody:
+                        for sub in ast.walk(f_node):
+                            if (
+                                isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Attribute)
+                                and sub.func.attr == "logout"
+                            ):
+                                has_finally_logout = True
+                next_in_loop = in_loop or isinstance(stmt, (ast.For, ast.AsyncFor, ast.While))
+                for child in ast.iter_child_nodes(stmt):
+                    _visit(child, next_in_loop)
+
+            _visit(node, False)
+            if bs_calls > 1:
+                raise RuntimeError(
+                    "BaoStock sequential sync contract violated: "
+                    f"BaoStockDataProvider instantiated {bs_calls} times in sync_5m_intraday"
+                )
+            if bs_calls == 1 and not has_finally_logout:
+                raise RuntimeError(
+                    "BaoStock sequential sync contract violated: "
+                    "sync_5m_intraday must call logout() inside a finally block"
+                )
+            single_session_verified = True
+
+    if provider_instance is not None:
+        from common.financial_api import BaoStockDataProvider as _RealBaoStockDataProvider
+
+        is_real_bs = isinstance(provider_instance, _RealBaoStockDataProvider)
+        if is_real_bs or hasattr(provider_instance, "keep_logged_in"):
+            if getattr(provider_instance, "keep_logged_in", False) is not True:
+                raise RuntimeError(
+                    "BaoStock sequential sync contract violated: "
+                    "provider keep_logged_in must be True"
+                )
+        if is_real_bs or hasattr(provider_instance, "adjustflag"):
+            if getattr(provider_instance, "adjustflag", None) != "3":
+                raise RuntimeError(
+                    "BaoStock sequential sync contract violated: "
+                    "provider adjustflag must be '3' (raw basis)"
+                )
+
+    return {
+        "ok": True,
+        "single_session_verified": single_session_verified,
+        "provider_checked": provider_instance is not None,
+    }
 
 
 def sync_5m_intraday(
@@ -1739,6 +1910,8 @@ def sync_5m_intraday(
     for China 5m), and a series that comes back short of that deadline is written as-is, marked
     `intraday_incomplete`, and warned about. It is never padded to look complete.
     """
+    assert_baostock_sequential_sync_contract()
+
     print("\n" + "=" * 80)
     print(f"PART B: Pulling & Caching 5m Intraday Bars [{start} -> {end}]")
     print("Mode: Strictly Sequential Single-Process (BaoStock session reuse)")
@@ -1774,6 +1947,7 @@ def sync_5m_intraday(
         keep_logged_in=True,
         probe_observer=_on_intraday_probe,
     )
+    assert_baostock_sequential_sync_contract(provider_instance=bs_prov)
     em_prov = EastMoneyDataProvider(adjust="none")
 
     refusals = RefusalCollector("PART B (5m intraday)")
@@ -1863,6 +2037,17 @@ def sync_5m_intraday(
                 continue
 
             full_df = full_df[~full_df.index.duplicated(keep="last")].sort_index()
+
+            # MS9: align with `intraday_features.py:580`'s `full_bars < 45` completeness gate
+            # without dropping or padding any bars.
+            day_counts = full_df.groupby(full_df.index.normalize()).size()
+            short_days = {
+                pd.Timestamp(d).date().isoformat(): int(c)
+                for d, c in day_counts.items()
+                if int(c) < 45
+            }
+            if short_days:
+                report.short_session_symbols[sym] = short_days
 
             # "Published but half a session" must be loud (2026-11 defect): the 5m stream is used
             # the same day, so a frame that stops before `last_expected_bar_ts` (14:55) means

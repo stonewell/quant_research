@@ -3404,6 +3404,7 @@ class BaoStockDataProvider(BaseDataProvider):
             "close": "Close",
             "volume": "Volume",
             "amount": "Amount",
+            "turn": "Turn",
         }
         available_cols = {k: v for k, v in col_map.items() if k in raw_df.columns}
         df = raw_df[list(available_cols.keys())].rename(columns=available_cols)
