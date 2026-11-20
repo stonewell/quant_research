@@ -36,6 +36,8 @@ __all__ = [
     "cyq_chip_distribution",
     "cyq_winner_ratio",
     "cyq_cost_concentration",
+    "cyq_cost_deviation",
+    "cyq_quantile_spread_90_10",
     "enrich_universe_with_structural_features",
     "CURVATURE_KAPPA_BOUND_WINDOW5",
     "DEFAULT_REACHABLE_MIN_CURVATURE",
@@ -428,16 +430,26 @@ def wyckoff_effort_result(
     lag: int = 5,
     volume_lookback: int = 20,
     signed: bool = False,
+    *,
+    kurtosis_multiplier: bool = False,
+    intraday_5m_bars: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
     """Computes price advancement achieved per unit of trading effort.
 
-    Academic Grounding: Wyckoff Law of Effort vs Result (1931), Defect M3 resolution.
+    Academic Grounding: Wyckoff Law of Effort vs Result (1931), Defect M3 resolution;
+    optional 5m return Pearson kurtosis breakout-elasticity multiplier (Task MS19).
     Defines Effort as strictly positive relative volume ratio:
         Effort_t = V_t / (SMA(V, volume_lookback) + eps)
     and Result as ATR-normalized displacement:
         Result_t = |C_t - C_{t-lag}| / (ATR_lag(t) + eps)
         EffortResult_t = Result_t / (Effort_t + eps)
     Eliminates zero division explosions and sign confusion from negative volume changes.
+
+    When ``kurtosis_multiplier=False`` (default), returns the exact bit-identical
+    baseline Series (``intraday_5m_bars`` is ignored). When ``kurtosis_multiplier=True``,
+    multiplies ``er`` by each session's 5m return Pearson kurtosis on complete
+    (``>= 45`` bar) sessions; missing 5m bars or incomplete sessions (``< 45`` bars)
+    emit ``NaN`` (never a silent ``1.0`` fallback).
 
     Parameters
     ----------
@@ -449,6 +461,10 @@ def wyckoff_effort_result(
         Lookback for moving average volume.
     signed : bool, default False
         If True, multiplies result by sign(C_t - C_{t-lag}).
+    kurtosis_multiplier : bool, default False
+        Opt-in MS19 multiplier using daily 5m return Pearson kurtosis.
+    intraday_5m_bars : Optional[pd.DataFrame], default None
+        5m OHLCV bars used only when ``kurtosis_multiplier=True``.
 
     Returns
     -------
@@ -471,7 +487,57 @@ def wyckoff_effort_result(
     if signed:
         er = er * np.sign(close - close.shift(lag))
 
-    return er.rename("wyckoff_effort_result")
+    if not kurtosis_multiplier:
+        return er.rename("wyckoff_effort_result")
+
+    # MS19 opt-in 5m return Pearson kurtosis multiplier (strict NaN when missing/<45 bars)
+    if (
+        intraday_5m_bars is None
+        or not isinstance(intraday_5m_bars, pd.DataFrame)
+        or intraday_5m_bars.empty
+    ):
+        return pd.Series(np.nan, index=bars.index, name="wyckoff_effort_result", dtype=float)
+
+    close_col = "Close" if "Close" in intraday_5m_bars.columns else (
+        "close" if "close" in intraday_5m_bars.columns else None
+    )
+    if close_col is None:
+        return pd.Series(np.nan, index=bars.index, name="wyckoff_effort_result", dtype=float)
+
+    idx_5m = (
+        intraday_5m_bars.index
+        if isinstance(intraday_5m_bars.index, pd.DatetimeIndex)
+        else pd.to_datetime(intraday_5m_bars.index)
+    )
+    kurt_by_day: Dict[pd.Timestamp, float] = {}
+    for day_ts, grp in intraday_5m_bars.groupby(idx_5m.normalize()):
+        if len(grp) < 45:
+            kurt_by_day[day_ts] = np.nan
+            continue
+        c_5m = pd.to_numeric(grp[close_col], errors="coerce").astype(float)
+        r_5m = c_5m.pct_change(fill_method=None).dropna().to_numpy(dtype=np.float64)
+        r_5m = r_5m[np.isfinite(r_5m)]
+        if len(r_5m) < 4:
+            kurt_by_day[day_ts] = np.nan
+            continue
+        std_r = float(np.std(r_5m, ddof=0))
+        if std_r <= 1e-12 or not np.isfinite(std_r):
+            kurt_by_day[day_ts] = np.nan
+            continue
+        z_r = (r_5m - float(np.mean(r_5m))) / std_r
+        kurt_by_day[day_ts] = float(np.mean(z_r ** 4))
+
+    bar_dates = (
+        bars.index.normalize()
+        if isinstance(bars.index, pd.DatetimeIndex)
+        else pd.to_datetime(bars.index).normalize()
+    )
+    kurt_series = pd.Series(
+        [kurt_by_day.get(d, np.nan) for d in bar_dates],
+        index=bars.index,
+        dtype=float,
+    )
+    return (er * kurt_series).rename("wyckoff_effort_result")
 
 
 def fractal_dimension(
@@ -596,51 +662,24 @@ def consolidation_density(
     return density.clip(0.0, 1.0).rename("consolidation_density")
 
 
-def cyq_chip_distribution(
+def _run_cyq_recurrence(
     bars: pd.DataFrame,
     n_bins: int = 100,
     decay_mode: str = "turnover",
     kernel: str = "triangular",
     intraday_5m_bars: Optional[pd.DataFrame] = None,
-) -> Tuple[pd.Series, pd.Series]:
-    """Computes recursive turnover-decay chip distribution and derived CYQ factors.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Shared causal CYQ chip-distribution recurrence kernel (Task C1.3 / MS2).
 
-    Academic Grounding: Chen Hao (CYQ Chip Distribution Theory 1999), Task C1.3.
-    Operates on a strictly causal dynamic price grid [p_min, p_max] expanding monotonically
-    with historical price observations and projecting historical chips via mass-conserving
-    CDF interpolation:
-        chips_t = chips_{t-1} * (1 - tau_t) + tau_t * K_t(p)
-    where sum(chips_t) == 1.0 at all bars.
-
-    DISCLOSED APPROXIMATION:
-    When exchange turnover column ('Turn', 'Turnover') is unavailable, effective turnover tau_t
-    is approximated using relative volume proxy tau_hat_t = clip(0.02 * V_t / SMA_60(V)_t, 0.002, 0.50).
-
-    Parameters
-    ----------
-    bars : pd.DataFrame
-        Daily DataFrame with columns 'High', 'Low', 'Close', and optional 'Volume', 'Turn'/'Turnover', 'VWAP'.
-    n_bins : int, default 100
-        Number of price bins for the chip histogram.
-    decay_mode : str, default 'turnover'
-        Decay mode ('turnover' for turnover-based decay).
-    kernel : str, default 'triangular'
-        New chip injection kernel: 'triangular' (peaked at VWAP / typical price),
-        'uniform', or 'intraday_5m' (using 5m bars if provided).
-    intraday_5m_bars : Optional[pd.DataFrame], default None
-        Optional intraday 5-minute bars DataFrame with columns 'High', 'Low', 'Close', 'Volume'.
-
-    Returns
-    -------
-    Tuple[pd.Series, pd.Series]
-        (cyq_winner_ratio, cyq_cost_concentration)
+    Returns ``(winner_ratio, cost_concentration, cost_deviation, quantile_spread_90_10,
+    used_real_turn)``. Preserves the exact recurrence and bin-grid math of
+    ``cyq_chip_distribution`` with zero numerical drift on ``winner_ratio`` and
+    ``cost_concentration``.
     """
     n_bars = len(bars)
     if n_bars == 0:
-        return (
-            pd.Series(dtype=float, name="cyq_winner_ratio"),
-            pd.Series(dtype=float, name="cyq_cost_concentration"),
-        )
+        empty = np.zeros(0, dtype=float)
+        return empty, empty.copy(), empty.copy(), empty.copy(), False
 
     # 1. Effective turnover series tau_t
     has_turn = False
@@ -685,6 +724,8 @@ def cyq_chip_distribution(
 
     winner_ratio = np.zeros(n_bars, dtype=float)
     cost_concentration = np.zeros(n_bars, dtype=float)
+    cost_deviation = np.full(n_bars, np.nan, dtype=float)
+    quantile_spread_90_10 = np.full(n_bars, np.nan, dtype=float)
 
     for t in range(n_bars):
         l_t = lows[t]
@@ -781,7 +822,7 @@ def cyq_chip_distribution(
             chips = chips * (1.0 - tau_t) + tau_t * k_t
             chips /= np.sum(chips)
 
-        # 4. Export winner ratio & cost concentration
+        # 4. Export winner ratio & cost concentration (unchanged C1.3 contract)
         winner_ratio[t] = float(np.clip(np.sum(chips[bin_mids <= c_t]), 0.0, 1.0))
 
         cdf = np.concatenate([[0.0], np.cumsum(chips)])
@@ -790,6 +831,72 @@ def cyq_chip_distribution(
         p_95 = float(np.interp(0.95, cdf, bin_edges))
         cost_concentration[t] = float(np.clip(1.0 - (p_95 - p_5) / (p_95 + p_5 + 1e-8), 0.0, 1.0))
 
+        # 5. Export MS2 cost deviation & 90-10 quantile spread
+        p_cost = float(np.sum(chips * bin_mids))
+        if np.isfinite(p_cost) and p_cost > 1e-12:
+            cost_deviation[t] = (c_t - p_cost) / p_cost
+
+        p_10 = float(np.interp(0.10, cdf, bin_edges))
+        p_50 = float(np.interp(0.50, cdf, bin_edges))
+        p_90 = float(np.interp(0.90, cdf, bin_edges))
+        if np.isfinite(p_50) and p_50 > 1e-12:
+            quantile_spread_90_10[t] = (p_90 - p_10) / p_50
+
+    return winner_ratio, cost_concentration, cost_deviation, quantile_spread_90_10, has_turn
+
+
+def cyq_chip_distribution(
+    bars: pd.DataFrame,
+    n_bins: int = 100,
+    decay_mode: str = "turnover",
+    kernel: str = "triangular",
+    intraday_5m_bars: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.Series, pd.Series]:
+    """Computes recursive turnover-decay chip distribution and derived CYQ factors.
+
+    Academic Grounding: Chen Hao (CYQ Chip Distribution Theory 1999), Task C1.3.
+    Operates on a strictly causal dynamic price grid [p_min, p_max] expanding monotonically
+    with historical price observations and projecting historical chips via mass-conserving
+    CDF interpolation:
+        chips_t = chips_{t-1} * (1 - tau_t) + tau_t * K_t(p)
+    where sum(chips_t) == 1.0 at all bars.
+
+    DISCLOSED APPROXIMATION:
+    When exchange turnover column ('Turn', 'Turnover') is unavailable, effective turnover tau_t
+    is approximated using relative volume proxy tau_hat_t = clip(0.02 * V_t / SMA_60(V)_t, 0.002, 0.50).
+
+    Parameters
+    ----------
+    bars : pd.DataFrame
+        Daily DataFrame with columns 'High', 'Low', 'Close', and optional 'Volume', 'Turn'/'Turnover', 'VWAP'.
+    n_bins : int, default 100
+        Number of price bins for the chip histogram.
+    decay_mode : str, default 'turnover'
+        Decay mode ('turnover' for turnover-based decay).
+    kernel : str, default 'triangular'
+        New chip injection kernel: 'triangular' (peaked at VWAP / typical price),
+        'uniform', or 'intraday_5m' (using 5m bars if provided).
+    intraday_5m_bars : Optional[pd.DataFrame], default None
+        Optional intraday 5-minute bars DataFrame with columns 'High', 'Low', 'Close', 'Volume'.
+
+    Returns
+    -------
+    Tuple[pd.Series, pd.Series]
+        (cyq_winner_ratio, cyq_cost_concentration)
+    """
+    if len(bars) == 0:
+        return (
+            pd.Series(dtype=float, name="cyq_winner_ratio"),
+            pd.Series(dtype=float, name="cyq_cost_concentration"),
+        )
+
+    winner_ratio, cost_concentration, _, _, _ = _run_cyq_recurrence(
+        bars,
+        n_bins=n_bins,
+        decay_mode=decay_mode,
+        kernel=kernel,
+        intraday_5m_bars=intraday_5m_bars,
+    )
     return (
         pd.Series(winner_ratio, index=bars.index, name="cyq_winner_ratio"),
         pd.Series(cost_concentration, index=bars.index, name="cyq_cost_concentration"),
@@ -806,6 +913,46 @@ def cyq_cost_concentration(bars: pd.DataFrame, **kwargs) -> pd.Series:
     """Convenience wrapper returning cyq_cost_concentration Series."""
     _, cc = cyq_chip_distribution(bars, **kwargs)
     return cc
+
+
+def cyq_cost_deviation(
+    bars: pd.DataFrame,
+    n_bins: int = 100,
+    decay_mode: str = "turnover",
+    kernel: str = "triangular",
+    intraday_5m_bars: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+    """Computes CYQ average holding cost deviation: (Close_t - P_cost_t) / P_cost_t."""
+    if len(bars) == 0:
+        return pd.Series(dtype=float, index=bars.index, name="cyq_cost_deviation")
+    _, _, cost_dev, _, _ = _run_cyq_recurrence(
+        bars,
+        n_bins=n_bins,
+        decay_mode=decay_mode,
+        kernel=kernel,
+        intraday_5m_bars=intraday_5m_bars,
+    )
+    return pd.Series(cost_dev, index=bars.index, name="cyq_cost_deviation")
+
+
+def cyq_quantile_spread_90_10(
+    bars: pd.DataFrame,
+    n_bins: int = 100,
+    decay_mode: str = "turnover",
+    kernel: str = "triangular",
+    intraday_5m_bars: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+    """Computes raw CYQ 90-10 quantile price spread: (P_90 - P_10) / P_50."""
+    if len(bars) == 0:
+        return pd.Series(dtype=float, index=bars.index, name="cyq_quantile_spread_90_10")
+    _, _, _, q_spread, _ = _run_cyq_recurrence(
+        bars,
+        n_bins=n_bins,
+        decay_mode=decay_mode,
+        kernel=kernel,
+        intraday_5m_bars=intraday_5m_bars,
+    )
+    return pd.Series(q_spread, index=bars.index, name="cyq_quantile_spread_90_10")
 
 
 def enrich_universe_with_structural_features(
@@ -910,6 +1057,11 @@ def enrich_universe_with_structural_features(
             macd_hist = macd_df["hist"]
             d["standardized_divergence"] = standardized_divergence(close_s, macd_hist, lag=5, vol_lookback=20)
 
+        # MS19 Written Ruling: enrich_universe_with_structural_features keeps
+        # kurtosis_multiplier=False by default so the 12-column baseline and all
+        # downstream strategies remain bit-identical. Callers wanting the 5m
+        # kurtosis multiplier invoke wyckoff_effort_result(..., kurtosis_multiplier=True,
+        # intraday_5m_bars=df_5m) explicitly.
         if "wyckoff_effort_result" not in d.columns:
             d["wyckoff_effort_result"] = wyckoff_effort_result(d, lag=5, volume_lookback=20)
 

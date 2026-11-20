@@ -286,3 +286,173 @@ def test_warn_unreachable_curvature_threshold():
     assert all(issubclass(w.category, UserWarning) for w in caught)
     assert "some.gate" in str(caught[2].message)
     assert "1.5" in str(caught[2].message)
+
+
+# =============================================================================
+# MS2: CYQ Cost Deviation & 90-10 Quantile Spread
+# =============================================================================
+
+
+def test_ms2_cyq_chip_distribution_backward_compatible_and_directional_cost_dev():
+    from common.structural_factors import (
+        cyq_chip_distribution,
+        cyq_cost_deviation,
+        cyq_quantile_spread_90_10,
+    )
+
+    dates = pd.bdate_range("2025-01-02", periods=30)
+    up_close = np.linspace(100.0, 160.0, 30)
+    bars_up = pd.DataFrame(
+        {
+            "Open": up_close - 0.5,
+            "High": up_close + 1.0,
+            "Low": up_close - 1.0,
+            "Close": up_close,
+            "Volume": np.full(30, 1000.0),
+        },
+        index=dates,
+    )
+    dn_close = np.linspace(160.0, 100.0, 30)
+    bars_dn = pd.DataFrame(
+        {
+            "Open": dn_close + 0.5,
+            "High": dn_close + 1.0,
+            "Low": dn_close - 1.0,
+            "Close": dn_close,
+            "Volume": np.full(30, 1000.0),
+        },
+        index=dates,
+    )
+
+    # 2-tuple backward compatibility
+    res = cyq_chip_distribution(bars_up)
+    assert isinstance(res, tuple) and len(res) == 2
+    wr, cc = res
+    assert wr.name == "cyq_winner_ratio"
+    assert cc.name == "cyq_cost_concentration"
+
+    # Directional sign of cost deviation
+    dev_up = cyq_cost_deviation(bars_up)
+    dev_dn = cyq_cost_deviation(bars_dn)
+    assert dev_up.name == "cyq_cost_deviation"
+    assert (dev_up.iloc[1:] > 0.0).all()
+    assert (dev_dn.iloc[1:] < 0.0).all()
+
+    # Quantile spread 90-10: non-negative and smaller on tight consolidation than volatile bars
+    q_up = cyq_quantile_spread_90_10(bars_up)
+    assert q_up.name == "cyq_quantile_spread_90_10"
+    assert (q_up >= 0.0).all()
+
+    bars_tight = pd.DataFrame(
+        {
+            "Open": np.full(30, 100.0),
+            "High": np.full(30, 100.5),
+            "Low": np.full(30, 99.5),
+            "Close": np.full(30, 100.0),
+            "Volume": np.full(30, 1000.0),
+        },
+        index=dates,
+    )
+    q_tight = cyq_quantile_spread_90_10(bars_tight)
+    assert q_tight.iloc[-1] < q_up.iloc[-1]
+
+
+def test_ms2_real_turn_priority_and_ms12_causality():
+    from common.lookahead_checks import assert_future_append_invariant
+    from common.structural_factors import (
+        cyq_cost_deviation,
+        cyq_quantile_spread_90_10,
+    )
+
+    dates = pd.bdate_range("2025-01-02", periods=30)
+    up_close = np.linspace(100.0, 160.0, 30)
+    base = pd.DataFrame(
+        {
+            "Open": up_close - 0.5,
+            "High": up_close + 1.0,
+            "Low": up_close - 1.0,
+            "Close": up_close,
+            "Volume": np.full(30, 1000.0),
+        },
+        index=dates,
+    )
+
+    high_turn = base.assign(Turn=50.0)
+    low_turn = base.assign(Turn=1.5)
+
+    dev_high = cyq_cost_deviation(high_turn)
+    dev_low = cyq_cost_deviation(low_turn)
+    dev_proxy = cyq_cost_deviation(base)
+    q_high = cyq_quantile_spread_90_10(high_turn)
+    q_low = cyq_quantile_spread_90_10(low_turn)
+
+    # High turnover anchors mean holding cost much closer to today's close
+    assert abs(dev_high.iloc[-1]) < abs(dev_low.iloc[-1])
+    assert not np.allclose(dev_high.to_numpy(), dev_proxy.to_numpy())
+    assert not np.allclose(q_high.to_numpy(), q_low.to_numpy())
+
+    # Causality via MS12 lookahead harness
+    assert_future_append_invariant(cyq_cost_deviation, high_turn, [5, 15, 24])
+    assert_future_append_invariant(cyq_quantile_spread_90_10, high_turn, [5, 15, 24])
+
+
+# =============================================================================
+# MS19: wyckoff_effort_result 5m Return Pearson Kurtosis Multiplier
+# =============================================================================
+
+
+def test_ms19_wyckoff_effort_result_kurtosis_multiplier_and_nan_contract():
+    from common.structural_factors import (
+        enrich_universe_with_structural_features,
+        wyckoff_effort_result,
+    )
+
+    rng = np.random.default_rng(19)
+    dates = pd.bdate_range("2025-03-03", periods=10)
+    close = np.linspace(100.0, 110.0, 10)
+    daily = pd.DataFrame(
+        {
+            "Open": close - 0.5,
+            "High": close + 1.0,
+            "Low": close - 1.0,
+            "Close": close,
+            "Volume": np.full(10, 10000.0),
+        },
+        index=dates,
+    )
+
+    # 1. Default kurtosis_multiplier=False is bit-identical to baseline
+    base_er = wyckoff_effort_result(daily)
+    off_er = wyckoff_effort_result(daily, kurtosis_multiplier=False, intraday_5m_bars=None)
+    pd.testing.assert_series_equal(base_er, off_er)
+
+    # 2. kurtosis_multiplier=True with None -> all NaN (never 1.0 fallback!)
+    none_er = wyckoff_effort_result(daily, kurtosis_multiplier=True, intraday_5m_bars=None)
+    assert none_er.isna().all()
+
+    # 3. Complete 48-bar day vs incomplete 30-bar day
+    frames_5m = []
+    for i, d in enumerate(dates):
+        morn = pd.date_range(f"{d.date()} 09:35:00", f"{d.date()} 11:30:00", freq="5min")
+        if i == 8:
+            # Incomplete session: 30 bars (< 45) -> must emit NaN
+            aft = pd.date_range(f"{d.date()} 13:05:00", f"{d.date()} 13:30:00", freq="5min")
+        else:
+            aft = pd.date_range(f"{d.date()} 13:05:00", f"{d.date()} 15:00:00", freq="5min")
+        idx = morn.append(aft)
+        c5 = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.002, size=len(idx))))
+        frames_5m.append(pd.DataFrame({"Close": c5}, index=idx))
+    df_5m = pd.concat(frames_5m)
+
+    kurt_er = wyckoff_effort_result(daily, kurtosis_multiplier=True, intraday_5m_bars=df_5m)
+    assert np.isfinite(kurt_er.iloc[9])
+    assert kurt_er.iloc[9] != pytest.approx(base_er.iloc[9], rel=1e-3)
+    assert np.isnan(kurt_er.iloc[8])  # incomplete 30-bar session -> NaN
+
+    # 4. enrich_universe_with_structural_features stays on 12 baseline columns
+    enriched = enrich_universe_with_structural_features({"A": daily})["A"]
+    pd.testing.assert_series_equal(
+        enriched["wyckoff_effort_result"],
+        wyckoff_effort_result(daily, lag=5, volume_lookback=20),
+        check_names=False,
+    )

@@ -28,7 +28,18 @@ individual variances.
 `n_assets <= 2` is a deliberate no-op: RMT is an asymptotic-N result, and a
 2x2 correlation matrix (eigenvalues `1+rho`, `1-rho`) has no meaningful
 "noise eigenvalue" concept to clip.
+
+Mutual Exclusivity Ruling (2026-11-14 Addendum, MS3 / MS6)
+----------------------------------------------------------
+``ledoit_wolf_shrinkage`` (analytical linear shrinkage toward a structured
+positive-definite target) and ``denoise_covariance`` / ``denoise_correlation``
+(Marchenko-Pastur RMT eigenvalue clipping) are **MUTUALLY EXCLUSIVE**
+covariance-regularization alternatives (**二选一互斥**). Callers MUST select
+one path or the other and must never stack both on the same covariance matrix,
+as stacking double-compresses the off-diagonal spectrum.
 """
+
+from typing import Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -111,3 +122,140 @@ def denoise_covariance(cov: np.ndarray, n_obs: int, min_noise_eigenvalues: int =
 
     cleaned_corr = denoise_correlation(corr, n_obs, min_noise_eigenvalues=min_noise_eigenvalues)
     return cleaned_corr * np.outer(vols, vols)
+
+
+def ledoit_wolf_shrinkage(
+    returns: Union[pd.DataFrame, np.ndarray],
+    *,
+    target: str = "scaled_identity",
+    min_eigenvalue: float = 1e-8,
+    ddof: int = 1,
+) -> Tuple[Union[pd.DataFrame, np.ndarray], float]:
+    """Analytical Ledoit-Wolf linear covariance shrinkage (Task MS3 / MS6).
+
+    Academic Grounding
+    ------------------
+    - ``target="scaled_identity"``: Ledoit & Wolf (2004), "A well-conditioned
+      estimator for large-dimensional covariance matrices", *Journal of
+      Multivariate Analysis* 88(2), 365-411. Target ``F = mu * I`` with
+      ``mu = tr(S) / N``.
+    - ``target="constant_correlation"``: Ledoit & Wolf (2004), "Honey, I Shrunk
+      the Sample Covariance Matrix", *Journal of Portfolio Management* 30(4),
+      110-119. Target ``F_ii = S_ii``, ``F_ij = r_bar * sqrt(S_ii * S_jj)``.
+
+    Mutual Exclusivity (2026-11-14 Addendum)
+    ----------------------------------------
+    ``ledoit_wolf_shrinkage`` and ``denoise_covariance`` / ``denoise_correlation``
+    are **MUTUALLY EXCLUSIVE** (**二选一互斥**). Do not stack both on the same
+    covariance matrix.
+
+    Parameters
+    ----------
+    returns : pd.DataFrame or np.ndarray
+        ``T x N`` return matrix (rows = observations, columns = assets).
+    target : {'scaled_identity', 'constant_correlation'}, default 'scaled_identity'
+        Structured shrinkage target ``F``.
+    min_eigenvalue : float, default 1e-8
+        Strict positive-definite eigenvalue floor applied after shrinkage.
+    ddof : int, default 1
+        Degrees of freedom (``0`` or ``1``) for final covariance scaling.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame or np.ndarray, float]
+        ``(shrunk_cov, delta)`` where ``delta in [0.0, 1.0]`` is the analytical
+        shrinkage intensity and ``shrunk_cov`` preserves DataFrame labels when a
+        DataFrame was passed.
+    """
+    if target not in ("scaled_identity", "constant_correlation"):
+        raise ValueError(
+            f"Unknown target {target!r}; expected 'scaled_identity' or 'constant_correlation'"
+        )
+    if min_eigenvalue <= 0.0 or not np.isfinite(min_eigenvalue):
+        raise ValueError(f"min_eigenvalue must be positive and finite, got {min_eigenvalue!r}")
+    if ddof not in (0, 1):
+        raise ValueError(f"ddof must be 0 or 1, got {ddof!r}")
+
+    is_df = isinstance(returns, pd.DataFrame)
+    cols = returns.columns if is_df else None
+    arr = (
+        returns.to_numpy(dtype=np.float64, copy=False)
+        if is_df
+        else np.asarray(returns, dtype=np.float64)
+    )
+    if arr.ndim != 2:
+        raise ValueError(f"returns must be 2-D (T x N), got shape {arr.shape}")
+
+    _, n = arr.shape
+    if n == 0:
+        empty = np.empty((0, 0), dtype=np.float64)
+        return (pd.DataFrame(empty, index=cols, columns=cols) if is_df else empty), 1.0
+
+    finite_rows = np.all(np.isfinite(arr), axis=1)
+    x_raw = arr[finite_rows]
+    t = int(x_raw.shape[0])
+
+    if t < 2:
+        fallback = np.eye(n, dtype=np.float64) * max(float(min_eigenvalue), 1e-4)
+        return (pd.DataFrame(fallback, index=cols, columns=cols) if is_df else fallback), 1.0
+
+    x = x_raw - np.mean(x_raw, axis=0, keepdims=True)
+    s_ml = (x.T @ x) / float(t)
+    s_ml = 0.5 * (s_ml + s_ml.T)
+
+    if n == 1:
+        var_val = float(s_ml[0, 0]) * (float(t) / float(t - ddof) if ddof == 1 else 1.0)
+        out_1 = np.array([[max(var_val, float(min_eigenvalue))]], dtype=np.float64)
+        return (pd.DataFrame(out_1, index=cols, columns=cols) if is_df else out_1), 0.0
+
+    row_sq_norms = np.sum(x * x, axis=1)
+    sum_sq_outer = float(np.sum(row_sq_norms * row_sq_norms))
+    s_frob_sq = float(np.sum(s_ml * s_ml))
+
+    if target == "scaled_identity":
+        mu_raw = float(np.trace(s_ml)) / float(n)
+        if not np.isfinite(mu_raw) or mu_raw <= 1e-16:
+            f_mat = np.eye(n, dtype=np.float64) * float(min_eigenvalue)
+            delta = 1.0
+        else:
+            f_mat = np.eye(n, dtype=np.float64) * mu_raw
+            gamma_hat = float(np.sum((s_ml - f_mat) ** 2)) / float(n)
+            pi_hat = max(
+                0.0,
+                (sum_sq_outer - float(t) * s_frob_sq) / (float(n) * float(t) * float(t)),
+            )
+            delta = float(np.clip(pi_hat / gamma_hat, 0.0, 1.0)) if gamma_hat > 1e-16 else 1.0
+    else:
+        diag_s = np.maximum(np.diag(s_ml), 0.0)
+        vols = np.sqrt(diag_s)
+        nz = vols > 1e-12
+        k_nz = int(nz.sum())
+        if k_nz >= 2:
+            sub_s = s_ml[np.ix_(nz, nz)]
+            sub_v = vols[nz]
+            corr_sub = np.clip(sub_s / np.outer(sub_v, sub_v), -1.0, 1.0)
+            r_bar = float((np.sum(corr_sub) - np.trace(corr_sub)) / (k_nz * (k_nz - 1)))
+            r_bar = float(np.clip(r_bar, -1.0 + 1e-6, 1.0 - 1e-6))
+        else:
+            r_bar = 0.0
+        f_mat = r_bar * np.outer(vols, vols)
+        np.fill_diagonal(f_mat, diag_s)
+        gamma_hat = float(np.sum((s_ml - f_mat) ** 2))
+        pi_hat = max(0.0, (sum_sq_outer - float(t) * s_frob_sq) / (float(t) * float(t)))
+        delta = float(np.clip(pi_hat / gamma_hat, 0.0, 1.0)) if gamma_hat > 1e-16 else 1.0
+
+    shrunk = (1.0 - delta) * s_ml + delta * f_mat
+    if ddof == 1:
+        shrunk = shrunk * (float(t) / float(t - 1))
+    shrunk = 0.5 * (shrunk + shrunk.T)
+
+    # Strict PSD eigenvalue floor guardrail
+    eigvals, eigvecs = np.linalg.eigh(shrunk)
+    if float(eigvals[0]) < float(min_eigenvalue):
+        floored = np.maximum(eigvals, float(min_eigenvalue))
+        shrunk = (eigvecs * floored[None, :]) @ eigvecs.T
+        shrunk = 0.5 * (shrunk + shrunk.T)
+
+    if is_df:
+        return pd.DataFrame(shrunk, index=cols, columns=cols, dtype=np.float64), delta
+    return shrunk, delta
