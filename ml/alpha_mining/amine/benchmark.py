@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 
 from common.allocation_backtester import run_allocation_backtest
-from common.factor_analyzer import factor_ic_summary
+from common.factor_analyzer import asymmetric_long_only_factor_summary, factor_ic_summary
 
 from amine.combiner import (
     _cs_zscore_preserve_nan,
@@ -334,6 +334,17 @@ def run_alpha_mining_benchmark(
             min_assets=cfg.gp.min_assets,
         )
     )
+    oof_asym_raw = asymmetric_long_only_factor_summary(
+        cv_res.oof_scores,
+        labels.loc[split.combiner_dates],
+        top_k=cfg.top_n,
+        min_assets=cfg.gp.min_assets,
+        annualization_days=max(1, int(round(252 / max(1, cfg.holding_period)))),
+    )
+    oof_asym = {
+        k: (None if isinstance(v, float) and not np.isfinite(v) else v)
+        for k, v in oof_asym_raw.items()
+    }
 
     # Holdout predictions: arm (a) LightGBM top-N and arm (e) LightGBM + Löwdin on
     holdout_a = fit_predict_holdout(
@@ -556,6 +567,7 @@ def run_alpha_mining_benchmark(
             "n_oof_dates": int(len(cv_res.oof_scores)),
             "feature_names": cv_res.feature_names,
             "ic_summary": oof_ic,
+            "asymmetric_long_only_summary": oof_asym,
         },
         "holdout_arms": arms,
         "window_alignment": window_alignment,

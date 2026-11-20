@@ -19,13 +19,24 @@ Design Note:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
-VALID_LABEL_MODES = ("raw_return", "market_residual", "specific_residual")
+VALID_LABEL_MODES = (
+    "raw_return",
+    "market_residual",
+    "specific_residual",
+    "cross_sectional_rank",
+)
 VALID_TRAIN_SIDES = ("past", "both")
 VALID_OBJECTIVES = ("lambdarank", "regression")
 DEFAULT_GP_WINDOWS: Tuple[int, ...] = (3, 5, 10, 20, 40, 60)
+
+# Single-source adversarial validation thresholds shared by MonitoringConfig & amine.monitoring
+DEFAULT_ADV_AUC_ALARM_THRESHOLD: float = 0.70
+DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD: float = 0.65
+DEFAULT_ADV_MAX_FEATURE_GAIN_SHARE: float = 0.35
 
 
 @dataclass
@@ -49,6 +60,8 @@ class GPConfig:
     max_nan_fraction: float = 0.5
     max_zero_std_fraction: float = 0.5
     windows: Tuple[int, ...] = DEFAULT_GP_WINDOWS
+    include_ms_terminals: bool = False
+    ms_lookback: int = 20
     seed: int = 42
 
     def __post_init__(self) -> None:
@@ -85,6 +98,25 @@ class GPConfig:
         if not self.windows or any(int(w) < 2 for w in self.windows):
             raise ValueError(f"GPConfig.windows must contain integers >= 2, got {self.windows}")
         self.windows = tuple(int(w) for w in self.windows)
+        if int(self.ms_lookback) < 5:
+            raise ValueError(f"GPConfig.ms_lookback must be >= 5, got {self.ms_lookback}")
+        self.ms_lookback = int(self.ms_lookback)
+        if self.include_ms_terminals and self.max_depth > 4:
+            raise ValueError(
+                "GPConfig.max_depth must be <= 4 when include_ms_terminals=True "
+                f"to prevent microstructure overfit bloat, got {self.max_depth}"
+            )
+
+    @classmethod
+    def ms8_microstructure(cls, seed: int = 42, **kwargs: Any) -> "GPConfig":
+        """MS8 microstructure-enriched GP profile with depth capped at 4."""
+        defaults: Dict[str, Any] = {
+            "include_ms_terminals": True,
+            "max_depth": 4,
+            "seed": seed,
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
 
 
 @dataclass
@@ -128,6 +160,8 @@ class CombinerConfig:
     lambda_l2: float = 1.0
     eval_at: Tuple[int, ...] = (10,)
     n_relevance_bins: int = 5
+    asymmetric_long_only: bool = False
+    long_leg_weight_multiplier: float = 2.0
     deterministic: bool = True
     num_threads: int = 1
     force_col_wise: bool = True
@@ -159,6 +193,14 @@ class CombinerConfig:
             raise ValueError(f"CombinerConfig.lambda_l2 must be >= 0, got {self.lambda_l2}")
         if self.n_relevance_bins < 2:
             raise ValueError(f"CombinerConfig.n_relevance_bins must be >= 2, got {self.n_relevance_bins}")
+        if (
+            not math.isfinite(self.long_leg_weight_multiplier)
+            or self.long_leg_weight_multiplier < 1.0
+        ):
+            raise ValueError(
+                "CombinerConfig.long_leg_weight_multiplier must be finite and >= 1.0, "
+                f"got {self.long_leg_weight_multiplier}"
+            )
         if self.num_threads < 1:
             raise ValueError(f"CombinerConfig.num_threads must be >= 1, got {self.num_threads}")
         self.eval_at = tuple(int(k) for k in self.eval_at)
@@ -186,7 +228,14 @@ class CombinerConfig:
         }
         if self.objective == "lambdarank":
             params["eval_at"] = list(self.eval_at)
-            params["label_gain"] = list(range(self.n_relevance_bins))
+            if self.asymmetric_long_only:
+                mid = self.n_relevance_bins // 2
+                params["label_gain"] = [
+                    float((2 ** b - 1) * (self.long_leg_weight_multiplier if b > mid else 1.0))
+                    for b in range(self.n_relevance_bins)
+                ]
+            else:
+                params["label_gain"] = list(range(self.n_relevance_bins))
         return params
 
     @classmethod
@@ -208,7 +257,9 @@ class MonitoringConfig:
     """Thresholds for report-only production monitoring diagnostics."""
 
     adv_n_splits: int = 3
-    adv_auc_threshold: float = 0.70
+    adv_auc_threshold: float = DEFAULT_ADV_AUC_ALARM_THRESHOLD
+    adv_drop_auc_threshold: float = DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD
+    adv_max_feature_gain_share: float = DEFAULT_ADV_MAX_FEATURE_GAIN_SHARE
     imp_spearman_threshold: float = 0.30
     imp_top3_drop_ratio: float = 0.50
     turnover_window: int = 20
@@ -220,6 +271,16 @@ class MonitoringConfig:
         if not (0.5 < self.adv_auc_threshold < 1.0):
             raise ValueError(
                 f"MonitoringConfig.adv_auc_threshold must be in (0.5, 1), got {self.adv_auc_threshold}"
+            )
+        if not (0.5 < self.adv_drop_auc_threshold < 1.0):
+            raise ValueError(
+                "MonitoringConfig.adv_drop_auc_threshold must be in (0.5, 1), "
+                f"got {self.adv_drop_auc_threshold}"
+            )
+        if not (0.0 < self.adv_max_feature_gain_share <= 1.0):
+            raise ValueError(
+                "MonitoringConfig.adv_max_feature_gain_share must be in (0, 1], "
+                f"got {self.adv_max_feature_gain_share}"
             )
         if not (-1.0 <= self.imp_spearman_threshold <= 1.0):
             raise ValueError(

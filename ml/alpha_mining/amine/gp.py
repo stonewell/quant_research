@@ -70,7 +70,7 @@ from amine.fitness import (
     select_top_k_factors,
 )
 
-TERMINAL_NAMES: Tuple[str, ...] = (
+BASE_TERMINAL_NAMES: Tuple[str, ...] = (
     "open",
     "high",
     "low",
@@ -80,6 +80,17 @@ TERMINAL_NAMES: Tuple[str, ...] = (
     "returns",
     "adv20",
 )
+
+# MS8 opt-in microstructure & peer-network terminals (requires GPConfig.include_ms_terminals=True)
+MS_TERMINAL_NAMES: Tuple[str, ...] = (
+    "ofi_norm_5m",
+    "cyq_cost_deviation",
+    "cyq_quantile_spread_90_10",
+    "peer_mom",
+)
+
+# Backward-compatible default terminal set (identical to BASE_TERMINAL_NAMES)
+TERMINAL_NAMES: Tuple[str, ...] = BASE_TERMINAL_NAMES
 
 # Operator signature types:
 # - "u_p"   : (panel) -> panel
@@ -186,7 +197,9 @@ class GPNode:
         if self.is_window():
             return int(self.value)  # type: ignore[arg-type]
         if self.is_terminal():
-            return 20 if self.value == "adv20" else 1
+            if self.value == "adv20" or self.value in MS_TERMINAL_NAMES:
+                return 20
+            return 1
         return max((c.max_window() for c in self.children), default=1)
 
     def canonical(self) -> str:
@@ -203,8 +216,15 @@ class GPNode:
         return f"{self.op}({', '.join(child_strs)})"
 
 
-def build_terminals(ohlcv: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
-    """Compute the 8 standard GP terminal panels and the tradability mask.
+def build_terminals(
+    ohlcv: Mapping[str, pd.DataFrame],
+    *,
+    include_ms_terminals: bool = False,
+    ms_lookback: int = 20,
+    intraday_5m_universe: Optional[Mapping[str, pd.DataFrame]] = None,
+) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    """Compute the standard GP terminal panels (plus opt-in MS8 microstructure terminals)
+    and the tradability mask.
 
     Returns
     -------
@@ -240,6 +260,70 @@ def build_terminals(ohlcv: Mapping[str, pd.DataFrame]) -> Tuple[Dict[str, pd.Dat
         "returns": _mask(close.pct_change()),
         "adv20": _mask(adv(volume, close, 20)),
     }
+
+    if include_ms_terminals:
+        from common.intraday_features import compute_ofi_norm_5m
+        from common.peer_network import compute_peer_momentum_spillover
+        from common.structural_factors import (
+            cyq_cost_deviation,
+            cyq_quantile_spread_90_10,
+        )
+
+        ofi_cols: Dict[Any, pd.Series] = {}
+        cyq_dev_cols: Dict[Any, pd.Series] = {}
+        cyq_spread_cols: Dict[Any, pd.Series] = {}
+
+        for sym in close.columns:
+            sym_df = pd.DataFrame(
+                {
+                    "Open": open_[sym],
+                    "High": high[sym],
+                    "Low": low[sym],
+                    "Close": close[sym],
+                    "Volume": volume[sym],
+                },
+                index=close.index,
+            )
+            df_5m = intraday_5m_universe.get(sym) if intraday_5m_universe is not None else None
+            ofi_s = compute_ofi_norm_5m(df_5m, daily_df=sym_df, symbol=str(sym))
+            if isinstance(close.index, pd.DatetimeIndex):
+                ofi_cols[sym] = pd.Series(
+                    ofi_s.reindex(close.index.normalize()).to_numpy(dtype=float),
+                    index=close.index,
+                    dtype=float,
+                )
+            else:
+                ofi_cols[sym] = ofi_s.reindex(close.index)
+            cyq_dev_cols[sym] = cyq_cost_deviation(
+                sym_df, n_bins=50, intraday_5m_bars=df_5m
+            ).reindex(close.index)
+            cyq_spread_cols[sym] = cyq_quantile_spread_90_10(
+                sym_df, n_bins=50, intraday_5m_bars=df_5m
+            ).reindex(close.index)
+
+        ofi_df = pd.DataFrame(ofi_cols, index=close.index, columns=close.columns, dtype=float)
+        cyq_dev_df = pd.DataFrame(cyq_dev_cols, index=close.index, columns=close.columns, dtype=float)
+        cyq_spread_df = pd.DataFrame(cyq_spread_cols, index=close.index, columns=close.columns, dtype=float)
+
+        n_syms = len(close.columns)
+        if n_syms >= 2:
+            peer_top_k = max(1, min(5, n_syms - 1))
+            peer_min_obs = max(2, min(10, int(ms_lookback) // 2))
+            peer_df = compute_peer_momentum_spillover(
+                terminals["returns"],
+                window=int(ms_lookback),
+                top_k=peer_top_k,
+                adjacency_method="partial_corr",
+                min_obs=peer_min_obs,
+            ).reindex(index=close.index, columns=close.columns)
+        else:
+            peer_df = pd.DataFrame(np.nan, index=close.index, columns=close.columns, dtype=float)
+
+        terminals["ofi_norm_5m"] = _mask(ofi_df)
+        terminals["cyq_cost_deviation"] = _mask(cyq_dev_df)
+        terminals["cyq_quantile_spread_90_10"] = _mask(cyq_spread_df)
+        terminals["peer_mom"] = _mask(peer_df)
+
     return terminals, avail
 
 
@@ -327,16 +411,17 @@ def _random_tree(
     windows: Tuple[int, ...],
     op_names: Tuple[str, ...],
     op_table: Mapping[str, OpSpec],
+    terminal_names: Tuple[str, ...] = TERMINAL_NAMES,
     grow: bool = True,
     force_non_terminal: bool = False,
 ) -> GPNode:
     """Recursively generate a random typed GP tree."""
     if max_depth <= 1 and not force_non_terminal:
-        term = TERMINAL_NAMES[int(rng.integers(0, len(TERMINAL_NAMES)))]
+        term = terminal_names[int(rng.integers(0, len(terminal_names)))]
         return GPNode(op="term", value=term)
 
     if grow and not force_non_terminal and rng.random() < 0.25:
-        term = TERMINAL_NAMES[int(rng.integers(0, len(TERMINAL_NAMES)))]
+        term = terminal_names[int(rng.integers(0, len(terminal_names)))]
         return GPNode(op="term", value=term)
 
     op_name = op_names[int(rng.integers(0, len(op_names)))]
@@ -354,6 +439,7 @@ def _random_tree(
                     windows=windows,
                     op_names=op_names,
                     op_table=op_table,
+                    terminal_names=terminal_names,
                     grow=grow,
                     force_non_terminal=False,
                 )
@@ -419,6 +505,7 @@ def _mutate(
     op_names: Tuple[str, ...],
     op_table: Mapping[str, OpSpec],
     ops_by_sig: Mapping[Tuple[str, ...], Tuple[str, ...]],
+    terminal_names: Tuple[str, ...] = TERMINAL_NAMES,
 ) -> GPNode:
     """Apply subtree, point, or hoist mutation respecting bloat caps."""
     mode = float(rng.random())
@@ -433,6 +520,7 @@ def _mutate(
             windows=windows,
             op_names=op_names,
             op_table=op_table,
+            terminal_names=terminal_names,
             grow=True,
             force_non_terminal=(len(path) == 0),
         )
@@ -445,7 +533,7 @@ def _mutate(
             w = int(windows[int(rng.integers(0, len(windows)))])
             cand = _replace_at_path(node, path, GPNode(op="win", value=w))
         elif target.is_terminal():
-            t = TERMINAL_NAMES[int(rng.integers(0, len(TERMINAL_NAMES)))]
+            t = terminal_names[int(rng.integers(0, len(terminal_names)))]
             cand = _replace_at_path(node, path, GPNode(op="term", value=t))
         else:
             sig = op_table[target.op].arg_types
@@ -485,6 +573,11 @@ class GPFactorMiner:
         sector_groups: Optional[Dict[str, str]] = None,
     ) -> None:
         self.config = config if config is not None else GPConfig()
+        self.terminal_names: Tuple[str, ...] = (
+            BASE_TERMINAL_NAMES + MS_TERMINAL_NAMES
+            if self.config.include_ms_terminals
+            else BASE_TERMINAL_NAMES
+        )
         self.op_table = _build_operator_table(sector_groups=sector_groups)
         self.op_names = tuple(self.op_table.keys())
         ops_by_sig: Dict[Tuple[str, ...], List[str]] = {}
@@ -501,6 +594,7 @@ class GPFactorMiner:
         *,
         discovery_dates: Optional[pd.Index] = None,
         seed_library: Optional[Mapping[str, pd.DataFrame]] = None,
+        intraday_5m_universe: Optional[Mapping[str, pd.DataFrame]] = None,
     ) -> List[SelectedFactor]:
         """Run GP evolution strictly on ``discovery_dates`` and return top-K factors.
 
@@ -542,12 +636,34 @@ class GPFactorMiner:
                 if seed_library
                 else {}
             )
+            if intraday_5m_universe is not None:
+                disc_norm = (
+                    discovery_dates.normalize()
+                    if isinstance(discovery_dates, pd.DatetimeIndex)
+                    else pd.to_datetime(discovery_dates).normalize()
+                )
+                intraday_disc: Optional[Mapping[str, pd.DataFrame]] = {
+                    k: (
+                        v.loc[v.index.normalize().isin(disc_norm)]
+                        if (v is not None and not v.empty)
+                        else v
+                    )
+                    for k, v in intraday_5m_universe.items()
+                }
+            else:
+                intraday_disc = None
         else:
             ohlcv_disc = dict(ohlcv)
             fwd_disc = forward_returns
             lib_disc = dict(seed_library) if seed_library else {}
+            intraday_disc = intraday_5m_universe
 
-        terminals, avail_mask = build_terminals(ohlcv_disc)
+        terminals, avail_mask = build_terminals(
+            ohlcv_disc,
+            include_ms_terminals=cfg.include_ms_terminals,
+            ms_lookback=cfg.ms_lookback,
+            intraday_5m_universe=intraday_disc,
+        )
         cache: Dict[str, _EvalCacheEntry] = {}
 
         def _evaluate(node: GPNode) -> _EvalCacheEntry:
@@ -629,6 +745,7 @@ class GPFactorMiner:
                 windows=cfg.windows,
                 op_names=self.op_names,
                 op_table=self.op_table,
+                terminal_names=self.terminal_names,
                 grow=grow,
                 force_non_terminal=True,
             )
@@ -673,6 +790,7 @@ class GPFactorMiner:
                         op_names=self.op_names,
                         op_table=self.op_table,
                         ops_by_sig=self.ops_by_sig,
+                        terminal_names=self.terminal_names,
                     )
                 next_pop.append(child)
 
@@ -722,8 +840,14 @@ class GPFactorMiner:
         ohlcv: Mapping[str, pd.DataFrame],
         *,
         sign: float = 1.0,
+        intraday_5m_universe: Optional[Mapping[str, pd.DataFrame]] = None,
     ) -> pd.DataFrame:
         """Evaluate a discovered ``GPNode`` on any OHLCV panel (e.g. combiner/holdout)."""
-        terminals, avail_mask = build_terminals(ohlcv)
+        terminals, avail_mask = build_terminals(
+            ohlcv,
+            include_ms_terminals=self.config.include_ms_terminals,
+            ms_lookback=self.config.ms_lookback,
+            intraday_5m_universe=intraday_5m_universe,
+        )
         raw = evaluate_node(node, terminals, avail_mask, op_table=self.op_table)
         return raw * float(sign)

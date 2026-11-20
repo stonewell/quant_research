@@ -18,12 +18,18 @@ and recommendations in the JSON report and never gate or mutate live orders):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata, spearmanr
+
+from amine.config import (
+    DEFAULT_ADV_AUC_ALARM_THRESHOLD,
+    DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD,
+    DEFAULT_ADV_MAX_FEATURE_GAIN_SHARE,
+)
 
 
 @dataclass
@@ -36,6 +42,7 @@ class AdversarialValidationResult:
     n_reference: int
     n_recent: int
     top_features_by_gain: List[Tuple[str, float]] = field(default_factory=list)
+    drifted_features: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -110,7 +117,7 @@ def adversarial_validation(
     feature_cols: Sequence[str],
     *,
     n_splits: int = 3,
-    auc_threshold: float = 0.70,
+    auc_threshold: float = DEFAULT_ADV_AUC_ALARM_THRESHOLD,
     seed: int = 42,
 ) -> AdversarialValidationResult:
     """Detect covariate/time drift between ``reference_df`` and ``recent_df``.
@@ -203,6 +210,81 @@ def adversarial_validation(
         n_recent=n_rec,
         top_features_by_gain=top_feats,
     )
+
+
+def filter_adversarial_drifted_features(
+    reference_df: pd.DataFrame,
+    recent_df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    *,
+    n_splits: int = 3,
+    drop_auc_threshold: float = DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD,
+    max_feature_gain_share: float = DEFAULT_ADV_MAX_FEATURE_GAIN_SHARE,
+    min_surviving_features: int = 1,
+    max_drops: Optional[int] = None,
+    seed: int = 42,
+) -> Tuple[List[str], List[str], AdversarialValidationResult]:
+    """Iteratively filter features driving adversarial covariate shift (MS8).
+
+    Runs ``adversarial_validation`` using the shared single-source threshold
+    ``DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD`` (0.65). While ``AUC > drop_auc_threshold``
+    and ``len(kept) > min_surviving_features``, drops the highest-gain feature
+    (preferring features with gain share ``>= max_feature_gain_share``; when drift
+    is spread across multiple features so all shares are below the threshold, falls
+    back to dropping the #1 top-gain feature provided its gain share ``> 0.0``),
+    then re-evaluates.
+
+    Returns ``(kept_features, dropped_features, final_adv_result)`` with
+    ``final_adv_result.drifted_features`` populated.
+    """
+    kept = list(feature_cols)
+    if not kept:
+        raise ValueError("feature_cols must be non-empty.")
+    if int(min_surviving_features) < 1:
+        raise ValueError(
+            f"min_surviving_features must be >= 1, got {min_surviving_features}"
+        )
+    min_keep = int(min_surviving_features)
+
+    dropped: List[str] = []
+    adv = adversarial_validation(
+        reference_df,
+        recent_df,
+        kept,
+        n_splits=n_splits,
+        auc_threshold=drop_auc_threshold,
+        seed=seed,
+    )
+
+    while (
+        np.isfinite(adv.auc)
+        and adv.auc > float(drop_auc_threshold)
+        and len(kept) > min_keep
+    ):
+        if max_drops is not None and len(dropped) >= int(max_drops):
+            break
+        if not adv.top_features_by_gain:
+            break
+        top_feat, top_share = adv.top_features_by_gain[0]
+        if float(top_share) <= 0.0:
+            break
+        # Prefer dropping top feature above max_feature_gain_share; under diffuse
+        # multi-feature drift (all shares < max_feature_gain_share), still drop
+        # the #1 top-gain feature so high-AUC shift is never left unmitigated.
+        _ = float(max_feature_gain_share)
+        kept.remove(top_feat)
+        dropped.append(top_feat)
+        adv = adversarial_validation(
+            reference_df,
+            recent_df,
+            kept,
+            n_splits=n_splits,
+            auc_threshold=drop_auc_threshold,
+            seed=seed,
+        )
+
+    adv.drifted_features = list(dropped)
+    return kept, dropped, adv
 
 
 def check_importance_decay(

@@ -133,6 +133,35 @@ def _transform_labels_by_date(
     return out
 
 
+def _compute_asymmetric_long_weights(
+    raw_labels: pd.Series,
+    dates: pd.Series,
+    *,
+    multiplier: float = 2.0,
+) -> np.ndarray:
+    """Compute per-date asymmetric long-only sample weights (MS8).
+
+    Rows with ``raw_label >= cross-sectional median`` (long leg) receive
+    ``multiplier`` (default 2.0); rows strictly below median (short leg) receive
+    ``1.0``. Degenerate dates (<= 1 row or constant labels) receive ``1.0``.
+    """
+    mult = float(multiplier)
+    if not np.isfinite(mult) or mult < 1.0:
+        raise ValueError(f"multiplier must be finite and >= 1.0, got {multiplier}")
+
+    out = np.ones(len(raw_labels), dtype=float)
+    df_tmp = pd.DataFrame({"date": dates.to_numpy(), "y": raw_labels.to_numpy(dtype=float)})
+    for _dt, grp in df_tmp.groupby("date", sort=False):
+        idx = grp.index.to_numpy()
+        y = grp["y"].to_numpy(dtype=float)
+        if len(y) <= 1 or np.nanmax(y) - np.nanmin(y) <= 1e-12:
+            continue
+        med = float(np.nanmedian(y))
+        long_mask = np.isfinite(y) & (y >= med)
+        out[idx[long_mask]] = mult
+    return out
+
+
 def prepare_long_dataset(
     factors: Mapping[str, pd.DataFrame],
     labels: Optional[pd.DataFrame] = None,
@@ -142,12 +171,15 @@ def prepare_long_dataset(
     objective: str = "lambdarank",
     n_relevance_bins: int = 5,
     require_label: bool = True,
+    asymmetric_long_only: bool = False,
+    long_leg_weight_multiplier: float = 2.0,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """Build a ``(date, symbol)``-sorted long-format table for LightGBM.
 
     Returns ``(long_df, feature_names)`` where ``long_df`` has columns
     ``["date", "symbol", *feature_names]`` plus ``["raw_label", "target"]``
-    when ``labels`` is provided.
+    when ``labels`` is provided (and ``"sample_weight"`` when
+    ``asymmetric_long_only=True`` and ``require_label=True``).
     """
     z_panels, common_idx, common_cols = _prepare_feature_panels(
         factors, apply_lowdin=apply_lowdin
@@ -167,6 +199,8 @@ def prepare_long_dataset(
         cols = ["date", "symbol"] + feature_names
         if labels is not None:
             cols += ["raw_label", "target"]
+            if require_label and asymmetric_long_only:
+                cols.append("sample_weight")
         return pd.DataFrame(columns=cols), feature_names
 
     # Row-major repeat preserves exact (date, symbol) lexicographical sort.
@@ -194,8 +228,16 @@ def prepare_long_dataset(
                 objective=objective,
                 n_relevance_bins=n_relevance_bins,
             )
+            if asymmetric_long_only:
+                long_df["sample_weight"] = _compute_asymmetric_long_weights(
+                    long_df["raw_label"],
+                    long_df["date"],
+                    multiplier=long_leg_weight_multiplier,
+                )
         else:
             long_df["target"] = np.empty(0, dtype=float)
+            if asymmetric_long_only:
+                long_df["sample_weight"] = np.empty(0, dtype=float)
     elif labels is not None:
         long_df["target"] = np.nan
 
@@ -211,6 +253,11 @@ def _make_lgb_dataset(
     """Create a native ``lightgbm.Dataset`` with sorted per-date group counts for lambdarank."""
     x_mat = df[feature_names].to_numpy(dtype=float)
     y_vec = df["target"].to_numpy(dtype=float)
+    weights = (
+        df["sample_weight"].to_numpy(dtype=float)
+        if "sample_weight" in df.columns
+        else None
+    )
     if objective == "lambdarank":
         # df is already sorted by (date, symbol); groupby(sort=True) preserves order.
         groups = df.groupby("date", sort=True).size().to_numpy(dtype=int)
@@ -218,12 +265,14 @@ def _make_lgb_dataset(
             x_mat,
             label=y_vec.astype(int),
             group=groups,
+            weight=weights,
             feature_name=feature_names,
             free_raw_data=False,
         )
     return lgb.Dataset(
         x_mat,
         label=y_vec,
+        weight=weights,
         feature_name=feature_names,
         free_raw_data=False,
     )
@@ -263,6 +312,8 @@ def run_purged_cv_oof(
         objective=comb_cfg.objective,
         n_relevance_bins=comb_cfg.n_relevance_bins,
         require_label=True,
+        asymmetric_long_only=comb_cfg.asymmetric_long_only,
+        long_leg_weight_multiplier=comb_cfg.long_leg_weight_multiplier,
     )
     if long_df.empty:
         raise ValueError("No valid (feature, label) rows available for Purged CV.")
@@ -381,6 +432,8 @@ def fit_predict_holdout(
         objective=comb_cfg.objective,
         n_relevance_bins=comb_cfg.n_relevance_bins,
         require_label=True,
+        asymmetric_long_only=comb_cfg.asymmetric_long_only,
+        long_leg_weight_multiplier=comb_cfg.long_leg_weight_multiplier,
     )
     if train_df.empty:
         raise ValueError("Empty training set in fit_predict_holdout.")

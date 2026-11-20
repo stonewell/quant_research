@@ -120,3 +120,47 @@ def test_invalid_args_raise():
         build_forward_labels(close, exec_lag=-1)
     with pytest.raises(ValueError):
         build_forward_labels(close, mode="unknown_mode")
+
+
+def test_ms8_cross_sectional_rank_label_mode():
+    """MS8: cross_sectional_rank label mode maps forward returns to [-1, +1] causally."""
+    from common.cross_sectional import cs_rank_gaussian_or_uniform
+
+    close = _make_close_panel(n_dates=60, n_syms=8, seed=23)
+    k, lag = 5, 1
+    h = k + lag
+
+    raw = build_forward_labels(close, holding_period=k, exec_lag=lag, mode="raw_return")
+    ranked = build_forward_labels(
+        close, holding_period=k, exec_lag=lag, mode="cross_sectional_rank"
+    )
+
+    assert ranked.shape == close.shape
+    assert ranked.iloc[-h:].isna().all().all()
+
+    valid_rows = ranked.iloc[:-h]
+    vals = valid_rows.to_numpy(dtype=float)
+    assert np.isfinite(vals).all()
+    assert float(np.min(vals)) >= -0.5 - 1e-12
+    assert float(np.max(vals)) <= 0.5 + 1e-12
+    np.testing.assert_allclose(valid_rows.mean(axis=1).to_numpy(), 0.0, atol=1e-12)
+
+    # Interior NaN must stay NaN (never fabricated as 0.0 or 0.5)
+    close_nan = close.copy()
+    close_nan.iloc[15, 0] = np.nan
+    ranked_nan = build_forward_labels(
+        close_nan, holding_period=k, exec_lag=lag, mode="cross_sectional_rank"
+    )
+    assert np.isnan(ranked_nan.iloc[15 - lag, 0])
+
+    expected = cs_rank_gaussian_or_uniform(raw, method="centered_uniform")
+    pd.testing.assert_frame_equal(ranked, expected)
+
+    # Perturbation strictly outside [t + lag, t + k + lag] leaves row t unchanged
+    t = 20
+    close_out = close.copy()
+    close_out.iloc[t + h + 1] *= 1.8
+    ranked_out = build_forward_labels(
+        close_out, holding_period=k, exec_lag=lag, mode="cross_sectional_rank"
+    )
+    pd.testing.assert_series_equal(ranked.iloc[t], ranked_out.iloc[t])

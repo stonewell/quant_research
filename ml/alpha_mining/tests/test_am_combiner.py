@@ -109,3 +109,75 @@ def test_fit_predict_holdout_enforces_purge_and_predicts_all_holdout_dates():
             embargo=5,
             all_dates=all_dates,
         )
+
+
+@pytest.mark.parametrize("objective", ["lambdarank", "regression"])
+def test_ms8_asymmetric_long_only_combiner_weighting(objective: str):
+    """MS8: asymmetric long-only weighting applies long-leg multiplier & convex label_gain."""
+    from amine.combiner import prepare_long_dataset
+
+    with pytest.raises(ValueError, match="long_leg_weight_multiplier"):
+        CombinerConfig(asymmetric_long_only=True, long_leg_weight_multiplier=0.5)
+
+    factors, labels = _make_factor_and_label_panels(n_dates=130, n_syms=10, seed=41)
+    long_df, _ = prepare_long_dataset(
+        factors,
+        labels,
+        objective=objective,
+        asymmetric_long_only=True,
+        long_leg_weight_multiplier=2.5,
+    )
+    assert "sample_weight" in long_df.columns
+    for _dt, grp in long_df.groupby("date", sort=False):
+        med = float(np.median(grp["raw_label"].to_numpy(dtype=float)))
+        long_w = grp.loc[grp["raw_label"] >= med, "sample_weight"].to_numpy(dtype=float)
+        short_w = grp.loc[grp["raw_label"] < med, "sample_weight"].to_numpy(dtype=float)
+        assert np.allclose(long_w, 2.5)
+        assert np.allclose(short_w, 1.0)
+
+    comb_cfg = CombinerConfig(
+        objective=objective,
+        max_depth=3,
+        num_leaves=7,
+        learning_rate=0.05,
+        num_boost_round=40,
+        min_child_samples=5,
+        asymmetric_long_only=True,
+        long_leg_weight_multiplier=2.5,
+        seed=42,
+    )
+    params = comb_cfg.to_lgb_params()
+    if objective == "lambdarank":
+        base_gain = list(range(comb_cfg.n_relevance_bins))
+        gains = params["label_gain"]
+        assert gains[-1] > base_gain[-1]
+        assert gains == sorted(gains)
+        # Strictly convex upper tail: top bin step strictly exceeds lower-half step
+        assert (gains[-1] - gains[-2]) > (gains[1] - gains[0])
+        # n_relevance_bins=3 remains non-proportional (asymmetric in NDCG)
+        g3 = CombinerConfig(
+            objective="lambdarank",
+            n_relevance_bins=3,
+            asymmetric_long_only=True,
+            long_leg_weight_multiplier=2.0,
+        ).to_lgb_params()["label_gain"]
+        assert g3 == [0.0, 1.0, 6.0]
+
+    # Bit-identical baseline when asymmetric_long_only=False
+    base_cfg = CombinerConfig.small_data(seed=42, objective=objective)
+    base_params = base_cfg.to_lgb_params()
+    if objective == "lambdarank":
+        assert base_params["label_gain"] == list(range(base_cfg.n_relevance_bins))
+
+    cv_cfg = PurgedCVConfig(
+        n_splits=3, embargo_days=3, train_side="past", min_train_dates=15, min_test_dates=10
+    )
+    res = run_purged_cv_oof(
+        factors,
+        labels,
+        cv_config=cv_cfg,
+        combiner_config=comb_cfg,
+        h=6,
+    )
+    assert res.n_folds_trained == 3
+    assert np.isfinite(res.oof_scores.to_numpy(dtype=float)).all()

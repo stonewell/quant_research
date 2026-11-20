@@ -107,3 +107,58 @@ def test_turnover_breaker_alarm_and_calm_case():
     assert res_calm.alarm is False
     assert np.isclose(res_calm.max_rolling_turnover, 0.0, atol=1e-12)
     assert res_calm.recommended_action == "none"
+
+
+def test_ms8_adversarial_drift_feature_filtering_single_source_threshold():
+    """MS8: iterative drifted-feature drop uses single-source thresholds from amine.config."""
+    import inspect
+    from amine.config import (
+        DEFAULT_ADV_AUC_ALARM_THRESHOLD,
+        DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD,
+        DEFAULT_ADV_MAX_FEATURE_GAIN_SHARE,
+        MonitoringConfig,
+    )
+    from amine.monitoring import filter_adversarial_drifted_features
+
+    # Single-source threshold parity across config and monitoring defaults
+    m_cfg = MonitoringConfig()
+    assert m_cfg.adv_auc_threshold == DEFAULT_ADV_AUC_ALARM_THRESHOLD == 0.70
+    assert m_cfg.adv_drop_auc_threshold == DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD == 0.65
+    assert m_cfg.adv_max_feature_gain_share == DEFAULT_ADV_MAX_FEATURE_GAIN_SHARE == 0.35
+    sig_adv = inspect.signature(adversarial_validation)
+    assert sig_adv.parameters["auc_threshold"].default == DEFAULT_ADV_AUC_ALARM_THRESHOLD
+    sig_filt = inspect.signature(filter_adversarial_drifted_features)
+    assert sig_filt.parameters["drop_auc_threshold"].default == DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD
+    assert sig_filt.parameters["max_feature_gain_share"].default == DEFAULT_ADV_MAX_FEATURE_GAIN_SHARE
+
+    # 3 IID features + 1 strongly shifted feature -> only f_drift dropped, post-drop AUC <= 0.65
+    rng = np.random.default_rng(123)
+    cols = ["f1", "f2", "f3", "f_drift"]
+    ref = pd.DataFrame(rng.normal(0.0, 1.0, size=(240, 4)), columns=cols)
+    rec = pd.DataFrame(rng.normal(0.0, 1.0, size=(240, 4)), columns=cols)
+    rec["f_drift"] = rng.normal(3.5, 1.0, size=240)
+
+    kept, dropped, final_adv = filter_adversarial_drifted_features(
+        ref, rec, cols, n_splits=3, seed=42
+    )
+    assert dropped == ["f_drift"]
+    assert kept == ["f1", "f2", "f3"]
+    assert final_adv.drifted_features == ["f_drift"]
+    assert final_adv.auc <= DEFAULT_ADV_DRIFT_DROP_AUC_THRESHOLD
+
+    # Multi-feature diffuse drift (all shares < 0.35) + min_surviving_features floor
+    rec_multi = ref.copy()
+    for c in cols:
+        rec_multi[c] = rng.normal(2.5, 1.0, size=240)
+    kept_m, dropped_m, adv_m = filter_adversarial_drifted_features(
+        ref,
+        rec_multi,
+        cols,
+        n_splits=3,
+        max_feature_gain_share=0.90,
+        min_surviving_features=2,
+        seed=42,
+    )
+    assert len(kept_m) == 2
+    assert len(dropped_m) == 2
+    assert adv_m.drifted_features == dropped_m

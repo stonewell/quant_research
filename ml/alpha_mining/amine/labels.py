@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from common.alpha101_operators import cs_indneutralize
+from common.cross_sectional import cs_rank_gaussian_or_uniform
 from common.sector_metadata import load_sector_map, resolve_sector
 from common.specific_alpha import (
     DEFAULT_MIN_OBS,
@@ -36,7 +37,12 @@ from common.specific_alpha import (
     style_exposures_from_close,
 )
 
-VALID_LABEL_MODES = ("raw_return", "market_residual", "specific_residual")
+VALID_LABEL_MODES = (
+    "raw_return",
+    "market_residual",
+    "specific_residual",
+    "cross_sectional_rank",
+)
 
 
 def build_forward_labels(
@@ -78,7 +84,8 @@ def build_forward_labels(
     exec_lag : int, default 1
         Execution delay ``lag >= 0`` in trading bars (1 = enter at t+1 close).
     mode : str, default "raw_return"
-        One of ``"raw_return"``, ``"market_residual"``, ``"specific_residual"``.
+        One of ``"raw_return"``, ``"market_residual"``, ``"specific_residual"``,
+        or ``"cross_sectional_rank"`` (centered uniform rank in ``[-0.5, +0.5]``).
     benchmark_returns : Optional[pd.Series], default None
         Optional benchmark daily return series for residual modes. When None,
         ``specific_alpha_residual`` uses the panel's cross-sectional mean.
@@ -123,7 +130,7 @@ def build_forward_labels(
     close_f = close.astype(float)
     h = k + lag
 
-    if mode == "raw_return":
+    if mode in ("raw_return", "cross_sectional_rank"):
         entry = close_f.shift(-lag) if lag > 0 else close_f
         exit_px = close_f.shift(-h)
         labels = exit_px / entry.where(entry != 0.0) - 1.0
@@ -166,6 +173,14 @@ def build_forward_labels(
                 for sym in labels.columns
             }
         labels = cs_indneutralize(labels, groups)
+
+    if mode == "cross_sectional_rank":
+        # MS8: cross-sectional rank target mapped to [-0.5, +0.5] via shared MS1 primitive.
+        labels = cs_rank_gaussian_or_uniform(labels, method="centered_uniform")
+        if h >= len(labels):
+            labels.iloc[:] = np.nan
+        elif h > 0:
+            labels.iloc[-h:] = np.nan
 
     if drop_trailing_nan:
         if h >= len(labels):

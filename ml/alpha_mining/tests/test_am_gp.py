@@ -232,3 +232,62 @@ def test_gp_validity_mask_drops_neutral_fills_for_nonfinite_inputs():
     assert np.isfinite(out.iloc[20, 3])
     assert np.isfinite(out.iloc[19, 2])
     assert not np.isinf(out.to_numpy(dtype=float)).any()
+
+
+def test_ms8_gp_microstructure_terminals_and_depth_cap():
+    """MS8: opt-in microstructure terminals, depth cap <= 4, NaN masking, and causality."""
+    import pytest
+    from amine.gp import BASE_TERMINAL_NAMES, MS_TERMINAL_NAMES
+
+    # Depth > 4 with include_ms_terminals=True must be rejected
+    with pytest.raises(ValueError, match="max_depth"):
+        GPConfig(include_ms_terminals=True, max_depth=5)
+
+    ms_cfg = GPConfig.ms8_microstructure(
+        seed=42, population_size=14, n_generations=2, tournament_size=3, top_k=3
+    )
+    assert ms_cfg.include_ms_terminals is True
+    assert ms_cfg.max_depth == 4
+
+    ohlcv = _make_synthetic_ohlcv(n_dates=70, n_syms=6, seed=77)
+    ohlcv["close"].iloc[30, 0] = np.nan
+
+    terminals, avail = build_terminals(
+        ohlcv, include_ms_terminals=True, ms_lookback=15
+    )
+    for name in BASE_TERMINAL_NAMES + MS_TERMINAL_NAMES:
+        assert name in terminals
+        assert terminals[name].shape == ohlcv["close"].shape
+        assert np.isnan(terminals[name].iloc[30, 0])
+        assert not np.isinf(terminals[name].to_numpy(dtype=float)).any()
+
+    # After warmup, all 4 MS terminals must produce finite non-empty values
+    for name in MS_TERMINAL_NAMES:
+        tail = terminals[name].iloc[25:]
+        assert np.isfinite(tail.to_numpy(dtype=float)).sum() > 0
+        assert GPNode(op="term", value=name).max_window() == 20
+
+    # Causal prefix-invariance of MS terminals when future rows are perturbed
+    cutoff = 45
+    ohlcv_pert = {k: v.copy() for k, v in ohlcv.items()}
+    for k in ohlcv_pert:
+        ohlcv_pert[k].iloc[cutoff:] *= 2.5
+    t_pert, _ = build_terminals(
+        ohlcv_pert, include_ms_terminals=True, ms_lookback=15
+    )
+    for name in MS_TERMINAL_NAMES:
+        pd.testing.assert_frame_equal(
+            terminals[name].iloc[:cutoff],
+            t_pert[name].iloc[:cutoff],
+            atol=1e-12,
+        )
+
+    # Mining with MS8 profile enforces depth <= 4 on all returned factors
+    labels = build_forward_labels(ohlcv["close"], holding_period=5, exec_lag=1)
+    miner = GPFactorMiner(ms_cfg)
+    selected = miner.mine(ohlcv, labels)
+    for f in selected:
+        assert f.node is not None
+        assert f.node.depth() <= 4
+        eval_panel = miner.evaluate_expression_on_panel(f.node, ohlcv, sign=f.sign)
+        assert eval_panel.shape == ohlcv["close"].shape
