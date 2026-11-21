@@ -1379,6 +1379,21 @@ class AssetPolicy:
                     detail={
                         "exit_streak": st.exit_streak,
                         "guard_latency_bars": cfg.guard_latency_bars,
+                        # (L2.63 audit gap, 2026-11-20 forensics) ADDITIVE ONLY:
+                        # the model's PRE-policy target, so a "zero target but
+                        # still held" row is auditable from
+                        # `walkforward_lifecycle_records.csv` alone. Without it
+                        # 30,539 of 385,560 logged rows carried a NaN here and
+                        # the only way to tell "the model asked for 0 and
+                        # confirmation is running" apart from "read the code"
+                        # was to read the code. The decision itself is
+                        # untouched -- `target_weight` is still the held
+                        # `current_weight`, and no branch reads this key. The
+                        # other EXIT_CONFIRMING producer (gate 2b's breakdown
+                        # confirmation, opt-in default OFF) is deliberately NOT
+                        # touched: it is a different rule and already carries
+                        # its own price/floor evidence.
+                        "raw_target_weight": raw_target_weight,
                     },
                 )
             return _decision(

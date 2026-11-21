@@ -351,6 +351,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lifecycle-breadth-thrust-threshold",
                    type=float, default=None, dest="lifecycle_breadth_thrust_threshold",
                    help="UPLSM market breadth thrust threshold for entry fast path (default: 0.60).")
+    p.add_argument("--lifecycle-enable-market-breadth",
+                   dest="lifecycle_enable_market_breadth", action="store_true", default=False,
+                   help="L2.63: supply the position lifecycle with a per-bar market breadth/thrust "
+                        "series computed from the backtest universe (Stage-1 semantics: share "
+                        "above SMA50, else share with positive 10-bar return) so gate 5 "
+                        "'宏观冲力爆量突破' can actually fire. Default OFF: with the flag off the "
+                        "series is None and every output is bit-identical to a pre-L2.63 run. "
+                        "Requires universe frames with a Volume column for the volume legs.")
     # Both fast-path toggles are ALWAYS ON since BASE_VERSION 2.0.0 (M4.4 stage
     # D3): the kernel has no field for them, and `step_position_lifecycle` now
     # calls `_require_kernel_step_supported(cfg)` unconditionally, so a resolved
@@ -620,7 +628,11 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                 eval_universe = _slice_universe_for_range(universe, eval_index)
                 eval_symbols = list(eval_universe.keys())
 
-                from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
+                from common.position_lifecycle import (
+                    build_lifecycle_market_breadths,
+                    resolve_position_lifecycle_config,
+                    simulate_position_lifecycle,
+                )
                 from common.allocation_backtester import CASH_PROXY_SYMBOLS
 
                 enable_pl = getattr(args, "enable_position_lifecycle", True)
@@ -631,6 +643,18 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                 market_type = "china" if getattr(args, "china_trading", False) else ("us" if getattr(args, "us_trading", False) else ("hk" if getattr(args, "hk_trading", False) else "other"))
 
                 if enable_pl:
+                    # (L2.63) Gate 5's breadth leg needs `market_breadths`; without
+                    # it `breadth_val` is None on every bar and the confluence leg
+                    # is dead code. Computed from the SAME `buffered_universe` the
+                    # simulator reads, and ONLY when the flag is on -- otherwise
+                    # `None`, i.e. byte-identical to a pre-L2.63 run.
+                    market_breadths = (
+                        build_lifecycle_market_breadths(
+                            buffered_universe, pl_cfg, cash_proxy=resolved_cash_proxy,
+                        )
+                        if pl_cfg.enable_market_breadth
+                        else None
+                    )
                     # Warm the FSM causally over the fold's pre-eval warmup buffer
                     warmed_weights, all_records = simulate_position_lifecycle(
                         universe=buffered_universe,
@@ -638,6 +662,7 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                         cfg=pl_cfg,
                         market=market_type,
                         cash_proxy=resolved_cash_proxy,
+                        market_breadths=market_breadths,
                     )
                     eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
                     seed_row = (
@@ -690,6 +715,12 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                     enable_position_lifecycle=enable_pl,
                     lifecycle_config=pl_cfg,
                     lifecycle_records=eval_records,
+                    # (L2.63) Passed through so a fold whose records were
+                    # filtered to an empty window (which makes the engine
+                    # RE-simulate) still gets the same breadth supply.
+                    enable_market_breadth=bool(
+                        pl_cfg.enable_market_breadth if pl_cfg is not None else False
+                    ),
                 )
                 if result["equity_curve"].empty:
                     fold_metrics = _nan_fold_metrics()
@@ -1016,7 +1047,11 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
     eval_universe = _slice_universe_for_range(universe, eval_index)
     eval_symbols = list(eval_universe.keys())
 
-    from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
+    from common.position_lifecycle import (
+        build_lifecycle_market_breadths,
+        resolve_position_lifecycle_config,
+        simulate_position_lifecycle,
+    )
     from common.allocation_backtester import CASH_PROXY_SYMBOLS
 
     enable_pl = getattr(args, "enable_position_lifecycle", True)
@@ -1028,12 +1063,22 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
 
     has_warmup = len(eval_index) > 0 and len(eval_index) < len(raw_target_weights)
     if enable_pl:
+        # (L2.63) Same opt-in breadth supply as the walkforward path; `None`
+        # when the flag is off keeps every number bit-identical.
+        market_breadths = (
+            build_lifecycle_market_breadths(
+                universe, pl_cfg, cash_proxy=resolved_cash_proxy,
+            )
+            if pl_cfg.enable_market_breadth
+            else None
+        )
         warmed_weights, all_records = simulate_position_lifecycle(
             universe=universe,
             target_weights=raw_target_weights,
             cfg=pl_cfg,
             market=market_type,
             cash_proxy=resolved_cash_proxy,
+            market_breadths=market_breadths,
         )
         if has_warmup:
             eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
@@ -1087,6 +1132,10 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
         enable_position_lifecycle=enable_pl,
         lifecycle_config=pl_cfg,
         lifecycle_records=eval_records,
+        # (L2.63) Same series, same switch -- see the walkforward call site.
+        enable_market_breadth=bool(
+            pl_cfg.enable_market_breadth if pl_cfg is not None else False
+        ),
     )
 
     if result["equity_curve"].empty:

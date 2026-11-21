@@ -2891,3 +2891,206 @@ def test_main_optimize_empty_param_grid_keeps_original_params(tmp_path, monkeypa
 
 
 
+
+
+# --------------------------------------------------------------------------- #
+# L2.63 -- `--lifecycle-enable-market-breadth` (opt-in, default OFF)
+# --------------------------------------------------------------------------- #
+#
+# Gate 5 (「宏观冲力爆量突破」) needs THREE things: a breadth value >= 0.60, a
+# volume/ma20 ratio >= 1.5, and a positive model target on a FLAT/PENDING_ENTRY
+# asset. The backtest data path supplied NONE of the first (no `market_breadths`
+# argument was ever passed), so the confluence leg was dead code. These tests pin
+# both halves of the contract:
+#   * OFF (the default) -- the series is `None`, the builder is never even called,
+#     and the output is identical to the pre-L2.63 engine;
+#   * ON -- the series reaches the simulator and a real confluence BUY appears
+#     end-to-end through `run_standard`.
+
+
+class _OneShotTargetTemplate:
+    """Emits exactly ONE 0.30 target row (S0 on `bar`), NaN everywhere else."""
+
+    name = "one_shot"
+
+    def __init__(self, bar: int):
+        self.bar = bar
+
+    def generate_weights(self, universe, params):
+        n = len(next(iter(universe.values())))
+        dates = next(iter(universe.values())).index
+        weights = pd.DataFrame(np.nan, index=dates, columns=list(universe.keys()))
+        weights.loc[dates[self.bar], "S0"] = 0.30
+        return weights
+
+    def explain_weights(self, params):        # pragma: no cover - not used here
+        return "one-shot target"
+
+    def warmup_bars(self, params):
+        return 0
+
+
+def _breadth_universe(n=70, surge_bar=60, with_volume=True):
+    """5 strictly rising symbols; S0 gets a 2.33x volume surge on `surge_bar`.
+
+    Rising closes keep breadth at 1.0 from bar 49 on (all five above their SMA50),
+    and `(19 * 1000 + 2500) / 20 = 1075` gives a 2.33x ratio: over the 1.5x
+    confluence hurdle, under the 2.5x STANDALONE-surge hurdle, so any gate-5 BUY
+    observed here is provably the confluence leg.
+    """
+    universe = {}
+    for i in range(5):
+        sym = f"S{i}"
+        df = make_df(np.linspace(100.0, 159.0, n) + i, start="2020-01-01")
+        if with_volume:
+            df["Volume"] = 1000.0
+            if sym == "S0":
+                df.iloc[surge_bar, df.columns.get_loc("Volume")] = 2500.0
+        universe[sym] = df
+    return universe
+
+
+def _gate5_reasons(result):
+    return [
+        rec for rec in (result.get("lifecycle_records") or [])
+        if "宏观冲力爆量突破" in str(rec.get("reason", ""))
+    ]
+
+
+def test_market_breadth_off_by_default_is_bit_identical(monkeypatch):
+    """Default OFF: `market_breadths is None`, the builder is never called, same numbers."""
+    import common.position_lifecycle as pl
+
+    seen = []
+    real_sim = pl.simulate_position_lifecycle
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("market_breadths", "<<MISSING>>"))
+        return real_sim(*args, **kwargs)
+
+    def builder_must_not_be_called(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError(
+            "build_lifecycle_market_breadths must not run while "
+            "enable_market_breadth is False"
+        )
+
+    monkeypatch.setattr(pl, "simulate_position_lifecycle", spy)
+    monkeypatch.setattr(pl, "build_lifecycle_market_breadths", builder_must_not_be_called)
+
+    universe = _breadth_universe()
+    template = _OneShotTargetTemplate(bar=60)
+
+    # An args namespace that predates this flag entirely (no attribute at all).
+    legacy = run_standard(universe, template, {}, MockArgs())
+    assert seen == [None], f"the simulator must receive market_breadths=None, got {seen}"
+    assert _gate5_reasons(legacy) == [], "gate 5 cannot fire without a breadth series"
+
+    # Explicit `False` is the same run, cell for cell.
+    seen.clear()
+    explicit_off = run_standard(
+        universe, template, {},
+        MockArgs(lifecycle_enable_market_breadth=False),
+    )
+    assert seen == [None]
+    pd.testing.assert_frame_equal(
+        legacy["equity_curve"], explicit_off["equity_curve"], check_exact=True
+    )
+    assert legacy["lifecycle_records"] == explicit_off["lifecycle_records"]
+
+
+def test_market_breadth_flag_supplies_the_series_and_gate5_fires_end_to_end(monkeypatch):
+    """Flag ON: the series reaches the simulator and the confluence BUY really happens."""
+    import common.position_lifecycle as pl
+
+    seen = []
+    real_sim = pl.simulate_position_lifecycle
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("market_breadths", "<<MISSING>>"))
+        return real_sim(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "simulate_position_lifecycle", spy)
+
+    universe = _breadth_universe()
+    template = _OneShotTargetTemplate(bar=60)
+    on = run_standard(
+        universe, template, {},
+        MockArgs(lifecycle_enable_market_breadth=True),
+    )
+
+    assert len(seen) == 1
+    series = seen[0]
+    assert isinstance(series, pd.Series), f"expected a breadth Series, got {type(series)}"
+    assert not series.empty
+    # Breadth is 1.0 on the entry bar (all five symbols above their SMA50).
+    assert float(series.iloc[60]) == pytest.approx(1.0)
+
+    buys = _gate5_reasons(on)
+    assert buys, "the confluence leg must fire end-to-end through run_standard"
+    record = buys[0]
+    assert record["action"] == "BUY"
+    assert record["symbol"] == "S0"
+    assert record["detail_reason"]["market_breadth"] == pytest.approx(1.0)
+    assert 1.5 <= record["detail_reason"]["vol_ratio"] < 2.5
+
+
+def test_market_breadth_flag_is_inert_without_a_volume_column():
+    """No `Volume` => the volume legs stay False, so gate 5 still cannot fire.
+
+    The warning (one per context) is the whole point: a run that opted in but fed
+    a price-only universe must SAY that the gate is still unreachable instead of
+    looking enabled and doing nothing.
+    """
+    import common.position_lifecycle as pl
+
+    price_only = _breadth_universe(with_volume=False)
+    template = _OneShotTargetTemplate(bar=60)
+
+    with pytest.warns(RuntimeWarning, match="no universe frame carries a `Volume` column"):
+        result = run_standard(
+            price_only, template, {},
+            MockArgs(lifecycle_enable_market_breadth=True),
+        )
+    assert _gate5_reasons(result) == []
+    assert pl.lifecycle_volume_available(price_only) is False
+
+
+def test_market_breadth_flag_is_threaded_by_the_walkforward_path_too(monkeypatch):
+    """The walkforward fold evaluator must pass the series as well (2nd call site).
+
+    Pinned separately because the two `simulate_position_lifecycle` calls are
+    independent statement blocks: wiring only `run_standard` would leave every
+    walkforward fold -- i.e. the measurement that decides the flag's fate --
+    still dead.
+    """
+    import common.position_lifecycle as pl
+
+    seen = []
+    real_sim = pl.simulate_position_lifecycle
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("market_breadths", "<<MISSING>>"))
+        return real_sim(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "simulate_position_lifecycle", spy)
+
+    universe = _breadth_universe(n=140, surge_bar=60)
+    folds = run_walkforward(
+        universe,
+        _OneShotTargetTemplate(bar=60),
+        {},
+        MockArgs(lifecycle_enable_market_breadth=True, window_years=0.4, step_years=0.2),
+    )
+    assert folds, "fixture must produce at least one fold"
+    assert seen, "the walkforward path must run the lifecycle simulator"
+    assert all(isinstance(value, pd.Series) and not value.empty for value in seen), seen
+
+    # ... and OFF remains `None` (the pre-L2.63 fold behaviour).
+    seen.clear()
+    run_walkforward(
+        universe,
+        _OneShotTargetTemplate(bar=60),
+        {},
+        MockArgs(window_years=0.4, step_years=0.2),
+    )
+    assert seen and all(value is None for value in seen), seen

@@ -375,6 +375,7 @@ def run_allocation_backtest(
     enable_position_lifecycle: bool = False,
     lifecycle_config: Optional[Any] = None,
     lifecycle_records: Optional[List[Dict[str, Any]]] = None,
+    enable_market_breadth: bool = False,
 ) -> dict:
     """
     Simulates portfolio equity curve given daily target weights.
@@ -746,6 +747,19 @@ def run_allocation_backtest(
     deviation remains: a long/short book whose GROSS target exposure exceeds
     1.0 is not silently renormalised in the reported weights -- only the
     CASH-FEASIBLE long side is scaled down.
+
+    `enable_market_breadth` (L2.63, default False): inside the position-lifecycle
+    block only, compute a per-bar market breadth/thrust series from `universe`
+    (`common.indicators.lifecycle_market_breadth` -- Stage-1 semantics: share
+    above SMA50, replaced by the share with a positive 10-bar return on bars
+    where that thrust clears `breadth_thrust_threshold`) and pass it as the
+    simulator's `market_breadths`. This is the ONLY input that can arm gate 5's
+    breadth leg (`is_breadth`) in a backtest; with the flag off the series is
+    `None` and every bar's `breadth_val` stays `None`, i.e. byte-identical to a
+    pre-L2.63 run. NaN bars (warmup / calendar holes) are NEVER filled: they
+    decode to `None` in the policy kernel, which is a strict no-op. If no frame
+    carries a `Volume` column the volume legs (`is_vol` / `is_super_volume_surge`)
+    stay False and one WARNING says so.
     """
     if sum([bool(china_trading), bool(us_trading), bool(hk_trading)]) > 1:
         raise ValueError("Only one of china_trading, us_trading, hk_trading may be enabled.")
@@ -842,6 +856,12 @@ def run_allocation_backtest(
         # DISCLOSURE: strategy_generator candidate search runs with position lifecycle OFF
         # to preserve an unconstrained search landscape; final backtests run with it ON.
         #
+        # (L2.63) `enable_market_breadth` (default False) is a DATA switch, not a
+        # policy knob: it decides whether a per-bar `market_breadths` series is
+        # computed from `universe` and handed to the simulator, which is what
+        # gate 5's breadth leg needs to be evaluable at all. Off -> `None`, i.e.
+        # exactly the pre-L2.63 behaviour (`breadth_val is None` every bar).
+        #
         # (F4) A NON-EMPTY `lifecycle_records` is a caller-supplied, already
         # simulated record list (e.g. `run_backtest.py` warming the FSM over a
         # fold's pre-eval buffer) -- it may be passed straight through, because
@@ -855,7 +875,11 @@ def run_allocation_backtest(
             lifecycle_records_out = list(lifecycle_records)
             lifecycle_simulated = True
         else:
-            from common.position_lifecycle import resolve_position_lifecycle_config, simulate_position_lifecycle
+            from common.position_lifecycle import (
+                build_lifecycle_market_breadths,
+                resolve_position_lifecycle_config,
+                simulate_position_lifecycle,
+            )
             cfg = lifecycle_config if lifecycle_config is not None else resolve_position_lifecycle_config()
             market_type = "china" if china_trading else ("us" if us_trading else ("hk" if hk_trading else "other"))
             _proxy_syms = CASH_PROXY_SYMBOLS if cash_proxy_symbols is None else cash_proxy_symbols
@@ -877,6 +901,16 @@ def run_allocation_backtest(
                 cfg=cfg,
                 market=market_type,
                 cash_proxy=resolved_cash_proxy,
+                # (L2.63) Gate 5's breadth leg is inert without this series
+                # (`breadth_val` is None on every bar). Opt-in: default False
+                # passes `None`, i.e. exactly the pre-L2.63 behaviour.
+                market_breadths=(
+                    build_lifecycle_market_breadths(
+                        universe, cfg, cash_proxy=resolved_cash_proxy,
+                    )
+                    if enable_market_breadth
+                    else None
+                ),
             )
             lifecycle_simulated = True
 

@@ -210,6 +210,18 @@ class PositionLifecycleConfig:
     price_reentry_pct: float = 0.02
     reentry_vwap_lookback: int = 20
 
+    # ---- L2.63: the market-breadth DATA switch (not a policy knob) -----------
+    # Gate 5's breadth leg needs a per-bar `market_breadths` series, and the
+    # backtest data path used to supply `None` unconditionally -- so the
+    # confluence leg (`is_breadth and is_vol`) was dead code in every backtest
+    # while the live runner fed it normally. This field switches the SUPPLY on
+    # (the resolver computes `common.indicators.lifecycle_market_breadth` from
+    # the same universe the simulator already receives). It is deliberately NOT
+    # a `PositionPolicyConfig` field and NOT mapped into the kernel: the policy
+    # is unchanged, only its input used to be missing. Default `False` keeps
+    # every existing backtest output bit-identical (`market_breadths=None`).
+    enable_market_breadth: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         from dataclasses import asdict
         return asdict(self)
@@ -875,6 +887,9 @@ def resolve_position_lifecycle_config(
         price_reentry_gate: False       (M1.1 gate 3b, kernel-only)
         price_reentry_pct: 0.02
         reentry_vwap_lookback: 20
+        enable_market_breadth: False    (L2.63 DATA switch, NOT a kernel field:
+                                         it only decides whether the backtest
+                                         computes a `market_breadths` series)
 
     The two defaults that used to DISAGREE with live (and are fixed here, F1)
     were `normal_cooldown_bars=1` (live: 2 -- `--reentry-cooldown-bars` default)
@@ -1057,6 +1072,10 @@ def resolve_position_lifecycle_config(
     price_reentry_gate = bool(_get("price_reentry_gate", False, "price_reentry_gate"))
     price_reentry_pct = float(_get("price_reentry_pct", 0.02, "price_reentry_pct"))
     reentry_vwap_lookback = int(_get("reentry_vwap_lookback", 20, "reentry_vwap_lookback"))
+    # L2.63: the market-breadth DATA switch. Default False, so the resolved
+    # config stays semantically identical to a pre-change one and the call sites
+    # pass `market_breadths=None` exactly as they always did.
+    enable_market_breadth = bool(_get("enable_market_breadth", False, "enable_market_breadth"))
 
     return PositionLifecycleConfig(
         guard_latency_bars=guard_latency_bars,
@@ -1079,6 +1098,7 @@ def resolve_position_lifecycle_config(
         price_reentry_gate=price_reentry_gate,
         price_reentry_pct=price_reentry_pct,
         reentry_vwap_lookback=reentry_vwap_lookback,
+        enable_market_breadth=enable_market_breadth,
     )
 
 
@@ -1389,6 +1409,111 @@ def _forced_exits_for_bar(
     return resolved or None
 
 
+# ---------------------------------------------------------------------------
+# L2.63 -- supplying gate 5's `market_breadths` (backtest data path)
+# ---------------------------------------------------------------------------
+#
+# `simulate_position_lifecycle(market_breadths=...)` has always existed and the
+# loop reads it per bar, but NO backtest caller ever passed a value, so
+# `breadth_val` was permanently `None`, `is_breadth` permanently False, and the
+# 「宏观冲力爆量突破」 confluence leg could only fire in live trading. The three
+# call sites (`backtester/run_backtest.py` standard + walkforward,
+# `common/allocation_backtester.py`) now build the series through THIS function
+# so there is one derivation and one volume check, not three.
+
+def build_lifecycle_market_breadths(
+    universe: Dict[str, pd.DataFrame],
+    cfg: Optional[PositionLifecycleConfig] = None,
+    *,
+    cash_proxy: Optional[str] = None,
+) -> pd.Series:
+    """Per-bar breadth/thrust series for gate 5, from the SAME universe frames.
+
+    `thrust_thresh` is the RESOLVED `cfg.breadth_thrust_threshold` (0.60 by
+    default), i.e. the very number gate 5 compares `market_breadth` against:
+    selecting the thrust value with one threshold and then gating it with
+    another would make "thrust active" unobservable from a decision record.
+
+    NaN semantics are `common.indicators.lifecycle_market_breadth`'s: warmup /
+    calendar holes are `NaN`, which the simulator decodes to `None` (a strict
+    no-op), NEVER 0.0. Nothing here fills.
+
+    A universe whose frames carry no `Volume` column is DISCLOSED (once) rather
+    than silently left inert: `is_vol` requires `volume / ma20_volume`, so
+    without a Volume column the gate still cannot fire even with breadth
+    supplied. It is a warning, not an exception -- a price-only fixture is a
+    legitimate input, and killing the run would be a bigger change than the
+    one this task makes.
+    """
+    warn_if_lifecycle_volume_missing(universe, context="market_breadths")
+    from common.indicators import (
+        MARKET_BREADTH_LOOKBACK,
+        MARKET_THRUST_LOOKBACK,
+        lifecycle_market_breadth,
+    )
+
+    cfg = cfg if cfg is not None else PositionLifecycleConfig()
+    return lifecycle_market_breadth(
+        universe,
+        breadth_lookback=MARKET_BREADTH_LOOKBACK,      # live Stage-1: 50
+        thrust_lookback=MARKET_THRUST_LOOKBACK,        # live Stage-1: 10
+        thrust_thresh=float(getattr(cfg, "breadth_thrust_threshold", 0.60)),
+        cash_proxy=cash_proxy,
+    )
+
+
+#: Warning contexts already told that the universe carries no `Volume` column.
+#: The warning is a property of the DATA PATH, not of a bar, so it must not
+#: repeat once per fold / per backtest call in a batch run.
+_VOLUME_WARNED_CONTEXTS: Set[str] = set()
+
+
+def lifecycle_volume_available(universe: Dict[str, pd.DataFrame]) -> bool:
+    """True when at least one (non-empty) universe frame carries `Volume`.
+
+    This is the exact condition under which gate 5's volume legs can be
+    evaluated: `simulate_position_lifecycle` reads `df["Volume"]` (and rolls a
+    20-bar mean) whenever the column exists, and leaves `volume` / `ma20_volume`
+    as `None` otherwise -- which makes `is_vol` and `is_super_volume_surge` both
+    False by construction.
+    """
+    for df in (universe or {}).values():
+        if df is None or getattr(df, "empty", True):
+            continue
+        if "Volume" in getattr(df, "columns", ()):
+            return True
+    return False
+
+
+def warn_if_lifecycle_volume_missing(
+    universe: Dict[str, pd.DataFrame],
+    *,
+    context: str = "position_lifecycle",
+) -> bool:
+    """Warn ONCE per `context` when no frame carries `Volume`; return availability.
+
+    Returns `lifecycle_volume_available(universe)`. Repeats are suppressed
+    because a walkforward run calls this once per fold and would otherwise emit
+    the same warning dozens of times -- noise is how a real warning gets
+    ignored.
+    """
+    available = lifecycle_volume_available(universe)
+    if available:
+        return True
+    if context not in _VOLUME_WARNED_CONTEXTS:
+        _VOLUME_WARNED_CONTEXTS.add(context)
+        warnings.warn(
+            "market breadth supplied to the position lifecycle, but no universe frame "
+            "carries a `Volume` column: gate 5's volume legs (`is_vol` / "
+            "`is_super_volume_surge`) stay False, so 「宏观冲力爆量突破」 still cannot "
+            "fire. Attach Volume to the universe (or accept a breadth-only no-op) -- "
+            f"context={context!r}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return False
+
+
 def simulate_position_lifecycle(
     universe: Dict[str, pd.DataFrame],
     target_weights: pd.DataFrame,
@@ -1447,6 +1572,17 @@ def simulate_position_lifecycle(
     forwarded to `step_position_lifecycle`, which turns membership into the
     kernel's `forced_exit` channel. A missing date, a `None` value or a `None`
     mapping all resolve to "no forced exit on this bar".
+
+    `market_breadths` (L2.63, default `None`): a per-bar breadth/thrust Series
+    forwarded to the kernel as `market_breadth`, which is the ONLY input that can
+    arm gate 5's breadth leg (`is_breadth`). `None` -- the pre-L2.63 state of
+    every backtest call site -- leaves `breadth_val` `None` on every bar, so the
+    「宏观冲力爆量突破」 confluence leg is unreachable. A bar absent from the
+    series, or holding NaN, decodes to `None` (strict no-op), NEVER 0.0: filling
+    it would silently pin `is_breadth` to False forever, which is exactly the
+    dead-gate bug L2.63 fixes. Build the series through
+    `build_lifecycle_market_breadths` (one derivation for all three backtest
+    call sites) rather than by hand.
     """
     if cfg is None:
         cfg = resolve_position_lifecycle_config()

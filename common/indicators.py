@@ -367,3 +367,169 @@ def bearish_reversal_signals(df: pd.DataFrame, **kwargs) -> pd.Series:
     """True on any bar completing a bearish candlestick reversal pattern."""
     patterns = candlestick_patterns(df, **kwargs)
     return patterns[BEARISH_REVERSAL_PATTERNS].any(axis=1)
+
+
+# ---------------------------------------------------------------------------
+# Universe-wide market breadth / thrust
+# ---------------------------------------------------------------------------
+#
+# WHY THESE LIVE HERE (task L2.63)
+# --------------------------------
+# `common.position_policy`'s gate 5 (「宏观冲力爆量突破」) needs a per-bar
+# `market_breadth`, and NOTHING in the backtest data path used to supply one --
+# `simulate_position_lifecycle(market_breadths=None)` was the only value ever
+# passed by `backtester/run_backtest.py` (standard + walkforward) and
+# `common/allocation_backtester.py`, so `is_breadth` was permanently False and
+# the confluence leg could only ever fire in LIVE trading. These helpers are the
+# ONE derivation all three call sites share, so the three engines cannot
+# disagree about what "breadth" meant on a given bar.
+#
+# SEMANTICS ARE THE LIVE STAGE-1 SEMANTICS
+# ----------------------------------------
+# `scripts/check_live_portfolio_health.py::evaluate_market_breadth_and_thrust`
+# computes, over the universe EXCLUDING the cash proxy:
+#   breadth = share of symbols with `last_close > SMA(breadth_lookback)`   (50)
+#   thrust  = share of symbols with `close/close[-thrust_lookback] - 1 > 0` (10)
+# and `scripts/run_live_strategy.py` feeds the lifecycle kernel
+# `thrust_val if thrust_active else breadth_val` where
+# `thrust_active = thrust >= thrust_thresh` (0.60). Here the same three
+# quantities are computed as ROLLING per-bar series instead of one scalar
+# snapshot -- that is the only difference, and it is what a backtest needs.
+#
+# ALIGNMENT RULE (stated once, relied on by every caller)
+# ------------------------------------------------------
+# The returned Series is indexed by the UNION of the participating symbols'
+# own bar timestamps -- NOT their intersection, and NOT a forward-filled union
+# of prices:
+#   * UNION, because each caller's bar loop looks the value up per symbol per
+#     bar (`market_breadths.loc[t]`). An intersection would silently drop the
+#     calendar of any symbol that listed late or trades on a different session
+#     calendar, and those bars would fall back to `None` (a gate that cannot
+#     fire on exactly the symbols that were most recently listed).
+#   * NO PRICE FORWARD-FILL, because a filled price is a FABRICATED close: it
+#     would enter the SMA/ROC windows as a real observation. Each symbol's
+#     indicator is computed on its OWN native index and only THEN reindexed
+#     onto the union, so a symbol contributes to a bar's numerator/denominator
+#     only when it actually had a bar -- and enough history -- there.
+#
+# NaN IS NOT ZERO (the contract that matters)
+# -------------------------------------------
+# A bar where no participating symbol has a usable observation (warmup, a
+# calendar hole, an all-NaN panel) is left as `NaN`. The consumer
+# (`simulate_position_lifecycle` -> `step_position_lifecycle`) decodes a NaN as
+# `None`, which makes gate 5's breadth leg a STRICT NO-OP. NEVER `fillna` this
+# series: a filled 0.0 reproduces the very dead-gate bug this helper exists to
+# fix (`is_breadth` would be permanently False, silently), and a filled 0.5
+# would fabricate a measurement the data never supported.
+
+#: Live Stage-1 defaults (`evaluate_market_breadth_and_thrust`).
+MARKET_BREADTH_LOOKBACK = 50
+MARKET_THRUST_LOOKBACK = 10
+
+
+def _close_frames(universe, cash_proxy=None):
+    """`[(symbol, numeric Close series)]` for every usable, non-cash frame."""
+    excluded = str(cash_proxy).upper() if cash_proxy is not None else None
+    frames = []
+    for sym, df in (universe or {}).items():
+        if df is None or getattr(df, "empty", True) or "Close" not in getattr(df, "columns", ()):
+            continue
+        if excluded is not None and str(sym).upper() == excluded:
+            continue
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        if close.notna().any():
+            frames.append((sym, close))
+    return frames
+
+
+def _aggregate_share(flags) -> pd.Series:
+    """Per-bar `sum(flags) / count(known flags)`; NaN when nothing is known.
+
+    The denominator counts only symbols that actually produced a value on that
+    bar, so a warmup bar cannot be diluted by the symbols that have not yet
+    accumulated `lookback` observations.
+    """
+    if not flags:
+        return pd.Series(dtype=float)
+    panel = pd.concat(flags, axis=1).sort_index()
+    known = panel.notna().sum(axis=1)
+    share = panel.sum(axis=1, min_count=1) / known.where(known > 0)
+    return share.where(known > 0)
+
+
+def market_breadth_series(universe, lookback: int = MARKET_BREADTH_LOOKBACK,
+                          cash_proxy=None) -> pd.Series:
+    """Share of the universe closing above its own trailing SMA(`lookback`).
+
+    Rolling per-bar form of the live `breadth` statistic. `min_periods` is the
+    FULL lookback: a 3-bar mean printed as "SMA50" would sit almost on top of
+    the price and make nearly every close count as "above", so a symbol with
+    insufficient history is simply ABSENT from that bar's denominator (and the
+    bar is `NaN` if nobody has enough history yet). Returns a Series on the
+    union of the symbols' indices -- see the alignment rule above.
+    """
+    lookback = int(lookback)
+    if lookback < 1:
+        raise ValueError(f"market_breadth_series: lookback must be >= 1, got {lookback}")
+    flags = []
+    for sym, close in _close_frames(universe, cash_proxy):
+        ma = close.rolling(window=lookback, min_periods=lookback).mean()
+        known = (close.notna() & ma.notna()).to_numpy()
+        above = np.where(known, (close > ma).to_numpy(), np.nan)
+        flags.append(pd.Series(above, index=close.index, dtype=float).rename(sym))
+    series = _aggregate_share(flags)
+    series.name = "market_breadth"
+    return series
+
+
+def market_thrust_series(universe, lookback: int = MARKET_THRUST_LOOKBACK,
+                         cash_proxy=None) -> pd.Series:
+    """Share of the universe with a POSITIVE `lookback`-bar return (`roc > 0`).
+
+    Rolling per-bar form of the live `thrust` statistic. A symbol whose
+    `close[t - lookback]` is missing or non-positive cannot claim a direction
+    and is dropped from that bar's denominator rather than counted as "not
+    positive".
+    """
+    lookback = int(lookback)
+    if lookback < 1:
+        raise ValueError(f"market_thrust_series: lookback must be >= 1, got {lookback}")
+    flags = []
+    for sym, close in _close_frames(universe, cash_proxy):
+        prev = close.shift(lookback)
+        known = (close.notna() & prev.notna() & (prev > 0)).to_numpy()
+        momentum = close / prev.where(prev > 0) - 1.0
+        positive = np.where(known, (momentum > 0).to_numpy(), np.nan)
+        flags.append(pd.Series(positive, index=close.index, dtype=float).rename(sym))
+    series = _aggregate_share(flags)
+    series.name = "market_thrust"
+    return series
+
+
+def lifecycle_market_breadth(universe,
+                             breadth_lookback: int = MARKET_BREADTH_LOOKBACK,
+                             thrust_lookback: int = MARKET_THRUST_LOOKBACK,
+                             thrust_thresh: float = 0.60,
+                             cash_proxy=None) -> pd.Series:
+    """The value gate 5 compares against: thrust when active, else breadth.
+
+    Mirrors `scripts/run_live_strategy.py`'s per-bar kernel argument
+    `thrust_val if thrust_active else breadth_val` (`thrust_active` ==
+    `thrust >= thrust_thresh`). A bar whose THRUST is unknown falls back to
+    breadth (which may itself be `NaN`, i.e. "no measurement" -> `None` in the
+    kernel -> strict no-op). NaN is never replaced by a number.
+
+    `cash_proxy` is excluded from BOTH denominators: the idle-cash sleeve is
+    not a breadth observation (the live Stage-1 computes breadth over the risky
+    universe only), and counting it would peg the statistic at a floor equal to
+    its share of the universe.
+    """
+    breadth = market_breadth_series(universe, breadth_lookback, cash_proxy=cash_proxy)
+    thrust = market_thrust_series(universe, thrust_lookback, cash_proxy=cash_proxy)
+    index = breadth.index.union(thrust.index)
+    breadth = breadth.reindex(index)
+    thrust = thrust.reindex(index)
+    active = thrust.notna() & (thrust >= float(thrust_thresh))
+    series = breadth.where(~active, thrust)
+    series.name = "lifecycle_market_breadth"
+    return series

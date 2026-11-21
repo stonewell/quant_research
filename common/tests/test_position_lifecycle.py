@@ -2039,3 +2039,204 @@ def test_cold_start_state_is_never_produced_by_a_persisted_legacy_state():
     hydrated = AssetLifecycleState.from_dict({"symbol": "A", "state": "HELD_ACTIVE"})
     assert hydrated.cold_start is False
     assert hydrated.entry_price_approx is False
+
+
+# --------------------------------------------------------------------------- #
+# L2.63 -- gate 5 「宏观冲力爆量突破」 is fed a real `market_breadths` series
+# --------------------------------------------------------------------------- #
+#
+# `simulate_position_lifecycle(market_breadths=...)` always existed, but NO
+# backtest caller passed a value, so `breadth_val` was `None` on every bar,
+# `is_breadth` was permanently False and the confluence leg
+# (`is_breadth and is_vol`) could only ever fire in live trading. These tests
+# drive the simulator end-to-end (no mocks of the policy kernel) with a synthetic
+# 5-symbol universe: a +150% volume surge on ONE bar, breadth >= 0.60, and a
+# 0.30 model target on that same bar.
+#
+# The volume ratio is deliberately 1.9x-2.3x -- above `volume_surge_multiplier`
+# (1.5) but below the STANDALONE `is_super_volume_surge` (2.5) leg, so a BUY can
+# only be the CONFLUENCE leg. A 3x-triggering surge would fire even with
+# `breadth=None` and would make these tests unable to see the defect.
+
+N_BARS = 60
+SURGE_BAR = 52
+_SURGE_REASON = "宏观冲力爆量突破"
+
+
+def _gate5_universe(volume_surge_at=None, surge_volume=2500.0, n=N_BARS):
+    """5 symbols, all strictly rising (breadth 1.0 from bar 49 on), Volume=1000.
+
+    `volume_surge_at` raises ONLY that symbol's volume on `SURGE_BAR`. The
+    simulator's own `ma20_volume` (`rolling(20, min_periods=1)`) then prints
+    `(19 * 1000 + 2500) / 20 = 1075` -> ratio 2.33x: over the 1.5x confluence
+    hurdle, under the 2.5x standalone-surge hurdle.
+    """
+    from common.testing import make_ohlcv_from_closes as make_df
+
+    universe = {}
+    for i in range(5):
+        sym = f"S{i}"
+        closes = np.linspace(100.0, 159.0, n) + i
+        df = make_df(closes, start="2020-01-01")
+        df["Volume"] = 1000.0
+        if sym == volume_surge_at:
+            df.iloc[SURGE_BAR, df.columns.get_loc("Volume")] = surge_volume
+        universe[sym] = df
+    return universe
+
+
+def _gate5_weights(n=N_BARS):
+    """One 0.30 model target on `SURGE_BAR`, NaN everywhere else (sparse contract)."""
+    dates = pd.bdate_range("2020-01-01", periods=n)
+    weights = pd.DataFrame(np.nan, index=dates, columns=[f"S{i}" for i in range(5)])
+    weights.loc[dates[SURGE_BAR], "S0"] = 0.30
+    return weights
+
+
+def _gate5_cfg():
+    return PositionLifecycleConfig(
+        guard_latency_bars=2,       # without the fast path the entry needs 2 bars
+        min_holding_bars=2,
+        normal_cooldown_bars=2,
+        stop_cooldown_bars=5,
+        inertia_threshold=0.05,
+        min_entry_threshold=None,
+        volume_surge_multiplier=1.5,
+        breadth_thrust_threshold=0.60,
+    )
+
+
+def _records_at(records, symbol, bar_index, start="2020-01-01"):
+    date = str(pd.bdate_range(start, periods=N_BARS)[bar_index])
+    return [r for r in records if r["symbol"] == symbol and r["date"] == date]
+
+
+def test_gate5_thrust_confluence_fires_with_breadth_and_volume_surge():
+    """Breadth >= 0.60 AND volume/ma20 >= 1.5 => BUY on the FIRST bar.
+
+    Without the confluence fast path this bar can only open the 2-bar
+    confirmation window (`HOLD_FILTERED` / PENDING_ENTRY), so a BUY here is
+    proof the fast path ran -- not that the ladder was merely slow.
+    """
+    from common.indicators import lifecycle_market_breadth
+    from common.position_lifecycle import simulate_position_lifecycle
+
+    universe = _gate5_universe(volume_surge_at="S0")
+    breadth = lifecycle_market_breadth(universe, cash_proxy=None)
+    breadth_at_surge = float(breadth.loc[pd.bdate_range("2020-01-01", periods=N_BARS)[SURGE_BAR]])
+    assert breadth_at_surge >= 0.60, "fixture precondition: breadth must clear the hurdle"
+
+    _, records = simulate_position_lifecycle(
+        universe,
+        _gate5_weights(),
+        cfg=_gate5_cfg(),
+        market_breadths=breadth,
+    )
+
+    rows = _records_at(records, "S0", SURGE_BAR)
+    assert rows, "the surge bar must have a decision record for S0"
+    decision = rows[0]
+    assert decision["action"] == "BUY", decision
+    assert _SURGE_REASON in decision["reason"], decision["reason"]
+    assert decision["target_weight"] == pytest.approx(0.30)
+    # The decision carries its own evidence -- this is what makes the gate
+    # auditable after the fact instead of "read the code".
+    detail = decision["detail_reason"]
+    assert detail["fast_path_triggered"] == "VOLUME_BREAKOUT"
+    assert detail["market_breadth"] == pytest.approx(breadth_at_surge)
+    assert detail["vol_ratio"] == pytest.approx(2500.0 / 1075.0)
+    assert 1.5 <= detail["vol_ratio"] < 2.5, "confluence leg only, not the standalone surge"
+
+
+def test_gate5_does_not_fire_without_breadth():
+    """Same surge, no breadth series -- and below-threshold breadth must both be inert.
+
+    This is the DEFECT itself: `market_breadths=None` reproduces the pre-L2.63
+    behaviour, where the leg could never fire. It is asserted, not assumed, so a
+    future change that starts fabricating breadth (a `fillna(0.0)`, a 0.50
+    placeholder) turns this red.
+    """
+    from common.indicators import lifecycle_market_breadth
+    from common.position_lifecycle import simulate_position_lifecycle
+
+    universe = _gate5_universe(volume_surge_at="S0")
+    weights = _gate5_weights()
+    cfg = _gate5_cfg()
+
+    # (1) `market_breadths=None` -- the pre-L2.63 state of every backtest.
+    _, no_breadth = simulate_position_lifecycle(universe, weights, cfg=cfg, market_breadths=None)
+    rows = _records_at(no_breadth, "S0", SURGE_BAR)
+    assert rows and rows[0]["action"] == "HOLD_FILTERED"
+    assert _SURGE_REASON not in rows[0]["reason"]
+    assert rows[0]["state_after"] == PositionState.PENDING_ENTRY.value
+
+    # (2) A breadth series below the 0.60 hurdle: a measurement exists, but the
+    #     confluence leg must still be short-circuited.
+    real = lifecycle_market_breadth(universe, cash_proxy=None)
+    sub_threshold = real.where(real < 0.60, 0.30)
+    assert float(sub_threshold.loc[real.index[SURGE_BAR]]) == pytest.approx(0.30)
+    _, sub_breadth = simulate_position_lifecycle(
+        universe, weights, cfg=cfg, market_breadths=sub_threshold
+    )
+    rows = _records_at(sub_breadth, "S0", SURGE_BAR)
+    assert rows and rows[0]["action"] == "HOLD_FILTERED"
+    assert _SURGE_REASON not in rows[0]["reason"]
+
+    # (3) A NaN breadth series (warmup-only universe) is a STRICT NO-OP: it must
+    #     produce the identical frame and identical decisions as `None`.
+    all_nan = pd.Series(np.nan, index=real.index)
+    nan_frame, nan_records = simulate_position_lifecycle(
+        universe, weights, cfg=cfg, market_breadths=all_nan
+    )
+    none_frame, none_records = simulate_position_lifecycle(
+        universe, weights, cfg=cfg, market_breadths=None
+    )
+    pd.testing.assert_frame_equal(nan_frame, none_frame, check_exact=True)
+    assert nan_records == none_records
+
+
+def test_resolver_threads_enable_market_breadth_and_keeps_it_out_of_the_kernel():
+    """L2.63: the flag threads through the resolver exactly like its neighbours.
+
+    `breadth_thrust_threshold` (the gate's THRESHOLD) already lived on
+    `PositionLifecycleConfig`; the missing half was the DATA switch. It must
+    resolve from the CLI namespace and from a strategy JSON, default to `False`,
+    and must NOT appear on `PositionPolicyConfig` -- the policy is unchanged, only
+    its input used to be missing.
+    """
+    from common.position_lifecycle import resolve_position_policy_config
+
+    assert resolve_position_lifecycle_config().enable_market_breadth is False
+    assert resolve_position_lifecycle_config(params={}).enable_market_breadth is False
+    assert (
+        resolve_position_lifecycle_config(
+            args=_Namespace(lifecycle_enable_market_breadth=True)
+        ).enable_market_breadth
+        is True
+    )
+    assert (
+        resolve_position_lifecycle_config(
+            params={"lifecycle_enable_market_breadth": True}
+        ).enable_market_breadth
+        is True
+    )
+    # Bare (strategy-JSON) spelling is accepted too, and the prefixed key wins.
+    assert (
+        resolve_position_lifecycle_config(
+            params={"enable_market_breadth": True}
+        ).enable_market_breadth
+        is True
+    )
+    assert (
+        resolve_position_lifecycle_config(
+            params={"enable_market_breadth": True, "lifecycle_enable_market_breadth": False}
+        ).enable_market_breadth
+        is False
+    )
+
+    # NOT a kernel policy field: enabling the data supply must not imply (or
+    # silently acquire) a policy change.
+    kernel_cfg = resolve_position_policy_config(
+        params={"lifecycle_enable_market_breadth": True}
+    )
+    assert not hasattr(kernel_cfg, "enable_market_breadth")

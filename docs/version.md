@@ -7424,3 +7424,211 @@ opt-in Ledoit-Wolf 稳健协方差开关的版本演进与验证记录。
 - **未变的行为面**：`sector_incumbent_hurdle` 的挑战者罚则、行业上限准入、Pass 1/Pass 2 分配、
   §52 的三个 opt-in 键、§53 的 `is_full_exit` 全部原样；
   唯一变化是「不合格的在位者不再出现在保留名单里」。
+
+## 55. 回测数据路径补供给 `market_breadths`：闸门 5「宏观冲力爆量突破」不再是死代码（kernel/backtester 层，无版本轴变动，2026-11-20）
+
+> **对应任务**：`docs/development_plan.md` 的 **`L2.63`**。
+> **本节编号**：接上一节顺延为 **55**，§1–§54 一字未改。
+
+### 55.1 死路径事实（实测，非推断）
+
+- `common/position_policy.py` 闸门 5 的合流腿是
+  `is_thrust_confluence = is_breadth and is_vol`，其中
+  `is_breadth = ctx.market_breadth is not None and ctx.market_breadth >= cfg.breadth_thrust_threshold`
+  （默认 `0.60`）。
+- `common/position_lifecycle.py::simulate_position_lifecycle` 早在签名里就有
+  `market_breadths: Optional[pd.Series] = None`，循环内按 bar 读取并写入
+  `step_position_lifecycle(market_breadth=breadth_val)`。
+- **但三个回测调用点从未传过该参数**：`backtester/run_backtest.py`（walkforward 折内预热、
+  standard 主路径）与 `common/allocation_backtester.py` 的惰性重模拟点，
+  全部只传 `universe / target_weights / cfg / market / cash_proxy`。
+  ⇒ `breadth_val` 恒为 `None` ⇒ `is_breadth` 恒 `False` ⇒ 合流腿在**任何回测里都不可达**。
+- 连带后果：`--lifecycle-breadth-thrust-threshold` 是一个**死开关** —— 阈值被送达，
+  但没有数据可比较。实盘侧（`scripts/run_live_strategy.py`）逐 bar 传
+  `thrust_val if thrust_active else breadth_val`，属**回测/实盘非同源缺口**。
+
+### 55.2 新增的共享 breadth/thrust 推导（唯一实现）
+
+落在 `common/indicators.py`（该模块已拥有 `sma` / `roc`），三个回测调用点共用同一实现：
+
+```python
+market_breadth_series(universe, lookback=50, cash_proxy=None)          # 高于自身 SMA 的占比
+market_thrust_series(universe, lookback=10, cash_proxy=None)           # N 日收益为正的占比
+lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
+                         thrust_thresh=0.60, cash_proxy=None)          # 闸门 5 真正消费的值
+```
+
+- **口径即实盘 Stage-1 口径**（`check_live_portfolio_health.evaluate_market_breadth_and_thrust`）：
+  `breadth` = 收盘高于 `SMA(breadth_lookback)` 的占比、`thrust` = `close/close.shift(thrust_lookback)-1 > 0`
+  的占比；`lifecycle_market_breadth` 逐 bar 取 **`thrust if thrust >= thrust_thresh else breadth`**，
+  与 `run_live_strategy.py` 的 kernel 实参完全一致。唯一差别是「滚动逐 bar 化」，这正是回测需要的形态。
+- **对齐规则（明确选定并写进 docstring）**：返回的 Series 索引是**各标的自身 bar 时间戳的并集**
+  （union），既不是交集，也不是「价格 ffill 后的并集」。
+  - 取并集是因为调用方的 bar 循环按 `market_breadths.loc[t]` 逐标的逐 bar 取值；
+    取交集会把晚上市或不同交易日历的标的整段丢掉，那些 bar 会静默退化为 `None`。
+  - 不做价格 ffill 是因为**被 ffill 的收盘价是伪造观测**，会作为真实样本进入 SMA/ROC 窗口。
+    每个标的的指标先在自己的原生索引上算完，**再** reindex 到并集，
+    因此某标的只在「它确实有 bar、且历史足够」的那一根上进入分子/分母。
+- **NaN 不是 0（关键契约）**：没有任何标的具备可用观测的 bar（warmup / 日历空洞）保持 `NaN`；
+  消费方（`simulate_position_lifecycle` → `step_position_lifecycle`）把 `NaN` 解码成 `None`，
+  对闸门 5 是**严格 no-op**。**禁止 `fillna`**：填 0.0 会复现本任务要修的同一个死闸门
+  （`0.0 >= 0.60` 恒 False，且从此无从察觉），填 0.5 则是凭空造一个测量值。
+- 分母只计「该 bar 上有值」的标的，因此 warmup bar 不会被尚未积累满 `lookback` 的标的稀释；
+  `cash_proxy` 同时从 breadth / thrust 的分子分母中排除（现金腿不是广度观测）。
+
+### 55.3 开关与三处接线（默认 `False`，默认路径逐字节不变）
+
+- **新 CLI 开关**：`--lifecycle-enable-market-breadth`（`backtester/run_backtest.py`，
+  `action="store_true"`, **`default=False`**），按 `--lifecycle-breadth-thrust-threshold` 的既有路径
+  经 `resolve_position_lifecycle_config` 解析为
+  `PositionLifecycleConfig.enable_market_breadth`（默认 `False`）。
+  **不**进入 `PositionPolicyConfig`：策略未变，缺的只是输入；解析结果刻意不映射到 kernel 配置
+  （单测钉死 `resolve_position_policy_config(...)` 上没有该属性）。
+- **共享构建入口**：`common/position_lifecycle.py::build_lifecycle_market_breadths(
+  universe, cfg, *, cash_proxy=None)` —— 用已解析的 `cfg.breadth_thrust_threshold` 作为
+  thrust 选取阈值（与闸门比较的**同一个数**，否则「thrust 是否生效」无法从决策记录反查），
+  并在 universe 无 `Volume` 列时**一次性**告警。
+- **三处接线**：
+  1. `run_backtest.py` walkforward 折内预热：`market_breadths=` 仅在
+     `pl_cfg.enable_market_breadth` 为真时构建，取自同一个 `buffered_universe`；
+  2. `run_backtest.py` standard 主路径：同上，取 `universe`；
+  3. `common/allocation_backtester.py::run_allocation_backtest`：新增关键字参数
+     `enable_market_breadth: bool = False`，在两个 `run_backtest.py` 调用点透传，
+     供「记录被窗口过滤成空 → 引擎自行重模拟」的分支也拿到同样的供给。
+- **默认路径**：开关关闭时 `market_breadths=None` 被显式传入（等同不传），
+  因此既有回测结果、`walkforward_*` 产物与决策日志**逐字节不变**。
+- **`Volume` 列裁决**：`simulate_position_lifecycle` 已有的回退逻辑是
+  「帧里有 `Volume` 就读它并 `rolling(20, min_periods=1).mean()`」，
+  因此**只要帧带 `Volume` 就无需另传 `current_volumes` / `ma20_volumes`**，本任务未补传。
+  反之，**帧无 `Volume` 时 `is_vol` 与 `is_super_volume_surge` 恒 False，闸门 5 仍不可能触发**；
+  这一情形由 `warn_if_lifecycle_volume_missing` 每个 context **只告警一次**
+  （walkforward 逐折调用不至于把告警刷成噪声），明确点名「no universe frame carries a `Volume` column」。
+
+### 55.4 顺带补齐的审计缺口：`EXIT_CONFIRMING` 分支补 `raw_target_weight`
+
+- 2026-11-20 取证：`walkforward_lifecycle_records.csv` 合计 **385,560** 行，
+  其中 **30,539** 行的 `detail_reason` 为 NaN；这些正是「模型目标为 0、仍在确认期持有」的行，
+  却无法单凭产物判断「模型要求清仓」还是「只是漂移」。
+- 变更：`common/position_policy.py` 闸门 6 的 `EXIT_CONFIRMING` 分支 `detail` 增加
+  `raw_target_weight`（模型经策略前的原始目标）。
+- **纯追加**：不改任何决策、状态、计数器；`target_weight` 仍是既有的持有权重。
+  其余分支的 `detail` 键集**未变**（单测逐键钉死 gate 4 与 `TENURE_LOCKED`；
+  gate 2b 的另一个 `EXIT_CONFIRMING` 生产者是**另一条规则**且默认关闭，刻意不动）。
+
+### 55.5 Rule 9 验证状态：本次不做 A/B，交付为**定向**测量（AGENTS Rule 10）
+
+- 本提交**只做实现、单测与端到端合成证明**，**未**跑任何全局 walkforward A/B；
+  本节**不给出任何 ΔSharpe / ΔCAGR 结论**。
+- 依据 AGENTS.md 第 10 条：全局 14 折会被无关标的的成交淹没，无法裁决
+  「闸门 5 的合流腿是否该开」这一单一机制；定向单腿测量由后续独立任务产出，
+  届时补记于此（**不以「测不准」替代「没测量」**）。
+- 因此开关保持 **opt-in 默认 `False`**：在正/非降级证据出现之前，既有结果不受影响。
+
+### 55.6 版本轴（AGENTS.md 第 7 条）：零变动
+
+- `common/position_policy.py` 第 41 行明令本文件不设版本常量、不得 bump；
+  `common/position_lifecycle.py` 无 `version` / `BASE_VERSION` 字段；
+  `backtester/run_backtest.py` 与 `common/allocation_backtester.py::run_allocation_backtest`
+  均非 `AllocationTemplate` / 策略类。
+- 因此：**不**升 `BASE_VERSION` / `version`、**不**重跑 `--dump-strategies`、
+  **不**改 `test_blend_strategy_versioning.py` / `test_strategy_versioning.py`
+  （与 `L2.48` 启用整条生命周期状态机时同样的处置）。
+- `PositionLifecycleConfig` 新增的 `enable_market_breadth` 是**数据开关**（且只出现在
+  `run_manifest.json` 的 `position_lifecycle_config` 快照里），不是策略行为的版本化字段。
+
+### 55.7 验证（100% 合成数据、无网络、`--import-mode=importlib`）
+
+- `common/tests/test_position_lifecycle.py` + `common/tests/test_position_policy.py`：
+  **361 passed**。
+- `backtester/tests`：**128 passed**。
+- `pipeline/tests`：**1723 passed, 1 skipped**（约 9 分 12 秒，含既有 policy parity 套件）。
+- 新增单测（`common/tests/test_market_breadth.py` 新建；其余追加到既有文件）：
+  breadth/thrust 手工对账、并集对齐与「不 ffill 价格」、NaN-not-zero、
+  thrust 生效/回退、现金代理排除、`Volume` 缺失一次性告警、`simulate_position_lifecycle`
+  端到端合流买入（`volume/ma20 ≈ 2.33x`、`breadth = 1.0` ⇒ `宏观冲力爆量突破`）、
+  无 breadth / 低于阈值 / 全 NaN 三种 no-op、开关默认关闭的逐字节一致、
+  walkforward 第二接线点，以及 `EXIT_CONFIRMING` 的 `raw_target_weight`。
+- 端到端证据（合成 fixture，`run_standard`）：开关关闭 ⇒ 合流买入 **0 条**；
+  开关打开 ⇒ 出现 `S0` 在 `2020-03-25` 的 `宏观冲力爆量突破` BUY，
+  `vol_ratio = 2.3256`（1.5x 之上、2.5x 之下 ⇒ 必为合流腿而非单独爆量腿）、
+  `market_breadth = 1.0`；同一 fixture 两臂的 `equity_curve` **不同**，即开关确实改变了成交。
+
+### 55.8 Rule 10 定向队列测量：闸门 5 供给后的队列与组合影响（2026-11-20）
+
+> 本节是 §55.5 承诺的「定向单腿测量」的落地记录。**口径声明（AGENTS Rule 10）**：
+> 这是**定向队列口径**，不是全局 14 折 A/B —— 全局折会被无关标的的成交淹没，
+> 无法裁决「闸门 5 的合流腿是否该开」这一单一机制。因此本节只报告
+> 「被闸门 5 放行的这些买入」自身的成交与它们对组合的边际影响。
+
+**判别力（Rule 10 第一条：先证明实验能看见缺陷）**
+
+- `common/position_policy.py` 闸门 5 的 `position_policy` 两个分支**输出同一标签**
+  「宏观冲力爆量突破」，且都硬编码 `fast_path_triggered="VOLUME_BREAKOUT"`。
+  因此**按标签字符串计数必然产生假阳性**：开关打开后的 46 行里，有 7 行是
+  `vol ≥ 2.5x` 的独立爆量腿、根本不看 breadth。
+- **唯一可判别字段是 `market_breadth != null`**（合流腿必然读到真值；
+  未接线的臂恒为 `NaN` → `None`）。实测计数如下（合成 universe，同一 fixture 双臂）：
+
+| 臂 | standard 标签行 / breadth 非空 | walkforward 标签行 / breadth 非空 |
+| --- | --- | --- |
+| A（`--lifecycle-enable-market-breadth` 关） | 8 / **0** | 6 / **0** |
+| B（开关开） | 46 / **46** | 39 / **39** |
+
+- B 臂 standard 的 46 行中 **39 行仅由广度触发、7 行走 `vol ≥ 2.5` 独立腿**；
+  walkforward 的 39 行中 **34 行仅广度触发**。下文「队列」即指这批仅广度触发的买入。
+- **无接线泄漏**：A 臂 standard 18,700 行 / walkforward 17,640 行的决策记录中，
+  `market_breadth` 非空者**恒为 0** ⇒ 开关关闭时默认路径没有被新数据污染
+  （与 §55.3「默认路径逐字节不变」一致）。这是本实验的判别力证据本身：
+  两臂在同一字段上出现 0 vs 46 / 0 vs 39 的分叉，而不是靠聚合指标猜。
+
+**队列成交：`chan_four_state_blend`**
+
+- **standard**：n = **39**，均值 **+8.12%**，中位 **+2.76%**，胜率 **64.1%**（25 胜 / 14 负），
+  平均持有 **17.6 根 bar**（约 **25.6 日历日**），毛利 **+58,297.65**、
+  交易成本 **−1,777.57**、**净 +56,520.10**。
+- **去极值**：剔除最大两笔后 n = 37、均值 **+6.29%**、中位 **+2.09%** —— 符号与量级保持，
+  结论不依赖两笔「超级赢家」。
+- **walkforward**：n = **29**，均值 **+10.90%**，中位 **+3.66%**，胜率 **79.3%**，
+  净 **+39,697.96**。
+
+**组合层归因（刻意克制，不做会计式放大）**
+
+- 组合权益：A **265,514.29** → B **270,181.81** = **+4,667.52（+1.76%）**；
+  Sharpe **2.01 → 2.02**、CAGR **28.80% → 29.38%**、MDD **9.7% → 10.1%**、换手持平。
+  即：**收益小幅改善、回撤小幅变差**，不是「免费午餐」。
+- 按日缺口拆解：**队列持仓日贡献 +2,667.67（57%）**，其余位移 **+1,999.85（43%）**。
+  后者来自同一批标的更早进场后沿时间轴的整体位移，不是新增标的。
+- **表述禁令**：队列净 **+56.5k** 是队列内成交的盈亏合计，**不是**组合权益的会计拆分，
+  其与 +4,667.52 之比没有经济含义 —— **不得**写成「权益差的 1,211%」或任何同构说法。
+- **机制归因**：39 笔中 **10 笔**在 A 臂同日持有同权重（进场提前、仓位相同）；
+  **29 笔**在 A 臂当日为空仓，但其中 **28 笔在 20 根 bar 内自行买回**；
+  仅 **`600584.SH 2024-03-04`** 是 A 臂从未持有过的仓位。
+  ⇒ 机制主要是**更早 1–2 根 bar 进场**（同标的、同方向、更优价位），
+  而**不是**新增暴露。这条正是不能把 +56.5k 当「新 alpha」的原因。
+
+**反例：`chan_risk_managed_blend` 不通过**
+
+- 队列侧看起来好：n = **37**、均值 **+4.57%**、净 **+34,891**。
+- 但**组合层面变差**：权益 **−669.17**、Sharpe **1.84 → 1.81**、MDD **8.8% → 9.4%**；
+  按日拆解为「队列日 **+3,325** / 其余位移 **−3,995**」——
+  即队列赚的钱被同一批仓位的位移亏损吃掉并反超。
+- 结论：**不推荐启用**。这条反例同时说明本测量不是「开开关就有正收益」的确认偏误工具，
+  Rule 9 的正向门槛在这里被真实地证伪了一次。
+
+**结论与开关处置**
+
+- 在该口径下：`chan_four_state_blend` **PASS**（队列显著为正、去极值后符号保持、
+  组合层 +1.76% 且 Sharpe 微升、机制可解释为更早进场）；
+  `chan_risk_managed_blend` **不通过**（组合层负贡献）。
+- 因此 `--lifecycle-enable-market-breadth` **保持 opt-in、默认 `False`**：
+  不提升为默认、也不在 `strategies_config.json` 里钉为 `true`。
+  单策略 PASS 不足以覆盖另一策略的退化，且本判定只是**定向队列口径**，
+  不是全局 14 折 A/B（AGENTS Rule 10）。
+- 版本轴仍为零变动（§55.6 不变）：本次测量未修改任何策略/模板类或其参数。
+
+**附带未处理项（只记录，不修）**
+
+- `position_policy` 闸门 5 的两个分支共用**同一标签字符串**且都硬编码
+  `fast_path_triggered="VOLUME_BREAKOUT"`，属**独立的可观测性缺陷**：
+  仅凭决策日志无法区分「广度+爆量合流」与「单独爆量」。
+  本文**不改**该项（它需要单独的信号语义决策与版本轴处置），留待独立任务。

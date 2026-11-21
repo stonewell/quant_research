@@ -2356,3 +2356,102 @@ def test_last_exit_price_is_written_by_every_exit_path():
     )
     assert gated.blocking_reason is BlockingReason.REENTRY_GATED
     assert gated.detail["last_exit_price"] == pytest.approx(10.3)
+
+
+# --------------------------------------------------------------------------- #
+# L2.63 audit gap -- `EXIT_CONFIRMING` detail carries the model's raw target
+# --------------------------------------------------------------------------- #
+#
+# Forensics on the 2026-11-20 lifecycle ledger (`walkforward_lifecycle_records.csv`,
+# 385,560 rows) found 30,539 rows whose `detail_reason` was NaN. Those are exactly
+# the rows a human wants when asking "did the MODEL ask for a full exit and the
+# confirmation window is still running, or is the book merely drifting?" -- and the
+# answer was only obtainable by reading the code. The fix is ADDITIVE: the gate-6
+# `EXIT_CONFIRMING` payload now records `raw_target_weight`; no decision, state or
+# counter changes, and no other branch's payload is touched.
+
+
+def _held_above_stop():
+    """HELD_ACTIVE, entry 10.0, +3% -> gate 2 (hard stop) is deliberately silent."""
+    return AssetState(
+        symbol="AAA",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=3,
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.30,
+    )
+
+
+def test_exit_confirming_detail_carries_raw_target_weight():
+    """A zero target under confirmation records the model's target verbatim."""
+    cfg = PositionPolicyConfig(guard_latency_bars=2)
+    policy = AssetPolicy()
+
+    first = policy.step(_held_above_stop(), 0.0, PolicyContext(price=10.3), cfg)
+
+    # DECISION UNCHANGED (byte-for-byte the pre-L2.63 verdict):
+    assert first.action == PolicyAction.HOLD_FILTERED
+    assert first.blocking_reason is BlockingReason.EXIT_CONFIRMING
+    assert first.next_state is PositionState.PENDING_EXIT
+    assert first.target_weight == pytest.approx(0.30)          # still held
+    assert first.reason.startswith("平仓信号进入确认期")
+    # ... PLUS the auditable fact:
+    assert first.detail["raw_target_weight"] == 0.0
+    assert first.detail["exit_streak"] == 1
+    assert first.detail["guard_latency_bars"] == 2
+
+    # The second bar confirms the exit; that payload is untouched (its evidence is
+    # the streak count, and a `raw_target_weight` there would be redundant noise).
+    second = policy.step(_carry(first), 0.0, PolicyContext(price=10.3), cfg)
+    assert second.action == PolicyAction.SELL
+    assert second.blocking_reason is BlockingReason.NONE
+    assert set(second.detail) == {
+        "exit_streak", "guard_latency_bars", "last_exit_type",
+        # `_decision` always appends the state snapshots; not part of this change.
+        "state_before", "state_after",
+    }
+
+
+def test_only_the_exit_confirming_branch_payload_gained_raw_target_weight():
+    """Every OTHER branch's `detail` keys are unchanged by the L2.63 addition.
+
+    Pinned explicitly (not merely "the tests still pass") because the payload is
+    the forensic ledger: a key appearing or disappearing in a branch is an
+    auditability change, and it must be a DELIBERATE one.
+    """
+    cfg = PositionPolicyConfig(guard_latency_bars=2, min_holding_bars=2)
+
+    # gate 4 (minimum entry weight): unchanged payload.
+    gate4 = AssetPolicy().step(
+        AssetState(symbol="AAA"),
+        0.01,
+        PolicyContext(price=10.0),
+        cfg,
+    )
+    assert gate4.blocking_reason is BlockingReason.MIN_ENTRY_THRESHOLD
+    assert set(gate4.detail) == {
+        "delta_w", "inertia_threshold", "raw_target_weight", "current_weight",
+        "state_before", "state_after",
+    }
+    assert "raw_target_weight" in gate4.detail  # pre-existing key, not added here
+
+    # gate 6's TENURE_LOCKED sibling (zero target while inside the tenure lock).
+    locked = AssetPolicy().step(
+        AssetState(
+            symbol="AAA",
+            state=PositionState.HELD_GESTATION,
+            held_bars=0,
+            entry_price=10.0,
+            peak_price=10.5,
+            current_weight=0.30,
+        ),
+        0.0,
+        PolicyContext(price=10.3),
+        cfg,
+    )
+    assert locked.blocking_reason is BlockingReason.TENURE_LOCKED
+    assert set(locked.detail) == {
+        "held_bars", "min_holding_bars", "blocked_action", "state_before", "state_after",
+    }
+    assert "raw_target_weight" not in locked.detail
