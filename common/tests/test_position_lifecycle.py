@@ -31,6 +31,12 @@ from common.position_lifecycle import (
     resolve_position_lifecycle_config,
     step_position_lifecycle,
 )
+from common.position_policy import (
+    # Single source of truth for the gate-5 confluence label (split from the
+    # super-volume label on 2026-11-20): a re-merge turns `_SURGE_REASON` users red.
+    GATE5_BREADTH_CONFLUENCE_FAST_PATH,
+    GATE5_BREADTH_CONFLUENCE_REASON,
+)
 
 
 def test_normal_lifecycle_transitions():
@@ -116,7 +122,7 @@ def test_volume_breakout_fast_path_entry():
     )
     assert d1.action == "BUY"
     assert d1.target_weight == 0.15
-    assert d1.fast_path_triggered == "VOLUME_BREAKOUT"
+    assert d1.fast_path_triggered == "BREADTH_CONFLUENCE"
     assert state1.state == PositionState.HELD_GESTATION
     assert state1.entry_price == 120.0
 
@@ -132,7 +138,7 @@ def test_volume_breakout_fast_path_entry():
         market_breadth=0.30,
     )
     assert d2.action == "BUY"
-    assert d2.fast_path_triggered == "VOLUME_BREAKOUT"
+    assert d2.fast_path_triggered == "SUPER_VOLUME"
     assert state2.state == PositionState.HELD_GESTATION
 
     # Case C: Volume surge alone (2.0x >= 1.5x) without macro thrust (breadth 0.40 < 0.60) does NOT bypass
@@ -579,7 +585,8 @@ def test_entry_resets_exit_streak():
         market_breadth=0.50,
     )
     assert d_fast.action == "BUY"
-    assert d_fast.fast_path_triggered == "VOLUME_BREAKOUT"
+    # 3.0x >= the 2.5x standalone hurdle and breadth 0.50 < 0.60: SUPER_VOLUME leg.
+    assert d_fast.fast_path_triggered == "SUPER_VOLUME"
     assert state_fast.state == PositionState.HELD_GESTATION
     assert state_fast.exit_streak == 0, "exit_streak must be reset to 0 on fast-path entry"
 
@@ -2060,7 +2067,7 @@ def test_cold_start_state_is_never_produced_by_a_persisted_legacy_state():
 
 N_BARS = 60
 SURGE_BAR = 52
-_SURGE_REASON = "宏观冲力爆量突破"
+_SURGE_REASON = GATE5_BREADTH_CONFLUENCE_REASON
 
 
 def _gate5_universe(volume_surge_at=None, surge_volume=2500.0, n=N_BARS):
@@ -2142,7 +2149,7 @@ def test_gate5_thrust_confluence_fires_with_breadth_and_volume_surge():
     # The decision carries its own evidence -- this is what makes the gate
     # auditable after the fact instead of "read the code".
     detail = decision["detail_reason"]
-    assert detail["fast_path_triggered"] == "VOLUME_BREAKOUT"
+    assert detail["fast_path_triggered"] == GATE5_BREADTH_CONFLUENCE_FAST_PATH
     assert detail["market_breadth"] == pytest.approx(breadth_at_surge)
     assert detail["vol_ratio"] == pytest.approx(2500.0 / 1075.0)
     assert 1.5 <= detail["vol_ratio"] < 2.5, "confluence leg only, not the standalone surge"

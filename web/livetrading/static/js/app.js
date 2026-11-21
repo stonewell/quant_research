@@ -3492,7 +3492,17 @@
                     bannerHtml += `<div><span style="color: #94a3b8; font-size: 12px; margin-right: 6px;">生命周期状态:</span><span class="badge ${badgeClass} font-mono">${stateNameCn}</span></div>`;
                 }
                 if (fastPath) {
-                    const fpText = fastPath === "VOLUME_BREAKOUT" ? "放量突破闪电入场 (0-delay)" : (fastPath === "STOP_LOSS" ? "硬止损/跟踪止损紧急避险 (0-delay)" : fastPath);
+                    // Gate-5 fast-path labels were split into two on 2026-11-20
+                    // (`common/position_policy.py` owns the constants): the
+                    // confluence leg vs the standalone super-volume leg. The
+                    // legacy shared literal is kept for archived tickets only.
+                    const fpText = (
+                        fastPath === "BREADTH_CONFLUENCE" ? "广度+放量合流闪电入场 (0-delay)"
+                        : fastPath === "SUPER_VOLUME" ? "超量突破闪电入场 (0-delay)"
+                        : fastPath === "VOLUME_BREAKOUT" ? "放量突破闪电入场 (0-delay，旧标签)"
+                        : fastPath === "STOP_LOSS" ? "硬止损/跟踪止损紧急避险 (0-delay)"
+                        : fastPath
+                    );
                     bannerHtml += `<div><span style="color: #94a3b8; font-size: 12px; margin-right: 6px;">风控穿透快通道:</span><span class="badge badge-nogo font-mono" style="background: rgba(239, 68, 68, 0.2); border: 1px solid #ef4444; color: #fca5a5;">⚡ ${fpText}</span></div>`;
                 }
                 bannerHtml += '</div>';

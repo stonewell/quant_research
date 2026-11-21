@@ -162,6 +162,11 @@ __all__ = [
     "BLOCKING_REASON_LABELS",
     "coerce_blocking_reason",
     "blocking_reason_label",
+    "GATE5_BREADTH_CONFLUENCE_FAST_PATH",
+    "GATE5_SUPER_VOLUME_FAST_PATH",
+    "GATE5_LEGACY_VOLUME_BREAKOUT_FAST_PATH",
+    "GATE5_BREADTH_CONFLUENCE_REASON",
+    "GATE5_SUPER_VOLUME_REASON",
     "is_liquidation_event",
     "PolicyAction",
     "AssetState",
@@ -272,6 +277,27 @@ BLOCKING_REASON_LABELS: Dict[str, str] = {
     BlockingReason.REENTRY_GATED.value: "再入场价格未确认",
     BlockingReason.NONE.value: "无阻断",
 }
+
+
+# --- gate 5 fast-path labels ------------------------------------------------
+# The entry fast path (gate 5) has TWO independent legs that used to share one
+# reason string and one `fast_path_triggered` literal, which made the decision
+# log unable to tell them apart (`docs/version.md` §55.8 recorded the gap as an
+# independent observability defect). Split 2026-11-20, LABEL-ONLY:
+#   * confluence -- `market_breadth >= breadth_thrust_threshold` AND
+#     `volume/ma20 >= volume_surge_multiplier`: the gate-5 leg proper;
+#   * super volume -- `volume/ma20 >= 2.5`, breadth possibly absent.
+# Thresholds, `is_vol` / `is_breadth`, and sizing are untouched.
+# `VOLUME_BREAKOUT` stays as the LEGACY value (archived tickets and
+# `backtests_research/**/walkforward_lifecycle_records.csv` still carry it); it
+# is emitted by no code path any more, and a reader that must accept "any
+# gate-5 buy" has to accept all three literals.
+GATE5_BREADTH_CONFLUENCE_FAST_PATH = "BREADTH_CONFLUENCE"
+GATE5_SUPER_VOLUME_FAST_PATH = "SUPER_VOLUME"
+#: The pre-split shared literal. Archived artefacts only -- never re-emit.
+GATE5_LEGACY_VOLUME_BREAKOUT_FAST_PATH = "VOLUME_BREAKOUT"
+GATE5_BREADTH_CONFLUENCE_REASON = "宏观冲力爆量突破"
+GATE5_SUPER_VOLUME_REASON = "超量突破（放量，无广度确认）"
 
 
 def coerce_blocking_reason(value: Any) -> BlockingReason:
@@ -1241,11 +1267,28 @@ class AssetPolicy:
                         if (ctx.volume and ctx.ma20_volume and ctx.ma20_volume > 0)
                         else None
                     )
-                    fast_reason = (
-                        f"宏观冲力爆量突破 (冲力生效且成交量放大 {vol_ratio:.1f}x)，豁免确认期即刻买入"
-                        if vol_ratio is not None
-                        else "放量突破冲力闪电建仓"
-                    )
+                    # Label split (2026-11-20, LABEL-ONLY): the two legs no
+                    # longer share a reason string or a `fast_path_triggered`
+                    # value, so a log/count can tell "breadth confirmed" apart
+                    # from "volume only". When BOTH legs hold, breadth IS
+                    # confirmed, so the row is labelled as the gate-5 leg
+                    # proper (confluence) -- not as the standalone surge.
+                    if is_thrust_confluence:
+                        fast_label = GATE5_BREADTH_CONFLUENCE_FAST_PATH
+                    else:
+                        fast_label = GATE5_SUPER_VOLUME_FAST_PATH
+                    if vol_ratio is None:
+                        fast_reason = "放量突破冲力闪电建仓"
+                    elif is_thrust_confluence:
+                        fast_reason = (
+                            f"{GATE5_BREADTH_CONFLUENCE_REASON} "
+                            f"(冲力生效且成交量放大 {vol_ratio:.1f}x)，豁免确认期即刻买入"
+                        )
+                    else:
+                        fast_reason = (
+                            f"{GATE5_SUPER_VOLUME_REASON} "
+                            f"(成交量放大 {vol_ratio:.1f}x ≥ 2.5x 均量)，豁免确认期即刻买入"
+                        )
                     return _decision(
                         PolicyAction.BUY,
                         raw_target_weight,
@@ -1257,7 +1300,7 @@ class AssetPolicy:
                             "volume_surge_multiplier": cfg.volume_surge_multiplier,
                             "market_breadth": ctx.market_breadth,
                             "breadth_thrust_threshold": cfg.breadth_thrust_threshold,
-                            "fast_path_triggered": "VOLUME_BREAKOUT",
+                            "fast_path_triggered": fast_label,
                         },
                     )
 

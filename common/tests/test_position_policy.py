@@ -71,6 +71,11 @@ for _root in (_PROJECT_ROOT,):
 from common.allocation_templates import apply_asset_inertia
 from common.position_policy import (
     BLOCKING_REASON_LABELS,
+    GATE5_BREADTH_CONFLUENCE_FAST_PATH,
+    GATE5_BREADTH_CONFLUENCE_REASON,
+    GATE5_LEGACY_VOLUME_BREAKOUT_FAST_PATH,
+    GATE5_SUPER_VOLUME_FAST_PATH,
+    GATE5_SUPER_VOLUME_REASON,
     AssetPolicy,
     AssetState,
     BlockingReason,
@@ -2518,3 +2523,80 @@ def test_tenure_locked_detail_exposes_raw_target_weight():
     assert trim.blocking_reason is BlockingReason.TENURE_LOCKED
     assert trim.detail["blocked_action"] == "partial_trim"
     assert trim.detail["raw_target_weight"] == pytest.approx(0.20)
+
+
+# --------------------------------------------------------------------------- #
+# Gate 5 -- the two entry fast-path legs carry DISTINCT labels (2026-11-20)
+# --------------------------------------------------------------------------- #
+# Splitting the labels is a pure observability change: the thresholds, the
+# `is_vol` / `is_breadth` computation and the sizing are deliberately NOT
+# touched. These tests pin the wire values so a future re-merge (the defect
+# recorded in docs/version.md §55.8) turns red.
+
+def _gate5_step(*, volume, ma20_volume, market_breadth, target=0.30):
+    """One FLAT-state entry bar that can only be resolved by gate 5."""
+    cfg = PositionPolicyConfig(
+        guard_latency_bars=2,
+        volume_surge_multiplier=1.5,
+        breadth_thrust_threshold=0.60,
+    )
+    return AssetPolicy().step(
+        AssetState(symbol="AAA"),
+        target,
+        PolicyContext(
+            price=10.0,
+            volume=volume,
+            ma20_volume=ma20_volume,
+            market_breadth=market_breadth,
+        ),
+        cfg,
+    )
+
+
+def test_gate5_breadth_confluence_label_and_fast_path():
+    """breadth >= 0.60 AND volume/ma20 >= 1.5x (but < 2.5x) => confluence leg only."""
+    decision = _gate5_step(volume=2_000_000.0, ma20_volume=1_000_000.0, market_breadth=0.65)
+
+    assert decision.action == PolicyAction.BUY
+    assert decision.target_weight == pytest.approx(0.30)
+    assert decision.next_state is PositionState.HELD_GESTATION
+    # The human reason keeps the accurate name for THIS leg ...
+    assert decision.reason.startswith(GATE5_BREADTH_CONFLUENCE_REASON)
+    # ... and the machine label says which leg it was.
+    assert decision.detail["fast_path_triggered"] == "BREADTH_CONFLUENCE"
+    assert decision.detail["fast_path_triggered"] == GATE5_BREADTH_CONFLUENCE_FAST_PATH
+    assert decision.detail["market_breadth"] == pytest.approx(0.65)
+    assert decision.detail["vol_ratio"] == pytest.approx(2.0)
+    # 2.0x is below the standalone 2.5x hurdle: this row is the gate-5 leg proper.
+    assert decision.detail["vol_ratio"] < 2.5
+
+
+def test_gate5_super_volume_label_and_fast_path():
+    """volume/ma20 >= 2.5x with NO breadth => the standalone surge leg."""
+    decision = _gate5_step(volume=3_000_000.0, ma20_volume=1_000_000.0, market_breadth=None)
+
+    assert decision.action == PolicyAction.BUY
+    assert decision.target_weight == pytest.approx(0.30)
+    assert decision.next_state is PositionState.HELD_GESTATION
+    assert decision.reason.startswith(GATE5_SUPER_VOLUME_REASON)
+    assert decision.detail["fast_path_triggered"] == "SUPER_VOLUME"
+    assert decision.detail["fast_path_triggered"] == GATE5_SUPER_VOLUME_FAST_PATH
+    # Breadth was genuinely absent -- this leg does not consult it.
+    assert decision.detail["market_breadth"] is None
+    assert decision.detail["vol_ratio"] == pytest.approx(3.0)
+
+
+def test_gate5_labels_are_distinct():
+    """Guards against a future re-merge of the two gate-5 legs' labels."""
+    assert GATE5_BREADTH_CONFLUENCE_REASON != GATE5_SUPER_VOLUME_REASON
+    assert GATE5_BREADTH_CONFLUENCE_FAST_PATH != GATE5_SUPER_VOLUME_FAST_PATH
+    # The legacy shared literal is neither of the two new values, so an old
+    # artifact can be told apart from a new one instead of silently matching.
+    assert GATE5_LEGACY_VOLUME_BREAKOUT_FAST_PATH not in (
+        GATE5_BREADTH_CONFLUENCE_FAST_PATH,
+        GATE5_SUPER_VOLUME_FAST_PATH,
+    )
+    # Pinned wire values (the split is what makes the log countable).
+    assert GATE5_BREADTH_CONFLUENCE_FAST_PATH == "BREADTH_CONFLUENCE"
+    assert GATE5_SUPER_VOLUME_FAST_PATH == "SUPER_VOLUME"
+    assert GATE5_LEGACY_VOLUME_BREAKOUT_FAST_PATH == "VOLUME_BREAKOUT"
