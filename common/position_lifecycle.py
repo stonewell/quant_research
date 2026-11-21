@@ -218,9 +218,15 @@ class PositionLifecycleConfig:
     # (the resolver computes `common.indicators.lifecycle_market_breadth` from
     # the same universe the simulator already receives). It is deliberately NOT
     # a `PositionPolicyConfig` field and NOT mapped into the kernel: the policy
-    # is unchanged, only its input used to be missing. Default `False` keeps
-    # every existing backtest output bit-identical (`market_breadths=None`).
-    enable_market_breadth: bool = False
+    # is unchanged, only its input used to be missing.
+    #
+    # Default `True` (AGENTS Rule 11, backtest/live parity): the live runner
+    # supplies the input on every bar, so a backtest that omits it cannot
+    # exercise the same decision path. `--no-lifecycle-enable-market-breadth`
+    # (or `lifecycle_enable_market_breadth=False` in a strategy JSON) opts back
+    # into the pre-alignment behaviour, where `market_breadths=None` keeps every
+    # historical number bit-identical.
+    enable_market_breadth: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         from dataclasses import asdict
@@ -887,9 +893,14 @@ def resolve_position_lifecycle_config(
         price_reentry_gate: False       (M1.1 gate 3b, kernel-only)
         price_reentry_pct: 0.02
         reentry_vwap_lookback: 20
-        enable_market_breadth: False    (L2.63 DATA switch, NOT a kernel field:
+        enable_market_breadth: True     (L2.63 DATA switch, NOT a kernel field:
                                          it only decides whether the backtest
-                                         computes a `market_breadths` series)
+                                         computes a `market_breadths` series.
+                                         Default ON since the Rule 11 parity
+                                         alignment -- the live runner always
+                                         supplies the input, so `--no-
+                                         lifecycle-enable-market-breadth`
+                                         restores the pre-alignment `None`)
 
     The two defaults that used to DISAGREE with live (and are fixed here, F1)
     were `normal_cooldown_bars=1` (live: 2 -- `--reentry-cooldown-bars` default)
@@ -1072,10 +1083,13 @@ def resolve_position_lifecycle_config(
     price_reentry_gate = bool(_get("price_reentry_gate", False, "price_reentry_gate"))
     price_reentry_pct = float(_get("price_reentry_pct", 0.02, "price_reentry_pct"))
     reentry_vwap_lookback = int(_get("reentry_vwap_lookback", 20, "reentry_vwap_lookback"))
-    # L2.63: the market-breadth DATA switch. Default False, so the resolved
-    # config stays semantically identical to a pre-change one and the call sites
-    # pass `market_breadths=None` exactly as they always did.
-    enable_market_breadth = bool(_get("enable_market_breadth", False, "enable_market_breadth"))
+    # L2.63: the market-breadth DATA switch. Default `True` (AGENTS Rule 11,
+    # backtest/live parity): the live runner hands the kernel a breadth/thrust
+    # value on every bar, so the backtest must supply the same class of input by
+    # default. `lifecycle_enable_market_breadth=False` (from the CLI's
+    # `--no-lifecycle-enable-market-breadth` or a strategy JSON) restores the
+    # pre-alignment `market_breadths=None` exactly.
+    enable_market_breadth = bool(_get("enable_market_breadth", True, "enable_market_breadth"))
 
     return PositionLifecycleConfig(
         guard_latency_bars=guard_latency_bars,

@@ -375,7 +375,7 @@ def run_allocation_backtest(
     enable_position_lifecycle: bool = False,
     lifecycle_config: Optional[Any] = None,
     lifecycle_records: Optional[List[Dict[str, Any]]] = None,
-    enable_market_breadth: bool = False,
+    enable_market_breadth: bool = True,
 ) -> dict:
     """
     Simulates portfolio equity curve given daily target weights.
@@ -748,15 +748,20 @@ def run_allocation_backtest(
     1.0 is not silently renormalised in the reported weights -- only the
     CASH-FEASIBLE long side is scaled down.
 
-    `enable_market_breadth` (L2.63, default False): inside the position-lifecycle
+    `enable_market_breadth` (L2.63, default True): inside the position-lifecycle
     block only, compute a per-bar market breadth/thrust series from `universe`
     (`common.indicators.lifecycle_market_breadth` -- Stage-1 semantics: share
     above SMA50, replaced by the share with a positive 10-bar return on bars
     where that thrust clears `breadth_thrust_threshold`) and pass it as the
     simulator's `market_breadths`. This is the ONLY input that can arm gate 5's
-    breadth leg (`is_breadth`) in a backtest; with the flag off the series is
-    `None` and every bar's `breadth_val` stays `None`, i.e. byte-identical to a
-    pre-L2.63 run. NaN bars (warmup / calendar holes) are NEVER filled: they
+    breadth leg (`is_breadth`) in a backtest. Default ON is backtest/live
+    parity (AGENTS Rule 11): the live runner supplies this input on every bar,
+    so a backtest that structurally cannot exercise the gate is a defect, not a
+    baseline. Passing `False` restores the pre-alignment behaviour -- the
+    series is `None`, every bar's `breadth_val` stays `None`, and the output is
+    byte-identical to a pre-L2.63 run (label any historical number produced
+    that way as such).
+    NaN bars (warmup / calendar holes) are NEVER filled: they
     decode to `None` in the policy kernel, which is a strict no-op. If no frame
     carries a `Volume` column the volume legs (`is_vol` / `is_super_volume_surge`)
     stay False and one WARNING says so.
@@ -856,11 +861,13 @@ def run_allocation_backtest(
         # DISCLOSURE: strategy_generator candidate search runs with position lifecycle OFF
         # to preserve an unconstrained search landscape; final backtests run with it ON.
         #
-        # (L2.63) `enable_market_breadth` (default False) is a DATA switch, not a
-        # policy knob: it decides whether a per-bar `market_breadths` series is
-        # computed from `universe` and handed to the simulator, which is what
-        # gate 5's breadth leg needs to be evaluable at all. Off -> `None`, i.e.
-        # exactly the pre-L2.63 behaviour (`breadth_val is None` every bar).
+        # (L2.63 / Rule 11) `enable_market_breadth` (default True) is a DATA
+        # switch, not a policy knob: it decides whether a per-bar
+        # `market_breadths` series is computed from `universe` and handed to the
+        # simulator, which is what gate 5's breadth leg needs to be evaluable at
+        # all. Default ON is backtest/live parity -- the live runner feeds the
+        # kernel this input on every bar. An explicit `False` restores exactly
+        # the pre-L2.63 behaviour (`breadth_val is None` every bar).
         #
         # (F4) A NON-EMPTY `lifecycle_records` is a caller-supplied, already
         # simulated record list (e.g. `run_backtest.py` warming the FSM over a
@@ -902,8 +909,9 @@ def run_allocation_backtest(
                 market=market_type,
                 cash_proxy=resolved_cash_proxy,
                 # (L2.63) Gate 5's breadth leg is inert without this series
-                # (`breadth_val` is None on every bar). Opt-in: default False
-                # passes `None`, i.e. exactly the pre-L2.63 behaviour.
+                # (`breadth_val` is None on every bar). On by DEFAULT (Rule 11
+                # parity with the live runner); an explicit False passes `None`,
+                # i.e. exactly the pre-L2.63 behaviour.
                 market_breadths=(
                     build_lifecycle_market_breadths(
                         universe, cfg, cash_proxy=resolved_cash_proxy,

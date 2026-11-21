@@ -351,14 +351,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lifecycle-breadth-thrust-threshold",
                    type=float, default=None, dest="lifecycle_breadth_thrust_threshold",
                    help="UPLSM market breadth thrust threshold for entry fast path (default: 0.60).")
+    # (L2.63 / AGENTS Rule 11) DEFAULT ON -- backtest/live parity.
+    #
+    # The live runner ALWAYS supplies this input: `scripts/run_live_strategy.py:7881`
+    # passes `market_breadth=thrust_val if thrust_active else breadth_val` into
+    # `step_position_lifecycle`, every bar, unconditionally. The backtest path
+    # supplying `None` meant gate 5's confluence leg (`is_breadth and is_vol`)
+    # was structurally unreachable there -- a parity DEFECT, not a baseline.
+    #
+    # `--no-lifecycle-enable-market-breadth` is the symmetric, explicit opt-out:
+    # it restores the pre-alignment behaviour (series = None, every number
+    # bit-identical to a pre-L2.63 run) so historical results stay reproducible
+    # and comparable. Anything measured under it must be labelled as such
+    # (Rule 11: divergence is opt-in and recorded).
+    #
+    # BOTH actions carry `default=True`: argparse seeds the namespace from the
+    # FIRST action registered for a given `dest` (`if not hasattr(namespace,
+    # action.dest)`), so pinning the same default on both makes the resolved
+    # default independent of definition order -- `--no-...` still flips it to
+    # False because that action is the one that actually runs.
     p.add_argument("--lifecycle-enable-market-breadth",
-                   dest="lifecycle_enable_market_breadth", action="store_true", default=False,
-                   help="L2.63: supply the position lifecycle with a per-bar market breadth/thrust "
+                   dest="lifecycle_enable_market_breadth", action="store_true", default=True,
+                   help="Supply the position lifecycle with a per-bar market breadth/thrust "
                         "series computed from the backtest universe (Stage-1 semantics: share "
                         "above SMA50, else share with positive 10-bar return) so gate 5 "
-                        "'宏观冲力爆量突破' can actually fire. Default OFF: with the flag off the "
-                        "series is None and every output is bit-identical to a pre-L2.63 run. "
+                        "'宏观冲力爆量突破' can actually fire. DEFAULT ON: 回测与实盘对齐 -- "
+                        "the live runner supplies this input on every bar, so a backtest "
+                        "without it cannot exercise the same decision path. "
                         "Requires universe frames with a Volume column for the volume legs.")
+    p.add_argument("--no-lifecycle-enable-market-breadth",
+                   dest="lifecycle_enable_market_breadth", action="store_false", default=True,
+                   help="Opt out of the breadth/thrust supply above. Restores the pre-alignment "
+                        "(pre-L2.63) behaviour exactly: the series is None, gate 5's breadth "
+                        "leg is inert, and every number is bit-identical to a historical run. "
+                        "Any result produced under this flag is NOT comparable to a default "
+                        "run -- label it with the differing input set.")
     # Both fast-path toggles are ALWAYS ON since BASE_VERSION 2.0.0 (M4.4 stage
     # D3): the kernel has no field for them, and `step_position_lifecycle` now
     # calls `_require_kernel_step_supported(cfg)` unconditionally, so a resolved
@@ -646,8 +673,9 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                     # (L2.63) Gate 5's breadth leg needs `market_breadths`; without
                     # it `breadth_val` is None on every bar and the confluence leg
                     # is dead code. Computed from the SAME `buffered_universe` the
-                    # simulator reads, and ONLY when the flag is on -- otherwise
-                    # `None`, i.e. byte-identical to a pre-L2.63 run.
+                    # simulator reads. ON by default (Rule 11 parity with live);
+                    # an explicit opt-out yields `None`, i.e. byte-identical to a
+                    # pre-L2.63 run.
                     market_breadths = (
                         build_lifecycle_market_breadths(
                             buffered_universe, pl_cfg, cash_proxy=resolved_cash_proxy,
@@ -1063,8 +1091,9 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
 
     has_warmup = len(eval_index) > 0 and len(eval_index) < len(raw_target_weights)
     if enable_pl:
-        # (L2.63) Same opt-in breadth supply as the walkforward path; `None`
-        # when the flag is off keeps every number bit-identical.
+        # (L2.63) Same breadth supply as the walkforward path, on by default;
+        # an explicit opt-out passes `None` and keeps every number bit-identical
+        # to a pre-alignment run.
         market_breadths = (
             build_lifecycle_market_breadths(
                 universe, pl_cfg, cash_proxy=resolved_cash_proxy,

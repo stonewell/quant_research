@@ -7632,3 +7632,119 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
   `fast_path_triggered="VOLUME_BREAKOUT"`，属**独立的可观测性缺陷**：
   仅凭决策日志无法区分「广度+爆量合流」与「单独爆量」。
   本文**不改**该项（它需要单独的信号语义决策与版本轴处置），留待独立任务。
+
+## 56. 广度/冲量供给翻转为默认开启：回测与实盘按 Rule 11 对齐（kernel/backtester 层，无版本轴变动，2026-11-20）
+
+> **对应任务**：`L2.63` 的**默认值翻转**，依据新增的 `AGENTS.md` 第 11 条
+> （Backtest/Live Parity by Default）。
+> **本节编号**：接上一节顺延为 **56**，§1–§55 一字未改。
+> **性质声明**：这是**默认行为的变更**，不是新特性。
+> §55.3 记录的 `default=False` 与 §55.8 的「保持 opt-in」结论，均由本节**明示推翻**；
+> 推翻的理由是用户指令（对齐优先）而非新的绩效证据 —— 见「被记录的代价」。
+
+### 56.1 变更：默认 `True` + `--no-` 退出
+
+- `backtester/run_backtest.py`：
+  - `--lifecycle-enable-market-breadth`（`store_true`）**默认值 `False` → `True`**；
+  - 新增对称退出开关 `--no-lifecycle-enable-market-breadth`
+    （`dest="lifecycle_enable_market_breadth", action="store_false", default=True`）；
+  - 两个 action **同时**写 `default=True`：argparse 用「第一个注册到该 `dest` 的 action」
+    播种命名空间（`if not hasattr(namespace, action.dest)`），
+    两端钉同一个默认值才使解析结果**与定义顺序无关**，同时 `--no-...` 仍能真的翻成 `False`。
+- `common/position_lifecycle.py`：
+  - `PositionLifecycleConfig.enable_market_breadth` 字段 **`False` → `True`**；
+  - `resolve_position_lifecycle_config` 中该键的兜底默认 **`False` → `True`**
+    （无 CLI、无策略 JSON 的程序化调用同样按对齐口径供给）。
+- `common/allocation_backtester.py`：
+  - `run_allocation_backtest(..., enable_market_breadth: bool = True)` **`False` → `True`**。
+- **只有默认值变了**：NaN-not-zero 规则、`market_breadths` 的推导
+  （`common.indicators.lifecycle_market_breadth`，并集对齐、不 ffill 价格、
+  现金代理排除、`Volume` 缺失一次性告警）与三处接线的形状**逐字未动**。
+- 退出路径的语义**精确定义为「等价于 §55 之前的引擎」**：
+  `market_breadths=None`、构建器根本不被调用、闸门 5 广度腿恒 False。
+- **影响面（默认翻转的必然结果，非额外改动）**：除 `backtester/run_backtest.py` 外，
+  `pipeline/research_strategy/run_research_strategy.py:471` 与
+  `pipeline/instrument_selection/selectorbot/strategy_fit.py:476` 这两处在
+  `enable_position_lifecycle=True` 时不显式传 `enable_market_breadth`，
+  因此**同样**继承新默认（与 Rule 11 一致：回测侧都按对齐口径供给）。
+  `strategy_generator` 候选搜索与 `pipeline/parity_harness.py` 走
+  `enable_position_lifecycle=False`，不受影响；`ml/`、`scripts/` 下的调用同样不开生命周期。
+
+### 56.2 为什么：回测与实盘对齐（Rule 11）
+
+- 实盘侧 `scripts/run_live_strategy.py:7881` 逐 bar 无条件传
+  `market_breadth=thrust_val if thrust_active else breadth_val` 给 `step_position_lifecycle`。
+  回测侧默认传 `None`，等于**结构上无法进入实盘的决策路径**。
+  按 Rule 11：「回测结构上无法触发的实盘决策路径是**缺陷**，不是可比基线」。
+- 因此默认口径改为「两边都供给同类输入」；分歧改为**opt-in 且被记录**
+  （`--no-...` 写在帮助文字与本节里，历史数字必须带不一致输入集的标注）。
+- 附带效应：`--lifecycle-breadth-thrust-threshold` 从此在**默认**回测里重新成为一个
+  有数据可比的真实开关（§55.1 记录的死开关状态只在 `--no-` 路径上复现）。
+
+### 56.3 被记录的代价（Rule 11 第四条的「不可避免的非平权」不适用于此，但代价必须记录）
+
+- §55.8 的定向队列测量（AGENTS Rule 10，**定向队列口径，不是全局 14 折 A/B**）已给出
+  反例：`chan_risk_managed_blend` 在供给广度后**组合层面变差** ——
+  权益 **−669.17**、Sharpe **1.84 → 1.81**、MDD **8.8% → 9.4%**。
+  同一测量里 `chan_four_state_blend` 为 PASS（队列净 **+56.5k**、组合 **+4,667.52 / +1.76%**、
+  Sharpe **2.01 → 2.02**、MDD **9.7% → 10.1%**）。
+- 处置：**仍然翻转为默认开启**。这是**用户明示指令**（"backtest and live must be aligned
+  by default"）+ 新 Rule 11 的后果，属**经批准的例外**，
+  不是「实测正向后的启用」—— §55.8 的「不推荐启用」结论**没有被推翻，也没有被遗忘**，
+  它与本条处置并存，且在此处显式标注。
+- 因此 `chan_risk_managed_blend` 的默认回测结果**存在已知的、量级为 −670 权益 / −0.03 Sharpe
+  / +0.6pp MDD 的退化**；需要复现其历史口径时用 `--no-lifecycle-enable-market-breadth`。
+
+### 56.4 可比性禁令（必须随数字一起传播）
+
+- **历史回测数字与开启后的数字不可直接比较**：
+  §55 之前的全部 `walkforward_*` 产物、策略报告与 §53/§54 的 A/B 数字，
+  都是在「无广度供给」口径下测得的。
+- 任何引用了历史数字的对比，必须显式说明**一侧是 `--no-` 口径**，
+  否则差异里混着输入集差异，无法归因到策略或参数变更。
+- 同理：今后若在 `--no-` 口径下产出结果，必须**按 Rule 11 标注不一致输入集**，
+  不得与默认口径结果并排呈现为「同一策略的两个版本」。
+
+### 56.5 单测契约的同步更新
+
+- `backtester/tests/test_run_backtest.py`：
+  - 原 `test_market_breadth_off_by_default_is_bit_identical` **删除**，
+    替换为两条新契约：
+    - `test_market_breadth_on_by_default_supplies_series`：命名空间**完全没有**该属性时，
+      默认路径把**非 None** 的 Series 送达模拟器，且 `run_standard` 端到端出现闸门 5 合流 BUY
+      （`market_breadth = 1.0`、`1.5 <= vol_ratio < 2.5`）；
+    - `test_no_flag_restores_previous_behaviour`：`lifecycle_enable_market_breadth=False`
+      （= `--no-...`）时构建器**零调用**、模拟器收到 `None`、闸门 5 记录为空，
+      且 `equity_curve` 与「不传 `market_breadths` 关键字的历史签名」基线
+      **逐格相同**（`rtol=0, atol=0`），策略 JSON 拼写的同一退出也逐格相同；
+      同时断言默认臂与退出臂**确实不同**（否证「开关是惰性的」）。
+  - walkforward 第二接线点的 OFF 断言改为显式 `lifecycle_enable_market_breadth=False`。
+  - `test_market_breadth_flag_is_inert_without_a_volume_column` **保留**
+    （缺 `Volume` 的一次性告警），但显式重置模块级
+    `_VOLUME_WARNED_CONTEXTS`：默认开启后同进程内更早的用例可能已消费该告警，
+    否则断言会变成「依赖执行顺序」而非「依赖行为」。
+- `common/tests/test_position_lifecycle.py`：
+  `test_resolver_threads_enable_market_breadth_and_keeps_it_out_of_the_kernel`
+  的默认断言改为 `True`，并补 `args`/策略 JSON 两种显式 `False` 的解析断言；
+  「不是 kernel 字段」（`PositionPolicyConfig` 上无该属性）的断言不变。
+
+### 56.6 版本轴（AGENTS.md 第 7 条）：零变动
+
+- 触及的文件均无 `version` / `BASE_VERSION` 轴：
+  `backtester/run_backtest.py`、`common/allocation_backtester.py` 不是策略/模板类；
+  `common/position_lifecycle.py` 与 `common/position_policy.py` 一样不设版本常量；
+  `PositionLifecycleConfig.enable_market_breadth` 是**数据开关**且不映射进 kernel。
+- 因此**不**升 `BASE_VERSION` / `version`、**不**重跑 `--dump-strategies`、
+  **不**改版本断言测试（与 §55.6 同样的处置）。
+- 唯一落盘影响：`run_manifest.json` 的 `position_lifecycle_config` 快照里
+  该键的值从 `false` 变成 `true` —— 这正是「历史数字可与不可比」的机器可读标记。
+
+### 56.7 验证（100% 合成数据、无网络、`--import-mode=importlib`）
+
+- `backtester/tests`：**129 passed**（原 128，净 +1：删一条、增两条）。
+- `common/tests/test_position_lifecycle.py` + `common/tests/test_market_breadth.py`：**65 passed**。
+- `pipeline/tests`：**1723 passed, 1 skipped**（约 9 分 10 秒）。
+- argparse 冒烟（真实 `build_arg_parser()`）：
+  默认 `True`；`--no-lifecycle-enable-market-breadth` → `False`；
+  `--lifecycle-enable-market-breadth` → `True`；
+  两开关同时给出时「后者生效」（`--no-` 后接 `--enable` → `True`，反序 → `False`）。

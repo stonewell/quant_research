@@ -2894,18 +2894,22 @@ def test_main_optimize_empty_param_grid_keeps_original_params(tmp_path, monkeypa
 
 
 # --------------------------------------------------------------------------- #
-# L2.63 -- `--lifecycle-enable-market-breadth` (opt-in, default OFF)
+# L2.63 -- `--lifecycle-enable-market-breadth` (parity: ON by default, `--no-` opt-out)
 # --------------------------------------------------------------------------- #
 #
 # Gate 5 (「宏观冲力爆量突破」) needs THREE things: a breadth value >= 0.60, a
 # volume/ma20 ratio >= 1.5, and a positive model target on a FLAT/PENDING_ENTRY
-# asset. The backtest data path supplied NONE of the first (no `market_breadths`
-# argument was ever passed), so the confluence leg was dead code. These tests pin
-# both halves of the contract:
-#   * OFF (the default) -- the series is `None`, the builder is never even called,
-#     and the output is identical to the pre-L2.63 engine;
-#   * ON -- the series reaches the simulator and a real confluence BUY appears
-#     end-to-end through `run_standard`.
+# asset. The backtest data path used to supply NONE of the first (no
+# `market_breadths` argument was ever passed), so the confluence leg was dead
+# code in every backtest while `scripts/run_live_strategy.py:7881` fed it on
+# every bar. That is a backtest/live parity DEFECT (AGENTS Rule 11), so the
+# supply is now ON by default and the divergence is opt-in. These tests pin both
+# halves of the contract:
+#   * ON (the default) -- a non-None series reaches the simulator and a real
+#     confluence BUY appears end-to-end through `run_standard`;
+#   * `--no-lifecycle-enable-market-breadth` (=`lifecycle_enable_market_breadth
+#     False`) -- the series is `None`, the builder is never even called, gate 5
+#     stays inert and the run reproduces the pre-alignment baseline exactly.
 
 
 class _OneShotTargetTemplate:
@@ -2957,8 +2961,31 @@ def _gate5_reasons(result):
     ]
 
 
-def test_market_breadth_off_by_default_is_bit_identical(monkeypatch):
-    """Default OFF: `market_breadths is None`, the builder is never called, same numbers."""
+def run_allocation_backtest_for_test(universe, weights, records):
+    """Run the engine directly with the pre-alignment data supply pinned off."""
+    from common.allocation_backtester import run_allocation_backtest
+
+    return run_allocation_backtest(
+        universe,
+        weights,
+        initial_capital=100_000.0,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        min_shares=1,
+        min_weight_change=0.0,
+        enable_position_lifecycle=True,
+        lifecycle_records=records,
+        enable_market_breadth=False,
+    )
+
+
+def test_market_breadth_on_by_default_supplies_series(monkeypatch):
+    """Default run (`args` with NO breadth attribute at all) supplies a real series.
+
+    The point of the parity default: an operator who passes nothing gets the
+    same class of input the live runner passes on every bar, so gate 5 is
+    evaluable -- not silently inert.
+    """
     import common.position_lifecycle as pl
 
     seen = []
@@ -2968,34 +2995,110 @@ def test_market_breadth_off_by_default_is_bit_identical(monkeypatch):
         seen.append(kwargs.get("market_breadths", "<<MISSING>>"))
         return real_sim(*args, **kwargs)
 
-    def builder_must_not_be_called(*args, **kwargs):  # noqa: ARG001
-        raise AssertionError(
-            "build_lifecycle_market_breadths must not run while "
-            "enable_market_breadth is False"
-        )
-
     monkeypatch.setattr(pl, "simulate_position_lifecycle", spy)
-    monkeypatch.setattr(pl, "build_lifecycle_market_breadths", builder_must_not_be_called)
 
     universe = _breadth_universe()
     template = _OneShotTargetTemplate(bar=60)
 
-    # An args namespace that predates this flag entirely (no attribute at all).
-    legacy = run_standard(universe, template, {}, MockArgs())
-    assert seen == [None], f"the simulator must receive market_breadths=None, got {seen}"
-    assert _gate5_reasons(legacy) == [], "gate 5 cannot fire without a breadth series"
+    # An args namespace that predates this flag entirely (no attribute at all):
+    # the resolved default is the one that matters.
+    default_on = run_standard(universe, template, {}, MockArgs())
 
-    # Explicit `False` is the same run, cell for cell.
+    assert len(seen) == 1
+    series = seen[0]
+    assert series is not None, "the default must supply the series, not None"
+    assert isinstance(series, pd.Series), f"expected a breadth Series, got {type(series)}"
+    assert not series.empty
+    # Breadth is 1.0 on the entry bar (all five symbols above their SMA50).
+    assert float(series.iloc[60]) == pytest.approx(1.0)
+
+    # ... and gate 5's confluence leg can therefore fire on the default path.
+    buys = _gate5_reasons(default_on)
+    assert buys, "gate 5 must be reachable without any opt-in flag"
+    assert buys[0]["action"] == "BUY"
+    assert buys[0]["symbol"] == "S0"
+    assert buys[0]["detail_reason"]["market_breadth"] == pytest.approx(1.0)
+    assert 1.5 <= buys[0]["detail_reason"]["vol_ratio"] < 2.5
+
+
+def test_no_flag_restores_previous_behaviour(monkeypatch):
+    """`--no-lifecycle-enable-market-breadth` reproduces the pre-alignment baseline.
+
+    The opt-out must be EXACT, not "close enough": the builder is never called,
+    `market_breadths=None` reaches the simulator, gate 5's reasons are empty,
+    and the equity curve / decision records match a pre-L2.63 call (the
+    simulator invoked WITHOUT the `market_breadths` argument at all) cell for
+    cell. The default run must differ, or the flag would be inert.
+    """
+    import common.position_lifecycle as pl
+
+    seen = []
+    real_sim = pl.simulate_position_lifecycle
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("market_breadths", "<<MISSING>>"))
+        return real_sim(*args, **kwargs)
+
+    builder_calls = []
+    real_builder = pl.build_lifecycle_market_breadths
+
+    def builder_spy(*args, **kwargs):
+        builder_calls.append(1)
+        return real_builder(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "simulate_position_lifecycle", spy)
+    monkeypatch.setattr(pl, "build_lifecycle_market_breadths", builder_spy)
+
+    universe = _breadth_universe()
+    template = _OneShotTargetTemplate(bar=60)
+    weights = template.generate_weights(universe, {})
+
+    default_on = run_standard(universe, template, {}, MockArgs())
+
     seen.clear()
+    builder_calls.clear()
     explicit_off = run_standard(
         universe, template, {},
         MockArgs(lifecycle_enable_market_breadth=False),
     )
-    assert seen == [None]
-    pd.testing.assert_frame_equal(
-        legacy["equity_curve"], explicit_off["equity_curve"], check_exact=True
+
+    # (1) The divergent behaviour is restored exactly: nothing is built, and the
+    #     simulator receives `None` (never a fabricated / filled series).
+    assert builder_calls == [], "no breadth series may be built under the opt-out"
+    assert seen == [None], f"the simulator must receive market_breadths=None, got {seen}"
+    assert _gate5_reasons(explicit_off) == [], "gate 5 cannot fire without a breadth series"
+
+    # (2) The pre-L2.63 baseline: the SAME simulator call, with the
+    #     `market_breadths` keyword absent entirely (the historical signature).
+    cfg = pl.resolve_position_lifecycle_config({}, MockArgs(lifecycle_enable_market_breadth=False))
+    baseline_weights, baseline_records = pl.simulate_position_lifecycle(
+        universe=universe,
+        target_weights=weights,
+        cfg=cfg,
+        market="other",
+        cash_proxy=None,
     )
-    assert legacy["lifecycle_records"] == explicit_off["lifecycle_records"]
+    assert explicit_off["lifecycle_records"] == baseline_records
+    _baseline_result = run_allocation_backtest_for_test(universe, baseline_weights, baseline_records)
+    pd.testing.assert_frame_equal(
+        explicit_off["equity_curve"], _baseline_result["equity_curve"], check_exact=True
+    )
+
+    # (3) The same opt-out spelled from a strategy JSON agrees cell for cell.
+    param_off = run_standard(
+        universe, template,
+        {"lifecycle_enable_market_breadth": False},
+        MockArgs(),
+    )
+    pd.testing.assert_frame_equal(
+        explicit_off["equity_curve"], param_off["equity_curve"], check_exact=True
+    )
+    assert explicit_off["lifecycle_records"] == param_off["lifecycle_records"]
+
+    # (4) ... and the flag is NOT inert: the default run really differs.
+    assert _gate5_reasons(default_on) != []
+    assert not explicit_off["equity_curve"].equals(default_on["equity_curve"])
+
 
 
 def test_market_breadth_flag_supplies_the_series_and_gate5_fires_end_to_end(monkeypatch):
@@ -3034,14 +3137,21 @@ def test_market_breadth_flag_supplies_the_series_and_gate5_fires_end_to_end(monk
     assert 1.5 <= record["detail_reason"]["vol_ratio"] < 2.5
 
 
-def test_market_breadth_flag_is_inert_without_a_volume_column():
+def test_market_breadth_flag_is_inert_without_a_volume_column(monkeypatch):
     """No `Volume` => the volume legs stay False, so gate 5 still cannot fire.
 
     The warning (one per context) is the whole point: a run that opted in but fed
     a price-only universe must SAY that the gate is still unreachable instead of
     looking enabled and doing nothing.
+
+    The once-per-context suppression is module-global, so the ledger is reset
+    here: an earlier test in the same session may already have consumed the
+    `market_breadths` warning (the default is ON now), which would make this
+    assertion order-dependent instead of behaviour-dependent.
     """
     import common.position_lifecycle as pl
+
+    monkeypatch.setattr(pl, "_VOLUME_WARNED_CONTEXTS", set())
 
     price_only = _breadth_universe(with_volume=False)
     template = _OneShotTargetTemplate(bar=60)
@@ -3085,12 +3195,14 @@ def test_market_breadth_flag_is_threaded_by_the_walkforward_path_too(monkeypatch
     assert seen, "the walkforward path must run the lifecycle simulator"
     assert all(isinstance(value, pd.Series) and not value.empty for value in seen), seen
 
-    # ... and OFF remains `None` (the pre-L2.63 fold behaviour).
+    # ... and the opt-out remains `None` (the pre-alignment fold behaviour).
     seen.clear()
     run_walkforward(
         universe,
         _OneShotTargetTemplate(bar=60),
         {},
-        MockArgs(window_years=0.4, step_years=0.2),
+        MockArgs(
+            lifecycle_enable_market_breadth=False, window_years=0.4, step_years=0.2,
+        ),
     )
     assert seen and all(value is None for value in seen), seen

@@ -2200,19 +2200,28 @@ def test_resolver_threads_enable_market_breadth_and_keeps_it_out_of_the_kernel()
 
     `breadth_thrust_threshold` (the gate's THRESHOLD) already lived on
     `PositionLifecycleConfig`; the missing half was the DATA switch. It must
-    resolve from the CLI namespace and from a strategy JSON, default to `False`,
-    and must NOT appear on `PositionPolicyConfig` -- the policy is unchanged, only
-    its input used to be missing.
+    resolve from the CLI namespace and from a strategy JSON, default to `True`
+    (AGENTS Rule 11 backtest/live parity -- the live runner always supplies this
+    input), and must NOT appear on `PositionPolicyConfig` -- the policy is
+    unchanged, only its input used to be missing.
     """
     from common.position_lifecycle import resolve_position_policy_config
 
-    assert resolve_position_lifecycle_config().enable_market_breadth is False
-    assert resolve_position_lifecycle_config(params={}).enable_market_breadth is False
+    # ON by default: a bare resolve supplies the series, like live does.
+    assert resolve_position_lifecycle_config().enable_market_breadth is True
+    assert resolve_position_lifecycle_config(params={}).enable_market_breadth is True
     assert (
         resolve_position_lifecycle_config(
             args=_Namespace(lifecycle_enable_market_breadth=True)
         ).enable_market_breadth
         is True
+    )
+    # ... and the symmetric opt-out (`--no-...` -> False) still wins.
+    assert (
+        resolve_position_lifecycle_config(
+            args=_Namespace(lifecycle_enable_market_breadth=False)
+        ).enable_market_breadth
+        is False
     )
     assert (
         resolve_position_lifecycle_config(
@@ -2230,6 +2239,13 @@ def test_resolver_threads_enable_market_breadth_and_keeps_it_out_of_the_kernel()
     assert (
         resolve_position_lifecycle_config(
             params={"enable_market_breadth": True, "lifecycle_enable_market_breadth": False}
+        ).enable_market_breadth
+        is False
+    )
+    # A strategy JSON can opt out on its own, without the CLI flag.
+    assert (
+        resolve_position_lifecycle_config(
+            params={"enable_market_breadth": False}
         ).enable_market_breadth
         is False
     )
