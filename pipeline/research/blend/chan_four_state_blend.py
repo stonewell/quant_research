@@ -104,7 +104,22 @@ class ChanFourStateBlendStrategy(BaseBlendAllocationStrategy):
     #   therefore changed, hence a MINOR bump; DELIVERED WEIGHTS DO NOT MOVE (no deployed
     #   config or dump ever enabled one, and the flag-off branch is what every read now is).
     #   `BASE_VERSION` takes the matching MINOR bump `2.0.0 -> 2.1.0`. See docs/version.md §47.
-    version: str = "1.6.0"
+    # 1.6.0 -> 1.7.0 (2026-11-20, incumbent re-qualification): the inherited
+    #   `BaseBlendAllocationStrategy` gains the OPT-IN
+    #   `enable_incumbent_requalification` rule (`BASE_VERSION 2.1.0 -> 2.2.0`), so this
+    #   class's honoured-parameter surface grows by three keys (flag + `incumbent_min_roc`
+    #   + `incumbent_exit_bars`) -- a MINOR bump. WEIGHTS MOVE ONLY WHEN THE FLAG IS
+    #   ENABLED; it defaults `False` and this class's `strategies_config.json` block does
+    #   not set it, so delivered weights are unchanged. See docs/version.md §52.
+    # 1.7.0 -> 1.8.0 (2026-11-20, sector-incumbent momentum qualification): the inherited
+    #   sector-incumbent retention shortlist in `blend_base.py` now requires the incumbent to
+    #   clear the same momentum hurdle as every challenger (`roc >= max(thrust_min_roc, 0.0)`,
+    #   NaN = not qualified), closing the seam where `max(0.001, inc_roc)` handed a NEGATIVE
+    #   momentum name a deployment slot (`BASE_VERSION 2.2.0 -> 2.3.0`). UNCONDITIONAL -- no
+    #   new parameter key, so this class's honoured-parameter surface is unchanged; a MINOR
+    #   bump only because the inherited engine behaviour changed (weights CAN move on bars
+    #   where a disqualified incumbent used to be retained). See docs/version.md §54.
+    version: str = "1.8.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

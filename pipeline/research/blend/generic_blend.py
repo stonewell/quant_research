@@ -27,7 +27,19 @@ class GenericBlendStrategy(BaseBlendAllocationStrategy):
     # they gated, so this class's honoured-parameter surface changed (MINOR). Delivered
     # weights do not move: no config/dump ever enabled one. `BASE_VERSION 2.0.0 -> 2.1.0`.
     # See docs/version.md §47.
-    version: str = "1.1.0"
+    # 1.1.0 -> 1.2.0 (2026-11-20, incumbent re-qualification): the inherited
+    # base engine gains the OPT-IN `enable_incumbent_requalification` rule
+    # (`BASE_VERSION 2.1.0 -> 2.2.0`), i.e. three new honoured keys -- a MINOR
+    # bump. Weights move ONLY when the flag is enabled (default `False`, absent
+    # from this class's config block), so delivered weights are unchanged.
+    # See docs/version.md §52.
+    # 1.2.0 -> 1.3.0 (2026-11-20, sector-incumbent momentum qualification): the inherited
+    # sector-incumbent retention shortlist now requires the incumbent to clear the thrust
+    # momentum hurdle (`roc >= max(thrust_min_roc, 0.0)`, NaN = not qualified), so a negative
+    # momentum incumbent can no longer be retained by `max(0.001, inc_roc)` (`BASE_VERSION`
+    # `2.2.0 -> 2.3.0`). Unconditional, no new key; MINOR because inherited behaviour changed.
+    # See docs/version.md §54.
+    version: str = "1.3.0"
 
     def __init__(self, config: Optional[StrategyConfig] = None, version: Optional[str] = None):
         cfg = config or StrategyConfig()

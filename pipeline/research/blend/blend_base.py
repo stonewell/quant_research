@@ -30,7 +30,7 @@ Features provided across all blend strategies:
 from collections import defaultdict
 import copy
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import pandas as pd
 
@@ -196,9 +196,45 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     a refuted negative result) and only a never-enabled parameter surface disappears.
     `intraday_5m_provider` is deliberately KEPT: it routes 5m BARS for Stage-1 metrics
     and the ticket fields, not blend features.
+
+    `BASE_VERSION 2.2.0` (2026-11-20) adds the OPT-IN incumbent re-qualification rule
+    (`enable_incumbent_requalification`, default `False`): a blend-only incumbent held
+    for `incumbent_exit_bars` consecutive bars below `incumbent_min_roc` is released with
+    an explicit `0.0` instead of occupying a thrust-deployment slot indefinitely. A MINOR
+    bump, not a MAJOR one: the engine contract is unchanged and the flag defaults off, so
+    every existing strategy's weights are byte-identical unless a caller enables it.
+    See `docs/version.md` §52.
+
+    `BASE_VERSION 2.2.0` second iteration (same unmerged change, 2026-11-20; version NOT
+    bumped again): the rule alone was insufficient because the exit was swallowed one layer
+    down -- the policy's sell candidacy is `diff <= -(thresh * asymmetric_ratio)`, and a
+    position smaller than that adaptive band (600362.SH: 0.054982 vs ~0.0596) never becomes
+    a candidate, so `asset_emergency_df` (consulted only AFTER candidacy) was never reached.
+    The fix is an explicit `forced_exits` channel, flag-gated end to end: this class fills
+    `incumbent_forced_exit_df` at the same site-1 sweep and forwards each bar's set into
+    `PortfolioSequencer.sequence`, which pierces the band per symbol (the band itself is
+    never zeroed globally) and bypasses `min_holding_bars`; `common/position_lifecycle.py`
+    forwards the same channel to the 6-state ladder (gate 1c), and the live runner reads the
+    opt-in `self._last_forced_exits` side channel. `asset_emergency_df` writes are unchanged
+    (they still serve `min_holding_bars` and the sector-retention guard). See §52.6.
+
+    `BASE_VERSION 2.3.0` (2026-11-20) closes the ONE remaining seam the two iterations above
+    did not: the sector-incumbent protection itself. Its `sec_incumbents` shortlist admitted
+    ANY held name of the sector whose live blend weight had collapsed (`raw_w <= 0.01`), and
+    the retention branch then manufactured a positive score for it via `max(0.001, inc_roc)`
+    -- so a name with NEGATIVE momentum that fails the thrust momentum hurdle
+    (`r_val >= thrust_min_roc`) could keep being handed a deployment slot indefinitely
+    (600362.SH: ROC10 -11.99% / -10.42% / -13.02% on 2026-11-04 / 11-18 / 11-19, rank 18-19
+    of 20, still retained). The shortlist now requires the incumbent to clear the same
+    momentum hurdle as every challenger (`roc >= max(thrust_min_roc, 0.0)`, NaN = not
+    qualified). A MINOR bump, not a MAJOR one: `generate_weights`'s signature, the sparse
+    weights contract and the inertia-kernel contract are unchanged, and the change only
+    REMOVES names from a retention shortlist -- no state layout or "who writes the row"
+    moves. It is UNCONDITIONAL (no flag): retention is a churn-suppression courtesy for
+    qualifying incumbents, never a way to keep a disqualified one alive. See §54.
     """
 
-    BASE_VERSION: str = "2.1.0"
+    BASE_VERSION: str = "2.3.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -218,7 +254,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.1.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.3.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -781,6 +817,12 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         # just before this method returns. Log bookkeeping only -- no value below
         # reads it.
         self._eb_warn_state = _new_empty_bucket_warn_state()
+        # (2026-11-20, `BASE_VERSION 2.2.0`) Live-path side channel for the
+        # OPT-IN forced-exit rule. Reset on EVERY call so a previous ON run can
+        # never leak its exits into a later OFF run. It stays an EMPTY dict
+        # unless the flag is on, and it is a SEPARATE attribute -- the
+        # `AllocationTemplate` / `composite_spec` return contract is untouched.
+        self._last_forced_exits: Dict[pd.Timestamp, Set[str]] = {}
 
         # Core parameters with institutional defaults
         cash_proxy = self.resolve_param(p, "cash_proxy", getattr(cfg, "cash_proxy", "BIL"), str)
@@ -823,7 +865,25 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         max_assets_per_sector = self.resolve_param(p, "max_assets_per_sector", 2, int)
         adaptive_sector_throttle = self.resolve_param(p, "adaptive_sector_throttle", False, bool)
         sector_incumbent_hurdle = self.resolve_param(p, "sector_incumbent_hurdle", 0.03, float)
+        # (2026-11-20, `BASE_VERSION 2.2.0`) Incumbent re-qualification switch.
+        # Default `False` => the three reads below resolve to a dead `False` and
+        # NOTHING downstream executes, so every existing strategy keeps its exact
+        # pre-change weights. The bare names are collision-free: none of the three
+        # exists as a `StrategyConfig` field (verified by grep), so `resolve_param`'s
+        # final bare-name `getattr(cfg, name)` fallback can never leak a global --
+        # the 2026-10-21 `wq_alpha_id` incident shape. `incumbent_exit_bars` is
+        # floored at 1 because `rolling(0)` raises and a 0-bar window would veto on
+        # a single spot ROC reading.
+        enable_incumbent_requalification = self.resolve_param(
+            p, "enable_incumbent_requalification", False, bool)
+        incumbent_min_roc = self.resolve_param(p, "incumbent_min_roc", 0.0, float)
+        incumbent_exit_bars = max(1, int(self.resolve_param(p, "incumbent_exit_bars", 3, int)))
         thrust_min_roc = self.resolve_param(p, "thrust_min_roc", 0.01, float)
+        # (2026-11-20, `BASE_VERSION 2.3.0`) 推力候选的动量门槛，也用作「行业存量保护」
+        # 的资格线。夹到 `>= 0.0` 是有意的：负动量存量不得占槽必须是不变量，即使配置把
+        # `thrust_min_roc` 写成负数也不放行（负门槛只可能来自误配，不是合法意图）。
+        # 不合格的在位者不得占用保留名额 —— 见下方 `sec_incumbents` 的过滤条件。
+        incumbent_qualify_roc = max(thrust_min_roc, 0.0)
         thrust_sizing_mode = self.resolve_param(p, "thrust_sizing_mode", "vol_adjusted", str)
         require_asset_trend = self.resolve_param(p, "require_asset_trend", (self.param_prefix == "cdhb"), bool)
         require_rs_rank = self.resolve_param(p, "require_rs_rank", (self.param_prefix == "cdhb"), bool)
@@ -963,6 +1023,18 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         daily_breadth = breadth_matrix.mean(axis=1).fillna(0.50)
         daily_thrust = thrust_matrix.mean(axis=1).fillna(0.50)
 
+        # (2026-11-20, `BASE_VERSION 2.2.0`) Lazy N-consecutive-bars counter for the
+        # incumbent re-qualification rule (site 4 of 4). Derived PURELY from
+        # `roc_matrix` (already computed above), so the counter carries NO state
+        # across `generate_weights` calls -- it is a rolling count over the price
+        # frame, never an accumulator. Skipped entirely when the switch is off:
+        # `consec_below` stays `None` and nothing else in this method reads it.
+        consec_below = None
+        if enable_incumbent_requalification:
+            roc_below_incumbent = (roc_matrix < incumbent_min_roc)
+            consec_below = roc_below_incumbent.rolling(
+                incumbent_exit_bars, min_periods=incumbent_exit_bars).sum()
+
         # Precompute diversified basket return volatility and macro state indicators
         basket_ret = asset_returns.mean(axis=1).fillna(0.0)
         basket_vol_21d = (basket_ret.rolling(21, min_periods=10).std() * np.sqrt(252)).fillna(target_vol)
@@ -1035,6 +1107,18 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         stop_counter = 0
         emergency_flags = []
         asset_emergency_df = pd.DataFrame(False, index=master_index, columns=risky_symbols)
+        # (2026-11-20, `BASE_VERSION 2.2.0`) The FORCED-EXIT side channel: same
+        # index/columns as `asset_emergency_df`, populated ONLY by the site-1
+        # re-qualification sweep. It is a SEPARATE frame on purpose -- the
+        # emergency frame ALSO feeds `min_holding_bars`/the sector-retention
+        # guard, and a forced exit must not silently widen those.
+        #   * the inertia kernel receives one row per bar as `forced_exits`, which
+        #     bypasses the adaptive sell band (a sub-band exit was silently
+        #     swallowed before: 5.5% < the ~6% adaptive band);
+        #   * the live runner reads the same information through
+        #     `self._last_forced_exits` (see the end of `generate_weights`).
+        # With the flag off the frame stays all-False and is never passed on.
+        incumbent_forced_exit_df = pd.DataFrame(False, index=master_index, columns=risky_symbols)
 
         asset_cooldown_until = {s: 0 for s in risky_symbols}
         asset_entry_price = {s: None for s in risky_symbols}
@@ -1357,6 +1441,42 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             # Quality & Relative Strength Gate
             if t > 0:
                 prev_date = master_index[t - 1]
+                # (2026-11-20, `BASE_VERSION 2.2.0`) Incumbent re-qualification
+                # (site 1 of 4): a BLEND-ONLY incumbent that has spent
+                # `incumbent_exit_bars` consecutive bars below `incumbent_min_roc`
+                # must re-earn its slot instead of holding one indefinitely.
+                # 审计背景（2026-11-20）：blend 独有的存量标的长期不重新资格化 ⇒
+                # 600362 在 ROC10 连续为负、且已被 stage-2 −8% 止损的情况下仍占住
+                # `unallocated/5` 槽位。N 根计数器由价格帧推导（`consec_below`），
+                # **不依赖跨调用持久状态**；退出写显式 `0.0`（Rule 3：绝不是 NaN），
+                # 并置 `asset_emergency_df` 以便惯性核强制放行（同 −8% 止损路径）。
+                if enable_incumbent_requalification:
+                    for _s in risky_symbols:
+                        _held = (
+                            float(desired_weights.loc[prev_date, _s]) > 1e-4
+                            if _s in desired_weights.columns else False
+                        )
+                        if not _held:
+                            continue
+                        # Only a name NO sub-strategy holds is re-qualified: a
+                        # sub-strategy's own exit logic stays authoritative.
+                        _blend_only = True
+                        for _k, _sd in sub_daily.items():
+                            if _s in _sd.columns:
+                                _v = _sd.loc[date, _s] if date in _sd.index else 0.0
+                                if float(_v) > 1e-4:
+                                    _blend_only = False
+                                    break
+                        if not _blend_only:
+                            continue
+                        if float(consec_below.iloc[t][_s]) >= incumbent_exit_bars:
+                            raw_w[_s] = 0.0
+                            asset_emergency_df.loc[date, _s] = True
+                            # Forced-exit channel (Rule 3 still holds: `raw_w[_s]`
+                            # above is the explicit 0.0 the sparse row carries).
+                            incumbent_forced_exit_df.loc[date, _s] = True
+                            entry_signal_bars[_s] = 0
+                            expansion_signal_bars[_s] = 0
                 if require_asset_trend:
                     row_roc60 = roc_60_matrix.iloc[t]
                     roc60_median = float(row_roc60.median()) if not row_roc60.empty else 0.0
@@ -1588,12 +1708,32 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     allowed_sec_cap = max(allowed_sec_cap, 2)
 
                                 # Sector incumbent protection: outside challenger must beat held incumbent's ROC by at least sector_incumbent_hurdle
+                                # (2026-11-20, `BASE_VERSION 2.3.0`) 2026-11-20 定位结论：`600362`
+                                # 三天 ROC10 全为负（-11.99% / -10.42% / -13.02%，rank 18–19 / 20），
+                                # 却因 `max(0.001, inc_roc)` 把负动量洗成正分而持续占住推力槽位。
+                                # 在位保护的本意是抑制换手（别让微弱的挑战者挤掉合格的在位者），
+                                # 不是让负动量标的无限续命。`max(..., 0.0)` 让「负动量存量不得占槽」
+                                # 成为不变量：不合格者直接从集合里剔除，集合空了整个保留分支就不执行，
+                                # 挑战者按正常路径被评估（绝不能用 `continue` —— 那会连挑战者一起跳过）。
+                                # NaN ROC 一律视为「不合格」，不让比较语义把 NaN 悄悄放行。
                                 sec_incumbents = [
                                     s for s in held_incumbents
-                                    if _get_symbol_sector(s) == sec and s not in sorted_cands and float(raw_w[s]) <= 0.01
+                                    if _get_symbol_sector(s) == sec
+                                    and s not in sorted_cands
+                                    and float(raw_w[s]) <= 0.01
+                                    and pd.notna(row_roc[s])
+                                    and float(row_roc[s]) >= incumbent_qualify_roc
                                 ]
                                 if cand not in held_incumbents and sec_incumbents:
                                     best_inc = max(sec_incumbents, key=lambda s: float(row_roc[s]) if pd.notna(row_roc[s]) else 0.0)
+                                    # (2026-11-20, `BASE_VERSION 2.2.0`) A vetoed
+                                    # incumbent must not serve as its sector's
+                                    # retention benchmark. `held_incumbents` is built
+                                    # AFTER the site-1 sweep, so this is defensive:
+                                    # it only matters if a future reorder lets an
+                                    # emergency-flagged name into that set.
+                                    if bool(asset_emergency_df.loc[date, best_inc]):
+                                        continue
                                     inc_roc = float(row_roc[best_inc]) if pd.notna(row_roc[best_inc]) else 0.0
                                     cand_roc = float(row_roc[cand]) if pd.notna(row_roc[cand]) else 0.0
                                     if cand_roc < inc_roc + sector_incumbent_hurdle:
@@ -1824,6 +1964,12 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         cfg=policy_cfg,
                         cash_proxy=cash_proxy,
                         em_row=asset_emergency_df.iloc[t],
+                        # OPT-IN forced-exit row. `None` when the flag is off, so
+                        # the kernel evaluates exactly the pre-change predicate.
+                        forced_exits=(
+                            {s for s in risky_symbols if bool(incumbent_forced_exit_df.loc[date, s])}
+                            if enable_incumbent_requalification else None
+                        ),
                     )
                 desired_weights.loc[date] = current_w
             else:
@@ -1868,6 +2014,17 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         # `SparseProjector.write` (M4.3) is deliberately NOT wired: the write-back
         # rule still belongs to `desired_weights`/the sequencer above.
         sparse_weights = SparseProjector().project(daily_weights)
+        # (2026-11-20, `BASE_VERSION 2.2.0`) Publish the OPT-IN forced-exit
+        # side channel for the LIVE path. Built from the frame the sweep already
+        # filled, so it cannot disagree with the weights above: a date appears
+        # only when at least one symbol was forced out on it, and the value is
+        # the set of those symbols. When the flag is off the dict stays empty.
+        if enable_incumbent_requalification:
+            self._last_forced_exits = {
+                date: {s for s in risky_symbols if bool(row[s])}
+                for date, row in incumbent_forced_exit_df.iterrows()
+                if bool(row.any())
+            }
         # (2026-11-17, observability-only) End-of-computation summary for the
         # empty-style-bucket guard. Logged AFTER the weights exist so the log path
         # can never influence them (it is also exception-guarded).
