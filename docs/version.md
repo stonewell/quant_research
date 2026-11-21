@@ -7652,6 +7652,19 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
   仅凭决策日志无法区分「广度+爆量合流」与「单独爆量」。
   本文**不改**该项（它需要单独的信号语义决策与版本轴处置），留待独立任务。
 
+**已解决（2026-11-20）**
+
+- 处置：`b43834f` 已拆分两条腿 ——
+  合流腿 `BREADTH_CONFLUENCE` + 「宏观冲力爆量突破」；
+  超量腿 `SUPER_VOLUME` + 「超量突破（放量，无广度确认）」；
+  历史工单的 `VOLUME_BREAKOUT` 作为 legacy 常量保留
+  （仅归档产物与展示映射使用）。
+- 消费方：`web/livetrading/static/js/app.js` 展示映射已同步；
+  `scripts/run_live_strategy.py` 与 `common/order_netting.py` 不按该值分支，无需改动。
+- 判别口径更新：今后统计闸门 5 队列应改用
+  `fast_path_triggered in {BREADTH_CONFLUENCE, SUPER_VOLUME}`（或 `market_breadth != null`），
+  不得再按文案字符串计数。
+
 ## 56. 广度/冲量供给翻转为默认开启：回测与实盘按 Rule 11 对齐（kernel/backtester 层，无版本轴变动，2026-11-20）
 
 > **对应任务**：`L2.63` 的**默认值翻转**，依据新增的 `AGENTS.md` 第 11 条
