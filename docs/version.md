@@ -7060,3 +7060,367 @@ opt-in Ledoit-Wolf 稳健协方差开关的版本演进与验证记录。
 
 - 作为 opt-in 注册策略上线，不修改任何默认推荐生产策略配置（`modifies_default_config = false`）。
 
+
+## 52. blend 底座新增「存量标重新资格化」规则（`BASE_VERSION 2.1.0 → 2.2.0`，2026-11-20）
+
+> **本节编号**：落笔前实测现有最高节号为 **51**（`grep -n '^## ' docs/version.md` 的最后一项），
+> 故本节取 **52**，只追加在文件末尾；§1–§51 一字未改。
+> **已知历史漂移（本节不传播）**：`docs/version.md` 第 28 行、第 76 行、第 323 行仍写着
+> `v1.4.0 [base: v2.0.0]`，那是 §46/§47 之前的旧快照。**当前真值**见本节 52.2 的版本轴表。
+
+### 52.1 变更类型与内容（行为变更，开关默认关闭）
+
+- **类型**：底座引擎 `BaseBlendAllocationStrategy` 新增一条**可选的存量标重新资格化**（incumbent
+  re-qualification）规则，六个 blend 子类全部继承。
+- **问题（2026-11-20 审计）**：blend 独有的存量标的（`_blend_only`：任何子策略都不持有）长期不重新
+  资格化 ⇒ `600362.SH` 在 ROC10 连续为负、且已被 stage-2 −8% 止损的情况下，仍占住
+  `unallocated / 5` 的推力部署槽位。槽位一旦发出就不再被回收，标的因此只进不出。
+- **规则**：某标的在 `desired_weights` 上被持有（`> 1e-4`）、且没有任何子策略持有它、且在价格帧
+  上连续 `incumbent_exit_bars` 根（默认 3）`ROC10 < incumbent_min_roc`（默认 0.0）时，
+  引擎在当日目标行写入**显式 `0.0`**，并置 `asset_emergency_df`（同 −8% 止损路径），
+  使惯性核的持仓期限锁强制放行。
+- **计数器无状态**：`consec_below` 由 `roc_matrix` 的滚动窗口推导（`rolling(N).sum()`），
+  **不依赖跨调用持久状态**，两次同样的运行逐格相同。
+- **新增三个参数键**（`resolve_param`，默认关）：
+  `enable_incumbent_requalification=False`、`incumbent_min_roc=0.0`、
+  `incumbent_exit_bars=3`（下限夹到 `1`：`rolling(0)` 会抛异常，且 0 根窗口会在单点 ROC 上误杀）。
+- **为什么复用 `asset_emergency_df`**：这是本引擎既有的 L2.40 单标的一票否决通道（−8% 止损、
+  全局紧急状态都写它），且 `held_incumbents` 在它之后构建，被否决的标的自动退出「行业存量保护」
+  的基准集合；第 2 处再加一行防御性判断，禁止被否决者充当行业存量基准。
+- **裸名冲突核验**：`enable_incumbent_requalification` / `incumbent_min_roc` / `incumbent_exit_bars`
+  三个裸名在仓库内 `grep` 零命中，**都不是** `StrategyConfig` 字段，因此 `resolve_param` 的
+  末级裸名 `getattr(cfg, name)` 不可能泄漏全局值（2026-10-21 `wq_alpha_id` 事故形状）。
+- **一处已披露的非默认参数残余风险**：若把 `incumbent_min_roc` 设得**高于** `thrust_min_roc`
+  （默认 0.0 vs 0.01，正常配置不会），当日 ROC 落在两阈值之间的存量标可能在同一根 bar 内被
+  推力部署重新买入；默认参数下不可能发生，故本次未加额外开关。
+
+### 52.2 版本轴（AGENTS.md 第 7 条）
+
+| 轴 | 旧 | 新 | 理由 |
+| :--- | :---: | :---: | :--- |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.1.0` | **`2.2.0`** | **minor**：新增 opt-in 参数面 + 新退出路径，引擎契约不变 |
+| `ChanFourStateBlendStrategy.version` | `1.6.0` | **`1.7.0`** | 同上（同轴 minor，§47.3 先例） |
+| `ChanRiskManagedBlendStrategy.version` | `1.2.0` | **`1.3.0`** | 同上 |
+| `ChanCrisisShieldBlendStrategy.version` | `1.1.0` | **`1.2.0`** | 同上 |
+| `ChanFourStateShieldBlendStrategy.version` | `1.1.0` | **`1.2.0`** | 同上 |
+| `ChanDualHybridBlendStrategy.version` | `1.1.0` | **`1.2.0`** | 同上 |
+| `GenericBlendStrategy.version` | `1.1.0` | **`1.2.0`** | 同上 |
+
+- **为什么是 minor 而不是 patch**：被**认可**的参数集合变了（多三个键），且引擎多了一条能达到
+  权重的退出路径 —— 按第 7 条该升 minor。
+- **为什么不是 major**：`generate_weights` 的签名、稀疏权重契约、惯性核契约**全部未变**；
+  开关默认 `False`，「谁来写这一行账」没有变化，同 major 的 `prior_state` 仍可采纳
+  （`scripts/live_preflight.py::select_prior_state` 只比较 major，见 §47.3 的 `NV8`）。
+- **同步项**：`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、
+  `common/tests/test_strategy_versioning.py`、`pipeline/research_strategy/tests/test_blend_policy_kernel.py`
+  的版本断言已同步为本表；六个子类的版本沿革注释各追加一条 2026-11-20 记录。
+
+### 52.3 Rule 3 的 `0.0` 语义
+
+- 退出写的是**具体 Python `0.0`**，写进 `raw_w` → `desired_weights` → `daily_weights`；
+  `SparseProjector.project` 的 `daily != daily.shift(1)` 掩码在「目标发生变化」的那一行**保留真值**，
+  因此稀疏行里该列是显式 `0.0`（`not pd.isna(...)` 且 `== 0.0`），**绝不是 `NaN`**。
+- 理由：调仓行内的 `NaN` 在回测器列向 `ffill()` 下等价于「沿用上一笔权重」，会把已经退出的
+  仓位静默留住（即 2026-10 的 NaN-vs-0.0 事故形状）。
+- 单元测试 `pipeline/research_strategy/tests/test_blend_incumbent_requalification.py::
+  test_blend_only_incumbent_negative_roc_exits_with_explicit_zero` 直接钉死这一点，并额外断言
+  退出后该标的**不再被重新持有**（槽位真正释放，而不是只闪一下 0）。
+- **退出后允许重新入场**：规则不是永久的黑名单。某标的若之后 ROC 重新站上 `thrust_min_roc`，
+  它可以按正常推力部署路径重新获得槽位 —— 这正是「重新资格化」的语义。
+
+### 52.4 Rule 9 状态：待执行 / 未合并
+
+- **本轮只做实现 + 单元测试，未做任何 A/B 或回测**；正负收益结论由另一个独立任务产出。
+- 因此本条规则当前状态标注为「**待执行 / 未合并**」：`strategies_config.json` 中六个 blend 块
+  **未**写入任何新键（A/B 任务随后钉开关），实盘与既有回测权重不受影响。
+- **行为变更仅在开关启用时生效，默认 `False`。** 开关关闭时：三个 `resolve_param` 读到 `False`
+  / `0.0` / `3`，`consec_below` 保持 `None`（预计算整块跳过），扫描块整块不执行 —— 输出与改动前
+  **逐位相同**（`test_incumbent_requalification_off_by_default` 以 pin 住的
+  `6adb67e:pipeline/research/blend/blend_base.py` 为基线做逐格比对：同 index、同列序、
+  同 `NaN` 足迹、`max_abs_diff == 0.0`）。
+
+### 52.5 验证与边界
+
+- 离线测试（`--import-mode=importlib`，100% 合成数据、无网络）：新增
+  `test_blend_incumbent_requalification.py` **4 passed**；版本门禁
+  （`test_blend_strategy_versioning.py` + `common/tests/test_strategy_versioning.py`）**10 passed**。
+- **未动**：`common/position_policy.py`、`common/position_lifecycle.py`、
+  `scripts/run_live_strategy.py`、六个子类的**逻辑**（只改 `version` 与沿革注释）、
+  `strategies_config.json` 的参数；`chan_four_state_blend` 的
+  `blend_weighting_mode="regime_ic_ir_hybrid"` 保持不动（§8 的已记录例外）。
+- **dump 重生成**：本轮独立任务环境下未执行/未能执行（见交付报告的实际输出），
+  未伪造任何 `strategy_dumps/*.json`。
+
+### 52.6 第二次迭代：显式 `forced_exits` 强制退出通道（同一未合并变更，`BASE_VERSION` 仍 `2.2.0`）
+
+- **背景（A/B 已确认的既有诊断）**：52.1 的 site-1 扫描对 `600362.SH` 已正确触发 **66 次**
+  （`raw_w[_s] = 0.0` 且 `asset_emergency_df = True`），但**交付权重仍为 `0.054982`**。
+  根因在下一层：`common/position_policy.py` 的卖出候选判定是
+  `is_sell_candidate = diff <= -sell_thresh`，自适应带宽
+  `sell_thresh = clip(expanding_vol_ratio × 0.05, 0.025, 0.08)` 当时约 **0.0596**；
+  `0.054982` 的跌幅永远清不过这个带宽，因此候选不成立，`symbol_emergency` /
+  `asset_emergency`（在候选之后、`:793-795` 处才被读取，用于放行 `min_holding_bars`）
+  **根本走不到**。净效果：任何小于约 6% 的**完整退出**（含 ATR 止损）都被静默吞掉。
+  这是 §16.15.16 家族「减仓被惰性门吞掉」的**全平仓变体**。
+- **通道设计（端到端开关门控）**：
+  1. `common/position_policy.py::AssetPolicy.inertia_step(..., forced_exit=None)`：卖出候选谓词
+     改为 `bool(diff <= -sell_thresh) or (symbol in forced_exit)`，并在 `in_sells` 分支上与
+     `symbol_emergency` 复用同一条放行路径（因此同样绕过 `min_holding_bars`）。
+     **不**把 `sell_thresh` 全局清零 —— 那会让当 bar 的**其他所有标的**都变成卖出候选。
+     `detail["forced_exit"]` 仅在命中时写入，未命中时键**不存在**（保持既有 detail 逐键一致）。
+  2. `common/position_policy.py::PortfolioSequencer.sequence(..., forced_exits=None)`：
+     把同一个 per-bar 容器原样转交每一次 `inertia_step`。卖出仍写 `new_w[s] = ideal_w[s]`
+     （即调用方的显式 `0.0`），Rule 3 不破。
+  3. `common/position_policy.py::AssetPolicy.step(..., forced_exit=False)`：新增 **gate 1c**
+     （位于「休市冻结 / 缺价」两个『未评估任何信号』前缀之后、stop 快路径之前）：
+     对 `HELD_*` / `PENDING_EXIT` 直接 `SELL @ 0.0`、`next_state=COOLDOWN`、
+     `asset_stop_cooldown_bars`，显式绕过惰性带宽与 `min_holding_bars`；休市或缺价时
+     **不会**触发（不会把券商 T+1 冻结转换成当日强平）。默认 `False` 为严格 no-op。
+  4. `common/position_lifecycle.py`：`step_position_lifecycle(..., forced_exits=None)` 按
+     `state.symbol in forced_exits` 转发；`simulate_position_lifecycle(..., forced_exits=None)`
+     接受按日期键的 `dict`/`pd.Series`（值为标的集合），每根 bar 用 `_forced_exits_for_bar`
+     解析后下传。缺失日期 / `None` 值 / 不可迭代值一律解码为「本 bar 无强制退出」，绝不解码成
+     「全部」或「空集合也生效」。
+  5. `pipeline/research/blend/blend_base.py`：与 `asset_emergency_df` 并列维护
+     `incumbent_forced_exit_df`（同 index/同列），仅在开关打开时由 site-1 扫描写同标同日期；
+     每 bar 以 `set` 形式传给 `PortfolioSequencer.sequence`。`asset_emergency_df` 的写入
+     **原样保留**（它仍服务于 `min_holding_bars` 与行业存量保护）。
+  6. **实盘侧通道**：`generate_weights` 在开关打开时额外发布
+     `self._last_forced_exits: dict[pd.Timestamp, set[str]]`（开关关闭时恒为空 dict）。
+     这是**可选属性**，`generate_weights` 的返回类型与 `composite_spec` 契约**完全未变**。
+     `scripts/run_live_strategy.py` 在 `generate_weights(...)` 之后
+     `getattr(template, "_last_forced_exits", None)`，把**本次调仓行日期**对应的集合传入既有
+     `step_position_lifecycle(market_breadth=...)` 调用；属性不存在（所有非 blend 策略、以及
+     开关关闭的 blend）时什么都不传，行为逐位不变。
+- **版本轴**：本节是同一个未合并变更的第二次迭代，`BASE_VERSION` **保持 `2.2.0`，不再升版**；
+  `common/position_policy.py` / `common/position_lifecycle.py` **没有版本轴**
+  （`position_policy.py:41` 明确「Do not bump」），未发明常量。六个子类版本、
+  `strategies_config.json`、`regime_ic_ir_hybrid` 固定值**均未改动**。
+- **关闭态不变性证明**：`forced_exits=None` / 缺省 / 空集合三种调用在
+  `PortfolioSequencer.sequence` 上逐格一致
+  （`test_forced_exit_noop_when_none`）；blend 开关关闭时 `_last_forced_exits == {}` 且输出与
+  pin 住的 `6adb67e` 基线 `assert_frame_equal(..., check_exact=True)` 完全相同。
+- **本次新增/修改的测试**：
+  `pipeline/research_strategy/tests/test_blend_incumbent_requalification.py` 新增
+  `test_forced_exit_pierces_adaptive_sell_band`（5.4982% 低于 0.0596 带宽：无 `forced_exits` 冻结、
+  有则显式 `0.0`；同一 bar 的兄弟标的仍冻结，证明带宽未被全局清零）与
+  `test_forced_exit_noop_when_none`；
+  `common/tests/test_position_lifecycle.py` 新增
+  `test_forced_exits_simulator_exits_sub_band_position_and_none_is_noop`；
+  `pipeline/tests/test_live_path_hardening.py` 新增 `test_live_forced_exit_side_channel`
+  （forced 侧 `action == "SELL"` / `target_weight == 0.0`，无通道侧 4% 仓位保持不变）。
+
+## 53. `is_full_exit` 按用户指令启用：全局卖出谓词放宽（kernel 层，无版本轴变动，2026-11-20）
+
+> **本节编号**：仍取 **53**，原位改写为「按用户指令启用」的完整记录（前一稿是「已回滚」），
+> 不新增节号；§1–§52 一字未改。
+> **已知历史漂移（本节不传播）**：第 28 / 76 / 323 行仍写着 `v1.4.0 [base: v2.0.0]`，那是 §46/§47
+> 之前的旧快照，本节**未触碰**（同 §52 头部的处置）。
+
+### 53.1 变更：`is_full_exit` 谓词（清仓必须可执行）
+
+- **位置**：`common/position_policy.py::AssetPolicy.inertia_step`，候选判定处新增
+  `is_full_exit = (ideal <= 1e-4) and (current > 1e-4)`，并把卖出候选改为
+  `bool(diff <= -sell_thresh) or is_full_exit or _is_forced_exit`。
+- **`detail["full_exit"]`**：只在「本谓词是唯一成立项」时写入
+  （`is_full_exit and not _band_sell and not _is_forced_exit`）；纯带宽卖出、§52 的
+  forced-exit 通道、以及一切没有清仓的 run，`detail` 逐字节不变。
+- **动机**：完整退出时 `diff == -current`，仓位一旦小于卖出带宽
+  （`sell_thresh = clip(expanding_vol_ratio × 0.05, 0.025, 0.08)`，审计时约 **0.0596**）就永远
+  不构成候选，被当作「减仓抖动」吞掉；sub-6% 仓位的 −8% 止损 / ATR 止损同样被吞。
+  语义要求：目标 `0` 必须卖，**不论**跌幅是否超过带宽（已经低于 5% 的持有同样清零）。
+- **不动的东西**：`sell_thresh` 不清零（清零整条带宽会污染同 bar 全部标的）；持有期分支
+  （`symbol_emergency or _is_forced_exit` 直接放行，否则 `min_holding_bars` 的两条抑制）
+  原样保留；§52 的 `_is_forced_exit` / `forced_exits` 通道未改。
+- **现金腿**：`risky_symbols` 在两个调用方都已排除 `cash_proxy`，现金残差永远不会进入本谓词
+  （代码注释已写明），因此不设「现金代理例外」。
+- **定性**：**无条件**的内核行为变更（对全部走 `apply_asset_inertia` /
+  `PortfolioSequencer.sequence` 的模板与策略同时生效），**没有**任何开关可以单独兜住 ——
+  这是用户明示要求的行为修复，不是默认关闭的实验性开关。
+
+### 53.2 机制验证（判别性探针：`601857.SH` / `2024-02-19`）
+
+- **内核 A/B 计数**：Arm B（`is_full_exit` 生效）在 240 种子面板上共 **189 次**新增候选，
+  **184 次**成交、**5 次**被 `min_holding_bars` 拦住 —— 证明「绕过带宽、不绕过期限锁」
+  的设计意图在内核层是真的落地了（否则其余测试也会崩）。
+- **探针**：`601857.SH`，`2024-02-19`。Arm B 把 `1.32%` 直接卖到 `0.0%`；Arm A（原谓词）
+  持有 `1.29%`、当日**无成交行** —— 清仓被带宽吞掉的现象是真实现象，不是理论推演。
+  按 Rule 10：这个 cell 的差异**由被研究的行为本身产生**（就是清仓是否落地，不是代理量），
+  两臂取值已如上引用。
+- **反向边界**：子带**部分**减仓不会被本谓词放行，如 `601728.SH` `2.14% → 2.00%`，
+  两臂均落在 `HOLD_FILTERED` / `INERTIA`。谓词确实只作用于全平仓。
+
+### 53.3 Rule 9 全局 A/B 实测为负（数字原样保留，不因结论改写而隐藏）
+
+- **实验面**：**14 折 × 6 只** blend 策略的 walkforward A/B（Arm A = 原谓词，Arm B =
+  `is_full_exit`），逐折比较合并 Sharpe / CAGR / MaxDD / 换手。
+- **合并 ΔSharpe（主策略 cfsb）**：**−0.2985**，14 折中仅 7 折非负，折 10 单折 **−3.04**。
+- **其余五只**：crb **−0.1893**、cdhb **−0.1684**、ccsb **−0.2311**、gb **−0.3085**、
+  cfssb **+0.2462** —— **六只里五只为负**，唯一为正的 cfssb 不足以翻案。
+- **ΔCAGR（主策略）**：**−4.61 pp**。
+- **MaxDD 恶化**：cdhb 折 2 **+3.74 pp**、gb 折 13 +2.25 pp（回撤方向为正 = 更差）。
+- **换手**：84 个可比较折中 **60 折换手上升**，均值 **+0.87 / 年** —— 即收益没拿到，
+  摩擦成本先付了。
+- **ERS**：trusted（1.0）。按 Rule 4 的定位，ERS 只回答「是否显著优于随机权重」，
+  **不能**作为通过依据；本变更的通过性由上面的 A/B 判定，故 ERS 不作为论据。
+
+### 53.4 覆盖与影响面：只有 7 只策略真正变化
+
+- **全扫**：59/59 配置化策略 + 9/9 静态模板。
+- **权重实际变化**：**仅 7 只** —— 六只 blend（cfsb / crb / cfsb-shield / cdhb / ccsb / gb）
+  加 `multi_strategy_alpha_book`，合计 **7,003 个 cells**，首次分歧日 `2023-05-17`。
+- **其余**：逐字节不变。这既说明谓词是「窄口径触发」，也说明 §52 的 opt-in 通道没有
+  被本节的行为变更污染。
+
+### 53.5 处置：按用户明示指令启用（2026-11-20）
+
+- **决定**：实证为负，但用户要求修复「目标 `0` 不落地」的行为缺陷，故**不设开关、无条件生效**。
+  这是**经用户批准的 Rule 9 例外**，不得据此推断该变更在风险调整后为正，也不得把它当作
+  其它负结果变更「翻案」的先例。
+- **保留的诚实证据**：§53.3 的五只负 ΔSharpe、主策略 **−4.61 pp** ΔCAGR、**+0.87/年**
+  换手、cdhb 折 2 / gb 折 13 的 MaxDD 恶化全部保留在案；ERS trusted 不作为通过依据（Rule 4）。
+- **零版本轴变动**：`common/position_policy.py` 没有版本常量
+  （`position_policy.py:41` 明确「Do not bump」），本节改动也不在
+  `pipeline/research/blend/blend_base.py`，故 `BASE_VERSION` 保持 **2.2.0**、六个 blend 子类
+  版本与 `strategies_config.json` 均未改动，未重跑 `--dump-strategies`。
+- **测试**：`common/tests/test_position_policy.py` 恢复 5 条具名单测
+  （`test_full_exit_subband_fires`、`test_partial_derisk_subband_still_frozen`、
+  `test_full_exit_respects_tenure_lock`、`test_emergency_full_exit_subband_fires`、
+  `test_nan_ideal_is_not_full_exit`），以及差分夹具里的
+  `_install_full_exit_rule_on_reference` 翻译钩子 —— 只对
+  `ideal <= 1e-4 and current > 1e-4` 的 cell 清零**参考臂**的带宽（那些 cell 的
+  `diff == -current <= -1e-4`，故 `diff <= -0.0` 恒真），等价于新谓词而非弱化断言；
+  240 种子差分夹具恢复全绿。
+- **保留**：§52 的窄口径 opt-in 通道（`forced_exits` / `forced_exit`，默认关闭、
+  默认 `False`/`None` 严格 no-op）不随本节改变。
+
+### 53.6 机制校正：带宽实际吞的是「非零部分减仓」，不是「零目标清仓」
+
+- **此前 §52.6 / 本节旧稿的措辞有误**。`walkforward_lifecycle_records.csv` **385,560 行**实测：
+  「模型目标精确为 `0` 且被惰性带拦下」的记录为 **0 行**。
+- 精确 `0` 目标实际走 `EXIT_CONFIRMING`（**3,398 行**）或 `TENURE_LOCKED`（**229 行**），
+  并不停在惰性带。
+- 带宽真正吞掉的是**非零部分减仓**：`INERTIA` 且 `delta_w < 0` 共 **18,183 行**，
+  持有中位 **9.49%**、`|Δw|` 中位 **3.90 pp**。
+- 但 `601857.SH` 案例又证明：即使目标为 `0`，确认期 / 持有期在**某些路径**下仍可能不落地。
+  因此「带宽只吞非零减仓」与「零目标必然落地」**两种极端都不成立**，必须按生命周期路径
+  分别判断 —— 这正是本谓词按用户指令无条件启用的原因：它只保证**惰性带**这条路径不再
+  吞掉零目标，确认期 / 持有期仍由既有闸门负责。
+
+## 54. blend 底座「行业存量保护」补动量资格线：负动量在位者不得续占推力槽（`BASE_VERSION 2.2.0 → 2.3.0`，2026-11-20）
+
+> **本节编号**：落笔前实测现有最高节号为 **53**（`grep -n '^## ' docs/version.md` 的最后一项），
+> 故本节取 **54**，只追加在文件末尾；§1–§53 一字未改。
+> **已知历史漂移（本节不传播）**：`docs/version.md` 第 28 行、第 76 行、第 323 行仍写着
+> `v1.4.0 [base: v2.0.0]`，那是 §46/§47 之前的旧快照。**当前真值**见本节 54.3 的版本轴表。
+
+### 54.1 变更类型与内容（无条件行为变更，无开关）
+
+- **位置**：`pipeline/research/blend/blend_base.py`，先发制人推力部署（pre-emptive thrust
+  deployment）里的「行业存量保护」（sector-incumbent protection）段。
+- **缺陷（2026-11-20 定位）**：`sec_incumbents` 名单只筛「同行业 + 上一根 bar 仍被持有
+  + 当前 `raw_w <= 0.01`」，**完全不看在位者自身的动量**；随后的保留分支用
+  `max(0.001, inc_roc)` 给负动量标的造出一个正分并 `sorted_cands.append(...)`，
+  于是 `r_val >= thrust_min_roc`（默认 0.01）这道门槛**对在位者根本不生效**。
+  `600362.SH` 在 2026-11-04 / 11-18 / 11-19 的 ROC10 分别为 **-11.99% / -10.42% / -13.02%**
+  （20 只里 rank **18–19**），仍持续占槽；实测一次
+  `alloc_desired = unallocated * (1/n_cands) = 0.21992992971784198 * 0.25 = 0.054982482429460494`。
+- **修复（一个谓词）**：名单推导追加
+  `and pd.notna(row_roc[s]) and float(row_roc[s]) >= incumbent_qualify_roc`；
+  `incumbent_qualify_roc = max(thrust_min_roc, 0.0)` 在参数读取处提前算好（每根 bar 只算一次，
+  不重复解析配置）。
+- **为什么是「从名单里剔除」而不是在保留分支里 `continue`**：`continue` 会把**挑战者一起跳过**
+  （挑战者本根 bar 就再也进不了 `sorted_cands`）；正确接缝是让名单变空 —— 名单为空时整个
+  `if cand not in held_incumbents and sec_incumbents:` 分支不执行，挑战者按正常路径被评估。
+- **NaN 语义**：`pd.notna` 显式判定，`NaN` 的 ROC **一律视为不合格**。不允许它经由
+  「比较恒为 False」「`inc_roc` 回退 0.0」这两条路径中的任何一条被放行。
+- **不变量**：`max(..., 0.0)` 让「负动量存量不得占槽」成为与配置符号无关的不变量 ——
+  即使有人把 `thrust_min_roc` 配成负数，也不会重新打开这个洞（负门槛只可能是误配）。
+- **不变的东西**：在位保护的**本意**（抑制换手：微弱的挑战者不该挤掉合格的在位者）原样保留；
+  `sector_incumbent_hurdle`、`max_assets_per_sector`、`thrust_incumbent_bonus`、
+  `asset_emergency_df` 的写入、§52 的 `forced_exits` 通道、§53 的 `is_full_exit` 谓词全部未动。
+
+### 54.2 为什么是 minor 而不是 patch / major（AGENTS.md 第 7 条）
+
+- **为什么不是 patch**：这是一次**无条件**的行为变更 —— 没有任何开关能兜住它，
+  在「某根 bar 上存在不合格在位者且同行业有合格挑战者」的情形下**交付权重会变**。
+- **为什么是 minor**：`generate_weights` 的签名、稀疏权重契约、`common.position_policy` 的
+  惯性核契约**全部未变**；**没有新增任何参数键**（ honoured 参数面不变）；「谁来写这一行账」
+  没有变化，同 major 的 `prior_state` 仍可采纳（`scripts/live_preflight.py::select_prior_state`
+  只比较 major，见 §47.3 的 `NV8`）。相对 §52 的 opt-in 规则，这里只是把**已存在的**一条保留
+  路径收窄。
+- **为什么不是 major**：引擎契约不变，状态布局不变，实盘 prior-state 兼容。
+- **同步项**：六个 blend 子类各追加一条 2026-11-20 版本沿革注释并升 minor；
+  三处版本门禁断言同步；`results/strategy_dumps/*.json` 重新 dump（目录被
+  `.gitignore:14 **/results/strategy_dumps/` 忽略）。
+
+### 54.3 版本轴（AGENTS.md 第 7 条）
+
+| 轴 | 旧 | 新 | 理由 |
+| :--- | :---: | :---: | :--- |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.2.0` | **`2.3.0`** | **minor**：无条件行为变更（保留名单收窄），无新参数面、无契约变更 |
+| `ChanFourStateBlendStrategy.version` | `1.7.0` | **`1.8.0`** | 同上（同轴 minor，§47.3 / §52.2 先例） |
+| `ChanRiskManagedBlendStrategy.version` | `1.3.0` | **`1.4.0`** | 同上 |
+| `ChanCrisisShieldBlendStrategy.version` | `1.2.0` | **`1.3.0`** | 同上 |
+| `ChanFourStateShieldBlendStrategy.version` | `1.2.0` | **`1.3.0`** | 同上 |
+| `ChanDualHybridBlendStrategy.version` | `1.2.0` | **`1.3.0`** | 同上 |
+| `GenericBlendStrategy.version` | `1.2.0` | **`1.3.0`** | 同上 |
+
+- **dump 复生成结果**：`cd pipeline && uv run python research_strategy/run_research_strategy.py
+  --dump-strategies` 后，59 个 dump 中**仅 6 个 blend dump 变化**，且逐键比对后
+  **只有** `strategy_version` / `base_version` / `composite_version` / 子策略
+  `version`、`base_version` 字段变化，**无任何权重、参数或 sub_strategies 结构变化**。
+- **同步的测试**：`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、
+  `common/tests/test_strategy_versioning.py`、`pipeline/research_strategy/tests/test_blend_policy_kernel.py`。
+
+### 54.4 探针与被修复的行为（AGENTS.md Rule 10：定向单腿测量）
+
+夹具（100% 合成、离线）：金属行业在位者 `600362.SH`（只由 blend 自己持有；其子策略在
+`_SECTOR_DROP_BAR` 撤回后 `raw_w` 塌到 0，而交付账簿因惯性/持有期仍持有它 —— 正是名单
+要检视的「blend 独有、当前理想权重已塌陷」状态）、金属行业挑战者 `601899.SH`
+（ROC10 = **+1.207% ≥ 0.01**，且落在 `inc_roc + 0.03` 之内）、四只上涨填充标的与现金腿 `BIL`。
+
+- **探针 1（负动量在位者）**：`600362.SH` 的 ROC10 = **-0.9955%**（< 0.01，不合格）。
+  - **修复前**（pin 住的 `6adb67e:pipeline/research/blend/blend_base.py`）：保留分支把槽位判给
+    `600362.SH`（得分 `max(0.001, -0.00996) × 1.2 = 0.0012`），`2020-04-08` 那一行
+    `601899.SH` 的稀疏权重 = **0.0**；在位者被再填入的部署目标约 **0.0303**，
+    但因其交付权重已是 0.05、减少 1.97pp 落在自适应卖出带宽（约 0.0596）之内而被吞掉，
+    交付权重仍为 **0.05**。
+  - **修复后**：同一根 bar 上 `600362.SH` 不再被重填（稀疏值维持 **0.05**，全程未超过它），
+    `601899.SH` 取得 **0.030317460126251194**，dense 首次 > 0 的日期 = **2020-04-08**。
+  - **判别性**：这个 cell 的差异**就是被研究的量本身**（谁拿到该行业槽位），不是代理量；
+    合格挑战者从 0.0 变为 0.0303，不合格在位者从「被再填 0.0303」变为 0.0。
+- **探针 2（合格在位者，无换手回归）**：`600362.SH` 的 ROC10 = **+1.005%**（≥ 0.01 合格），
+  且被 `blend_require_asset_trend` 挡在候选名单之外（价格低于 SMA50，比值 0.814），
+  因此「行业名单」是它拿到槽位的唯一路径。修复前后**逐格相同**（同 index、同列序、
+  同 `NaN` 足迹、`max_abs_diff == 0.0`），在位者保持 **0.20** 的交付权重，挑战者**全程 0.0**。
+- **探针 3（NaN ROC）**：在落槽 bar 前 10 根注入一个 `NaN` 收盘价，使该 bar 的 ROC10 恰为 `NaN`。
+  修复前 `inc_roc` 回退到 0.0 → 保留分支成立 → 挑战者 **0.0**；修复后挑战者
+  **0.030317460126251194**，在位者不再被重填。
+- **探针 4（负门槛配置）**：`blend_thrust_min_roc = -0.5` 与 `= 0.0` 两臂**逐格相同**
+  （`assert_frame_equal(check_exact=True)`），两臂挑战者都取得槽位 —— 若没有 `max(..., 0.0)`
+  地板，`-0.5` 臂会把 -1% 的在位者放进名单并跳过挑战者，两臂必然分叉。
+
+**A/B 状态见 §54.5（定向单腿测量，非全局 14 折；依据 AGENTS Rule 10）。**
+
+### 54.5 A/B 状态：待执行（不伪造证据）
+
+- 本轮只做实现 + 单元测试 + 版本轴，**未做任何 walkforward A/B**：按 Rule 10，全局 14 折 A/B
+  会被无关标的的成交淹没，无法裁决「负动量在位者是否占槽」这个单一机制；
+  定向单腿测量由后续独立任务产出，届时补记在本节（**不**用「测不准」替代「没测量」）。
+- 因此本节不给出任何 ΔSharpe / ΔCAGR 结论；`strategies_config.json` **未**写入任何新键
+  （本次无新键），实盘与既有回测的其它参数不受影响。
+
+### 54.6 验证与边界
+
+- **定向门禁**（`--import-mode=importlib`，100% 合成数据、无网络）：
+  `test_blend_incumbent_requalification.py`（含 4 条新测）+ `test_blend_strategy_versioning.py`
+  + `common/tests/test_strategy_versioning.py` = **20 passed**。
+- **整个 research_strategy 测试目录**：**646 passed, 1 xfailed**（约 7 分 48 秒）。
+- **未动**：`common/position_policy.py`、`common/position_lifecycle.py`、
+  `scripts/run_live_strategy.py`、六个子类的**逻辑**（只改 `version` 与沿革注释）、
+  `strategies_config.json`；`chan_four_state_blend` 的
+  `blend_weighting_mode="regime_ic_ir_hybrid"` 保持不动（§8 的已记录例外）。
+- **未变的行为面**：`sector_incumbent_hurdle` 的挑战者罚则、行业上限准入、Pass 1/Pass 2 分配、
+  §52 的三个 opt-in 键、§53 的 `is_full_exit` 全部原样；
+  唯一变化是「不合格的在位者不再出现在保留名单里」。
