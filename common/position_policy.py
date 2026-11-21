@@ -146,7 +146,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import numpy as np
 import pandas as pd
@@ -701,6 +701,7 @@ class AssetPolicy:
         last_buy_bar: Dict[str, int],
         symbol_emergency: bool = False,
         is_global_emergency: bool = False,
+        forced_exit: Optional[Set[str]] = None,
     ) -> Decision:
         """One symbol's contribution to one inertia bar.
 
@@ -731,6 +732,17 @@ class AssetPolicy:
         `last_buy_bar[symbol]` are updated in the caller's dicts (that is the
         reference's contract -- they must survive across bars). `current_w` /
         `ideal_w` / `ctx` are never mutated.
+
+        `forced_exit` is the OPT-IN forced-exit channel (blend incumbent
+        re-qualification, `BASE_VERSION 2.2.0`): a container of symbols that a
+        caller has ALREADY decided to release on THIS bar. Membership makes the
+        symbol a sell candidate even when `diff` never clears the adaptive band
+        (`thresh * asymmetric_sell_ratio`), and bypasses the `min_holding_bars`
+        tenure suppressions exactly like `symbol_emergency` does -- reusing the
+        same `in_sells` path rather than zeroing `sell_thresh` (which would
+        change every OTHER symbol's band on the bar). The default `None` is a
+        strict no-op: `symbol in None` is never evaluated because the test is
+        guarded, so every pre-existing decision is unchanged.
         """
         bar_index = int(ctx.bar_index)
         current = float(current_w[symbol])
@@ -786,12 +798,37 @@ class AssetPolicy:
         detail["diff"] = float(diff)
         detail["desired_inc"] = max(0.0, ideal - current)
 
+        # The forced-exit channel is consulted as a MEMBERSHIP test on the
+        # caller's set, never by zeroing `sell_thresh`: zeroing the band would
+        # also make every OTHER symbol on the bar a sell candidate. `None` is
+        # short-circuited first so the default path evaluates exactly the same
+        # predicate as before.
+        _is_forced_exit = bool(forced_exit is not None and symbol in forced_exit)
+        if _is_forced_exit:
+            # Only an opt-in artefact: the detail dict is what parity/live tests
+            # diff, so the key must be ABSENT when the channel is unused.
+            detail["forced_exit"] = True
+
+        # 用户指令（2026-11-20）要求「目标为 0 必须卖，不论变动是否超过 5%」：自适应卖出
+        # 带宽只应抑制「非零小幅减仓」，清仓是二元移除决策，不能被当成减仓抖动吞掉。
+        # 此前回滚是因为全局 A/B 为负（docs/version.md §53.3 保留全部负数证据），本次为
+        # 用户明示启用的无条件行为变更 —— 不设开关、无默认关闭态，也不得据此推断风险调整后为正。
+        # 现金腿不会到达本谓词：两个调用方传入的 `risky_symbols` 都已排除 `cash_proxy`。
+        is_full_exit = (ideal <= 1e-4) and (current > 1e-4)
+
         in_sells = False
-        is_sell_candidate = bool(diff <= -sell_thresh)
+        _band_sell = bool(diff <= -sell_thresh)
+        is_sell_candidate = _band_sell or is_full_exit or _is_forced_exit
+        if is_full_exit and not _band_sell and not _is_forced_exit:
+            # Only the new term made this a candidate: write the key only here so
+            # every unchanged run stays byte-identical in `detail`.
+            detail["full_exit"] = True
         detail["sell_candidate"] = is_sell_candidate
         if is_sell_candidate:
-            if symbol_emergency:
+            if symbol_emergency or _is_forced_exit:
                 # Per-symbol emergency is a sell bypass -- it never blocks one.
+                # A forced exit reuses the SAME path (it must not be tenure-
+                # lockable: the caller already decided the release this bar).
                 in_sells = True
             elif cfg.min_holding_bars > 0:
                 if holding_age[symbol] < cfg.min_holding_bars:
@@ -859,6 +896,7 @@ class AssetPolicy:
         raw_target_weight: float,
         ctx: PolicyContext,
         cfg: PositionPolicyConfig,
+        forced_exit: bool = False,
     ) -> Decision:
         """One bar of the 6-state lifecycle ladder, in the design §5 gate order.
 
@@ -873,6 +911,12 @@ class AssetPolicy:
              `next_state=COOLDOWN`, `asset_stop_cooldown_bars`; it bypasses BOTH
              the tenure lock and inertia (a T+1 lock must never convert a bounded
              stop into an unbounded tail loss -- the 2026-10-22 incident);
+          1c. forced-exit channel -- OPT-IN (`forced_exit=True` from a caller that
+             already decided the release this bar). Placed between the
+             "nothing was evaluated" prefix and the stop path: a FORCED SELL at
+             `0.0` of a held state, bypassing the inertia band and the tenure
+             lock, never firing on a closed market or a missing price. Default
+             `False` is a strict no-op;
           2b. two-day structural breakdown confirmation -- OPT-IN, default OFF
              (`two_day_breakdown_rule`); evaluated only for held states, below
              the stop fast path. Not entered at all while the flag is False (see
@@ -958,6 +1002,51 @@ class AssetPolicy:
         loss_pct = 0.0
         trailing_stop = -float("inf")
         is_stop = False
+
+        # ---- gate 1c: forced exit (OPT-IN channel, default inert) ----------
+        # `forced_exit=True` is set by a caller that has ALREADY decided, on this
+        # bar, that the position must be released (blend incumbent
+        # re-qualification, `BASE_VERSION 2.2.0`). It is a MODEL-signal exit, so
+        # it is tenure-lockable in principle -- but the whole point of the
+        # channel is that the decision was already made upstream, so it bypasses
+        # `min_holding_bars` exactly like the stop fast path (gate 2) does. It
+        # cannot fire on a closed market or a missing price: both "nothing was
+        # evaluated" prefixes returned above, and a broker T+1 freeze must not be
+        # converted into a same-day liquidation.
+        #
+        # `forced_exit=False` (the default) never enters this branch, so every
+        # pre-existing decision is unchanged.
+        if forced_exit and st.state in (
+            PositionState.HELD_GESTATION,
+            PositionState.HELD_ACTIVE,
+            PositionState.PENDING_EXIT,
+        ):
+            st.state = PositionState.COOLDOWN
+            st.cooldown_remaining = cfg.asset_stop_cooldown_bars
+            st.last_exit_type = ExitType.NORMAL.value
+            st.last_exit_price = float(ctx.price)
+            detail = {
+                "forced_exit": True,
+                "current_price": ctx.price,
+                "current_weight": float(st.current_weight),
+                "raw_target_weight": float(raw_target_weight),
+                "held_bars": int(st.held_bars),
+                "min_holding_bars": cfg.min_holding_bars,
+            }
+            st.held_bars = 0
+            st.entry_streak = 0
+            st.exit_streak = 0
+            st.entry_price = 0.0
+            st.peak_price = 0.0
+            st.current_weight = 0.0
+            return _decision(
+                PolicyAction.SELL,
+                0.0,
+                "强制退出通道：资格失效即时平仓 (不受惰性带宽与最低持仓期限约束)",
+                state_before=state_before,
+                state=st,
+                detail=detail,
+            )
 
         # ---- gate 2: stop / emergency fast path (held states only) --------
         if st.state in (
@@ -1730,6 +1819,7 @@ class PortfolioSequencer:
         cfg: PositionPolicyConfig,
         cash_proxy: Optional[str] = "CASH",
         em_row: Optional[Union[bool, pd.Series]] = None,
+        forced_exits: Optional[Set[str]] = None,
     ) -> pd.Series:
         """Advance one bar and return the committed weight row.
 
@@ -1764,6 +1854,11 @@ class PortfolioSequencer:
              threshold writes the old weight back explicitly;
           8. route the residual `1 - sum(risky)` into `cash_proxy`, only when that
              column actually exists.
+
+        `forced_exits` (OPT-IN, default `None` = strict no-op) is forwarded to
+        every `inertia_step` as the same per-bar container. A sell it produces
+        still lands as `new_w[s] = ideal_w[s]`, i.e. the caller's explicit `0.0`
+        (never a `NaN`, per the sparse-weights contract).
         """
         # (2) emergency classification is joint: "all symbols halted" is a
         # property of the row, not of any single symbol.
@@ -1821,6 +1916,7 @@ class PortfolioSequencer:
                 last_buy_bar=last_buy_bar,
                 symbol_emergency=symbol_emergency[s],
                 is_global_emergency=is_global_emergency,
+                forced_exit=forced_exits,
             )
 
         # (3) Pass-through of the ideal row, byte-for-byte (NaN cells included).

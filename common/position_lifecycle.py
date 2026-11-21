@@ -75,7 +75,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -708,6 +708,7 @@ def step_position_lifecycle(
     vwap20: Optional[float] = None,
     vol_ma20: Optional[float] = None,
     val: Optional[float] = None,
+    forced_exits: Optional[Set[str]] = None,
 ) -> LifecycleDecision:
     """Transitions an asset's position lifecycle state for a single bar.
 
@@ -741,6 +742,14 @@ def step_position_lifecycle(
             gate 2b's `min(MA20, VAL)` floor. Only ever a pass-through from the
             caller's own frame -- there is no derivation here, and `None` simply
             leaves the floor at MA20 alone.
+        forced_exits: OPT-IN container of symbols the CALLER has already decided
+            to release on this bar (blend incumbent re-qualification,
+            `BASE_VERSION 2.2.0`). Membership is forwarded to the kernel as
+            `forced_exit=True`, which makes the symbol a sell candidate without
+            clearing the inertia band and bypasses the tenure lock. This is a
+            PER-BAR set (one entry point sees one bar), so `simulate_`'s
+            per-date mapping resolves it into one set per bar before calling
+            here. `None` (the default) is a strict no-op.
 
     Returns:
         LifecycleDecision containing actionable target weight, trade action,
@@ -791,6 +800,10 @@ def step_position_lifecycle(
             is_portfolio_deleverage=is_portfolio_deleverage,
         ),
         position_policy_config_from_lifecycle(cfg),
+        # Membership, not equality: the caller's per-bar container is handed
+        # straight through. `None` short-circuits to False, keeping the default
+        # path byte-identical.
+        forced_exit=bool(forced_exits is not None and getattr(state, "symbol", None) in forced_exits),
     )
     return _decision_to_lifecycle(kernel_decision, state, state_before)
 
@@ -1347,6 +1360,35 @@ def _reentry_vwap_lookback(cfg: Any) -> int:
     return max(lookback, 1)
 
 
+def _forced_exits_for_bar(
+    forced_exits: Optional[Union[Dict[Any, Set[str]], pd.Series]],
+    t: Any,
+) -> Optional[Set[str]]:
+    """Resolve one bar's forced-exit container. `None` in / `None` out.
+
+    Accepts a `dict` or a `pd.Series` keyed by the bar timestamp. A missing key,
+    a `None` / NaN value, or a value that cannot be turned into a set all decode
+    to `None`, i.e. "no forced exit on this bar" -- never to an empty-but-active
+    channel and never to a fabricated symbol.
+    """
+    if forced_exits is None:
+        return None
+    try:
+        value = forced_exits.get(t)
+    except AttributeError:
+        return None
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {value}
+    try:
+        resolved = set(value)
+    except TypeError:
+        # A scalar NaN / a non-iterable placeholder: no instruction, not "all".
+        return None
+    return resolved or None
+
+
 def simulate_position_lifecycle(
     universe: Dict[str, pd.DataFrame],
     target_weights: pd.DataFrame,
@@ -1358,6 +1400,7 @@ def simulate_position_lifecycle(
     ma20_volumes: Optional[pd.DataFrame] = None,
     market_breadths: Optional[pd.Series] = None,
     atrs: Optional[pd.DataFrame] = None,
+    forced_exits: Optional[Union[Dict[Any, Set[str]], pd.Series]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """Pure causal simulation of position lifecycle state machine across time.
 
@@ -1396,6 +1439,14 @@ def simulate_position_lifecycle(
     live runner calls, so the two engines cannot disagree on a trigger. The
     anchors are inert while the two gates are OFF (their defaults); they move a
     number only for a cfg that opts in.
+
+    `forced_exits` (OPT-IN, default `None` = strict no-op) is a per-DATE mapping
+    -- a `dict` or a `pd.Series` keyed by the bar's timestamp whose value is the
+    container of symbols the caller has already decided to release on THAT bar
+    (blend incumbent re-qualification, `BASE_VERSION 2.2.0`). Each bar's set is
+    forwarded to `step_position_lifecycle`, which turns membership into the
+    kernel's `forced_exit` channel. A missing date, a `None` value or a `None`
+    mapping all resolve to "no forced exit on this bar".
     """
     if cfg is None:
         cfg = resolve_position_lifecycle_config()
@@ -1498,6 +1549,8 @@ def simulate_position_lifecycle(
 
     for t in target_weights.index:
         decisions: Dict[str, LifecycleDecision] = {}
+        # OPT-IN forced-exit channel: this bar's set, or `None` (strict no-op).
+        bar_forced_exits = _forced_exits_for_bar(forced_exits, t)
         for sym in risky_symbols:
             st = states[sym]
             tgt_w = float(raw_targets.loc[t, sym]) if (t in raw_targets.index and sym in raw_targets.columns) else 0.0
@@ -1577,6 +1630,7 @@ def simulate_position_lifecycle(
                 vwap20=ctx_values["vwap20"],
                 vol_ma20=ctx_values["vol_ma20"],
                 val=ctx_values["val"],
+                forced_exits=bar_forced_exits,
             )
             decisions[sym] = dec
 

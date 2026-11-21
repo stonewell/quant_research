@@ -141,8 +141,76 @@ def _legacy_apply_asset_inertia():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # The pinned blob predates the live full-exit predicate; translate it BEFORE
+    # any comparison (see the function's docstring for why this is equivalent).
+    _install_full_exit_rule_on_reference(module)
     _LEGACY_MODULE = module
     return module.apply_asset_inertia
+
+
+def _install_full_exit_rule_on_reference(module) -> None:
+    """Translate the pinned reference to the LIVE full-exit rule, in place.
+
+    `ab82318` predates the `is_full_exit` predicate (user instruction 2026-11-20),
+    so its `sells_raw` predicate is `diff <= -sell_thresh` only: a sub-band target
+    of `0` freezes there while the kernel now sells it. The translation is EXACTLY
+    the new term and nothing else -- the reference's own sell band is zeroed for
+    those symbols, and only those, whose cell is a full exit
+    (`ideal <= 1e-4 and current > 1e-4`). That is equivalent, not a weakening:
+
+      * for a full-exit cell `diff == ideal - current == -current <= -1e-4`, so
+        `diff <= -0.0` is True -- the cell becomes a candidate exactly when
+        `is_full_exit` is True;
+      * every other cell keeps its own band (`thresh_t` is copied per bar), so a
+        NON-ZERO trim/derisk is still filtered by the reference's original
+        predicate -- the band is not globally cleared;
+      * the zeroed band also lowers `buy_thresh` for those symbols, which is
+        inert: a full-exit cell's `diff < 0` can never satisfy
+        `diff >= buy_thresh`.
+
+    The tenure suppression below `sells_raw` is untouched, so the reference still
+    reproduces the kernel's ordering: bypass the band, NOT the tenure lock.
+    """
+    original = module._step_asset_inertia
+
+    def _step_asset_inertia_with_full_exit(
+        t,
+        ideal_w,
+        current_w,
+        risky_symbols,
+        symbols,
+        thresh_t,
+        holding_age,
+        last_buy_bar,
+        cash_proxy="CASH",
+        em_row=None,
+        asymmetric_sells=False,
+        entry_threshold=None,
+        min_holding_bars=0,
+        asymmetric_sell_ratio=0.60,
+    ):
+        full_exit = (ideal_w[risky_symbols] <= 1e-4) & (current_w[risky_symbols] > 1e-4)
+        if bool(full_exit.any()):
+            thresh_t = thresh_t.copy()
+            thresh_t[full_exit[full_exit].index] = 0.0
+        return original(
+            t=t,
+            ideal_w=ideal_w,
+            current_w=current_w,
+            risky_symbols=risky_symbols,
+            symbols=symbols,
+            thresh_t=thresh_t,
+            holding_age=holding_age,
+            last_buy_bar=last_buy_bar,
+            cash_proxy=cash_proxy,
+            em_row=em_row,
+            asymmetric_sells=asymmetric_sells,
+            entry_threshold=entry_threshold,
+            min_holding_bars=min_holding_bars,
+            asymmetric_sell_ratio=asymmetric_sell_ratio,
+        )
+
+    module._step_asset_inertia = _step_asset_inertia_with_full_exit
 
 
 
@@ -717,6 +785,157 @@ def test_last_buy_bar_resets_only_on_a_full_exit():
                {"AAA": 0.40, "BBB": 0.0, "CASH": 0.60}, exited)
     assert out["AAA"] == 0.0
     assert exited["AAA"] == -999
+
+
+# ---------------------------------------------------------------------------
+# B7b. The full-exit predicate (`is_full_exit`) -- 清仓不受卖出带宽约束
+# ---------------------------------------------------------------------------
+# 用户指令（2026-11-20）要求「目标为 0 必须卖，不论变动是否超过 5%」：自适应卖出带宽
+# 只应抑制「非零小幅减仓」，清仓是二元移除决策。这五条测试钉住内核行为本身，以及三条
+# 边界：非零小幅减仓仍然冻结、持有期锁仍然生效（带宽不是期限锁的旁路）、NaN 目标
+# 不是清仓。§53.3 的 Rule 9 A/B 为负，本节为用户明示启用的行为变更。
+
+
+def _full_exit_cfg(**overrides):
+    """0.10 threshold with the tight asymmetric band: 0.10 × 0.60 = 0.06.
+
+    Every case below holds 5.4982%, so a full exit's drop (5.4982 pp) stays
+    strictly BELOW the 6.0 pp band -- the exact shape the predicate exists for.
+    """
+    return PositionPolicyConfig(asymmetric_sells=True, asymmetric_sell_ratio=0.60, **overrides)
+
+
+def _inertia_decision(ideal, current, *, cfg=None, symbol="AAA", **kwargs):
+    holding_age = kwargs.pop("holding_age", {symbol: 10})
+    last_buy_bar = kwargs.pop("last_buy_bar", {symbol: -999})
+    return AssetPolicy().inertia_step(
+        symbol,
+        pd.Series({symbol: ideal}),
+        pd.Series({symbol: current}),
+        0.10,
+        cfg if cfg is not None else _full_exit_cfg(),
+        ctx=PolicyContext(bar_index=10),
+        holding_age=holding_age,
+        last_buy_bar=last_buy_bar,
+        **kwargs,
+    )
+
+
+def test_full_exit_subband_fires():
+    """目标 `0`、仓位低于带宽：仍然 SELL，并只在 `full_exit` 项生效时标注 detail。"""
+    decision = _inertia_decision(0.0, 0.054982)
+    # The shape under test: the drop is real but SMALLER than the sell band.
+    assert decision.detail["sell_thresh"] == pytest.approx(0.06)
+    assert decision.detail["diff"] == pytest.approx(-0.054982)
+    assert decision.detail["diff"] > -decision.detail["sell_thresh"]
+
+    assert decision.detail["sell_candidate"] is True
+    assert decision.detail["full_exit"] is True
+    assert decision.action == PolicyAction.SELL
+    assert decision.target_weight == 0.0
+
+    # A band sell (the pre-existing term) must NOT grow the extra detail key.
+    band_sell = _inertia_decision(0.20, 0.40)
+    assert band_sell.detail["diff"] < -band_sell.detail["sell_thresh"]
+    assert band_sell.action == PolicyAction.SELL
+    assert "full_exit" not in band_sell.detail
+
+
+def test_partial_derisk_subband_still_frozen():
+    """带宽只抑制非零小幅减仓：5.4982% → 3.00% 仍然 `HOLD_FILTERED` / `INERTIA`。"""
+    decision = _inertia_decision(0.03, 0.054982)
+    assert decision.detail["diff"] == pytest.approx(-0.024982)
+    assert decision.detail["sell_candidate"] is False
+    assert "full_exit" not in decision.detail
+    assert decision.action == PolicyAction.HOLD_FILTERED
+    assert decision.blocking_reason is BlockingReason.INERTIA
+    assert decision.target_weight == pytest.approx(0.054982)
+
+
+def test_full_exit_respects_tenure_lock():
+    """清仓绕过带宽，但不绕过持有期锁：年轻仓位上的 `0` 目标仍被拦下。"""
+    locked = _inertia_decision(
+        0.0,
+        0.054982,
+        cfg=_full_exit_cfg(min_holding_bars=5),
+        holding_age={"AAA": 2},
+    )
+    assert locked.detail["sell_candidate"] is True
+    assert locked.detail["full_exit"] is True
+    assert locked.detail["tenure_suppressed"] == "holding_age"
+    assert locked.action == PolicyAction.HOLD_FILTERED
+    assert locked.blocking_reason is BlockingReason.TENURE_LOCKED
+    assert locked.target_weight == pytest.approx(0.054982)
+
+    # Control: the same bar with the lock elapsed sells to 0.0.
+    released = _inertia_decision(
+        0.0,
+        0.054982,
+        cfg=_full_exit_cfg(min_holding_bars=5),
+        holding_age={"AAA": 5},
+    )
+    assert released.action == PolicyAction.SELL
+    assert released.target_weight == 0.0
+
+
+def test_emergency_full_exit_subband_fires():
+    """Symbol-level emergency bypasses the tenure lock; the band term is irrelevant."""
+    decision = _inertia_decision(
+        0.0,
+        0.054982,
+        cfg=_full_exit_cfg(min_holding_bars=5),
+        holding_age={"AAA": 0},
+        symbol_emergency=True,
+    )
+    assert decision.detail["full_exit"] is True
+    assert decision.detail["sell_candidate"] is True
+    assert decision.action == PolicyAction.SELL
+    assert decision.target_weight == 0.0
+
+
+def test_nan_ideal_is_not_full_exit():
+    """`NaN <= 1e-4` is False: a missing target is "no instruction", never a close."""
+    nan = float("nan")
+
+    # -- symbol level -------------------------------------------------------
+    decision = _inertia_decision(nan, 0.054982)
+    assert decision.detail["sell_candidate"] is False
+    assert "full_exit" not in decision.detail
+    assert decision.action == PolicyAction.HOLD_FILTERED
+    assert decision.target_weight == pytest.approx(0.054982)
+
+    # -- panel level --------------------------------------------------------
+    # Bar 0 is the seed; bar 1's NaN `ideal` cell must be CARRIED at the held
+    # weight, never rewritten as an explicit `0.0` (a fabricated liquidation).
+    index = pd.bdate_range("2024-08-01", periods=2)
+    daily = pd.DataFrame(
+        {"AAA": [0.054982, nan], "CASH": [0.945018, nan]}, index=index
+    )
+    got = kernel_apply_asset_inertia(
+        daily,
+        min_weight_change=0.10,
+        asymmetric_sells=True,
+        asymmetric_sell_ratio=0.60,
+    )
+    assert got["AAA"].iloc[1] == pytest.approx(0.054982)
+    assert not (got["AAA"].iloc[1] == 0.0)
+
+    # Same with a SIBLING trade on the bar, so the row really is rewritten: the
+    # NaN cell still keeps its held weight while the sibling's buy commits.
+    mixed = pd.DataFrame(
+        {"AAA": [0.054982, nan], "BBB": [0.20, 0.30], "CASH": [0.745018, 0.70]},
+        index=index,
+    )
+    mixed_out = kernel_apply_asset_inertia(
+        mixed,
+        min_weight_change=0.02,
+        asymmetric_sells=True,
+        asymmetric_sell_ratio=0.60,
+    )
+    assert mixed_out["AAA"].iloc[1] == pytest.approx(0.054982)
+    assert not (mixed_out["AAA"].iloc[1] == 0.0)
+    assert mixed_out["BBB"].iloc[1] == pytest.approx(0.30)  # sibling really traded
+    assert mixed_out["AAA"].iloc[1] != 0.0
 
 
 def test_buy_priority_and_capacity_ceiling():

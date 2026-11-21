@@ -1392,6 +1392,68 @@ def test_resolver_accepts_live_keys_as_aliases_of_the_lifecycle_prefix():
     ).stop_cooldown_bars == 6
 
 
+def test_forced_exits_simulator_exits_sub_band_position_and_none_is_noop():
+    """`simulate_position_lifecycle(forced_exits=...)` reaches the policy per bar.
+
+    THE SWALLOW THIS PINS (2026-11-20 audit, §16.15.16 family). The position is
+    opened at 5%, the target goes to 0.0, and the exit band is 6%: `delta_w` is
+    -0.05 against a 0.06 band, so the sell is never even a CANDIDATE and the
+    engine keeps holding. A `forced_exits` set containing the symbol on that bar
+    must release it as an explicit `0.0`; `None` must leave the frame and the
+    decisions byte-identical.
+    """
+    from common.position_lifecycle import simulate_position_lifecycle
+    from common.testing import make_ohlcv_from_closes as make_df
+
+    dates = pd.bdate_range("2020-01-01", periods=8)
+    universe = {"A": make_df([100.0] * 8, start="2020-01-01")}
+    weights = pd.DataFrame(np.nan, index=dates, columns=["A"])
+    weights.loc[dates[0], "A"] = 0.05      # enter at 5%
+    weights.loc[dates[4], "A"] = 0.0       # ONE bar of zero target
+    weights.loc[dates[5]:, "A"] = 0.05     # model re-targets the same 5%
+
+    cfg = PositionLifecycleConfig(
+        guard_latency_bars=2,                # one zero bar is not an exit
+        min_holding_bars=1,
+        normal_cooldown_bars=1,
+        stop_cooldown_bars=1,
+        inertia_threshold=0.06,              # the adaptive band that swallows -0.05
+        min_entry_threshold=0.01,            # ...but a 5% entry still clears gate 4
+    )
+
+    # (1) NO forced exits: the 5% drop never clears the 6% band -> still held.
+    baseline, baseline_records = simulate_position_lifecycle(universe, weights, cfg=cfg)
+    book = baseline.ffill().fillna(0.0)
+    assert float(book["A"].iloc[-1]) == pytest.approx(0.05), "the sub-band sell should be swallowed"
+
+    # (2) `forced_exits=None` is a strict no-op: byte-identical frame + records.
+    none_frame, none_records = simulate_position_lifecycle(
+        universe, weights, cfg=cfg, forced_exits=None
+    )
+    pd.testing.assert_frame_equal(baseline, none_frame, check_exact=True)
+    assert none_records == baseline_records
+
+    # (3) A forced exit on bar 4 releases the position as a concrete 0.0.
+    forced, forced_records = simulate_position_lifecycle(
+        universe, weights, cfg=cfg, forced_exits={dates[4]: {"A"}}
+    )
+    assert not pd.isna(forced.loc[dates[4], "A"]), "Rule 3: an exit is a 0.0 row, never NaN"
+    assert float(forced.loc[dates[4], "A"]) == 0.0
+    forced_book = forced.ffill().fillna(0.0)
+    baseline_book = baseline.ffill().fillna(0.0)
+    assert float(forced_book["A"].iloc[4]) == 0.0
+    assert float(forced_book["A"].iloc[5]) == 0.0   # stays released on the next bar
+    assert float(baseline_book["A"].iloc[4]) == pytest.approx(0.05)  # the swallow
+    sell = [r for r in forced_records if r["date"] == str(dates[4]) and r["symbol"] == "A"]
+    assert sell and sell[0]["action"] == "SELL"
+
+    # (4) A mapping that never names this symbol is inert.
+    off_date, _ = simulate_position_lifecycle(
+        universe, weights, cfg=cfg, forced_exits={dates[6]: {"ZZZ"}}
+    )
+    assert float(off_date.ffill().fillna(0.0)["A"].iloc[-1]) == pytest.approx(0.05)
+
+
 def test_simulate_position_lifecycle_warns_once_when_cash_proxy_is_not_in_the_universe():
     """F5: a cash_proxy outside the universe is DISCLOSED, not silently inert.
 
