@@ -6897,6 +6897,24 @@ def main(cli_args: Optional[List[str]] = None):
     latest_rebal_date = rebalances.index[-1].strftime("%Y-%m-%d")
     current_targets = rebalances.iloc[-1].fillna(0.0)
 
+    # (2026-11-20, `BASE_VERSION 2.2.0`) OPT-IN forced-exit side channel.
+    # The blend engine publishes `_last_forced_exits` (a `dict[Timestamp, set]`)
+    # ONLY when `enable_incumbent_requalification` is on; every other strategy --
+    # and any blend with the flag off -- simply does not expose the attribute, so
+    # `getattr` returns `None` and NOTHING below changes. Keep it a side channel:
+    # `generate_weights`' return type must stay the sparse-weights frame.
+    #
+    # The set is keyed by the rebalance date whose row the ticket is built from:
+    # that is the bar on which the engine wrote the explicit `0.0`, so the same
+    # date is the only one that can authorise a same-bar forced sell.
+    _last_forced_exits = getattr(template, "_last_forced_exits", None)
+    live_forced_exits = None
+    if _last_forced_exits:
+        try:
+            live_forced_exits = _last_forced_exits.get(rebalances.index[-1]) or None
+        except Exception:  # pragma: no cover - defensive: never fail a live run on this
+            live_forced_exits = None
+
     # ------------------------------------------------------------------ #
     # (`R6`, rule r6.3) OVERNIGHT DE-RISKING -- decided here, applied here
     # ------------------------------------------------------------------ #
@@ -7869,6 +7887,9 @@ def main(cli_args: Optional[List[str]] = None):
                 vwap20=anchor_ctx["vwap20"],
                 vol_ma20=anchor_ctx["vol_ma20"],
                 val=anchor_ctx["val"],
+                # OPT-IN forced-exit channel (`None` for every non-blend strategy
+                # and for a blend with the rule off -- a strict no-op).
+                forced_exits=live_forced_exits,
             )
 
             action = decision.action
@@ -8340,10 +8361,24 @@ def main(cli_args: Optional[List[str]] = None):
         # silent. `raw_tgt_w` is AUDIT-ONLY: it never enters trade_val /
         # delta_shares / any order field (grep: the variable is read solely here
         # and in the `thrust_attribution` audit block below).
-        # Disclosed limitation: for symbols with no sub-strategy decomposition we
-        # cannot split the residual further, so the whole raw target is attributed
-        # to the thrust bucket (pre-existing behaviour, unchanged).
-        macro_thrust_w = max(0.0, raw_tgt_w - sub_total_w)
+        # (2026-11-20 audit) 存量 incumbent 与新增预部署必须分开归因。判定依据是执行层
+        # 参考账本权重 `cur_w`（`current_series[sym]`，由 `reference.reindex(...)` 的行
+        # 权而来，即真实持仓/上次调仓），而不是子策略分解。旧实现把「blend 模型持有但
+        # 无任何子策略持有」的存量也当成残差冲力，使 600362.SH 在每次冲力重激活时被
+        # 反复误报为「宏观动量冲力预部署」买入 —— 实际只是存量维持。
+        # 现金腿（Phase-4 归集/释放，`SWEEP_CASH`/`RELEASE_CASH`）既不是冲力部署也不是
+        # blend-only 存量，两个桶都不进；旧实现曾把它记成 `macro_breadth_thrust`
+        # （见 11-03 的 `BIL` 行 0.1192）。
+        if sym in sub_strategy_weights_by_symbol:
+            # 子策略持有：残差仍是真·冲力（叠在子策略之上）
+            macro_thrust_w = max(0.0, raw_tgt_w - sub_total_w)
+        elif sym != cash_proxy and cur_w > 1e-4:
+            # blend-only 存量：不是新增冲力买入
+            dim_signals["blend_only_incumbent"] = round(raw_tgt_w, 4)
+            macro_thrust_w = 0.0
+        else:
+            # 空仓 → 真·冲力预部署（现金腿除外：它不承载任何冲力/存量桶）
+            macro_thrust_w = 0.0 if sym == cash_proxy else max(0.0, raw_tgt_w - sub_total_w)
         if macro_thrust_w > 0.001 and thrust_active:
             dim_signals["macro_breadth_thrust"] = round(macro_thrust_w, 4)
 
@@ -8369,6 +8404,8 @@ def main(cli_args: Optional[List[str]] = None):
             else:
                 summary_reason = "最优目标权重维持"
 
+        # 该标签只代表本次新增部署的冲力权重（存量 incumbent 已归入 blend_only_incumbent，
+        # 不会写入 macro_breadth_thrust，因此此处不再为存量行加标签）。
         if action == "BUY" and dim_signals.get("macro_breadth_thrust", 0.0) >= min_trade_thresh:
             if "[宏观动量冲力预部署]" not in summary_reason:
                 summary_reason = f"{summary_reason} [宏观动量冲力预部署]"

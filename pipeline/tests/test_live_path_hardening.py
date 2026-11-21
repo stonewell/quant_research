@@ -436,6 +436,188 @@ def test_thrust_attribution_survives_lifecycle_flattening(tmp_path, patched_weig
 
 
 # ---------------------------------------------------------------------------
+# FIX 6b (2026-11-20 audit) -- a blend-only incumbent is NOT fresh thrust
+# ---------------------------------------------------------------------------
+
+
+def test_blend_only_incumbent_not_labelled_thrust(tmp_path, patched_weights):
+    """A held symbol no sub-strategy owns must not be re-labelled as fresh thrust.
+
+    The live archive made `600362.SH` look like it was bought by the macro
+    breadth-thrust gate on EVERY thrust re-activation, although the blend model
+    -- not the thrust bucket -- was holding it. Attribution used a plain
+    subtraction (`raw_tgt_w - sub_total_w`), so a long-standing blend-only
+    incumbent (positive `cur_w`, no sub-strategy key) was indistinguishable from
+    a genuinely fresh pre-deployment. The discriminator is now the
+    execution-layer ledger weight `cur_w`.
+
+    Nothing economic may move: this is an audit/label change, so the thrust-ON
+    ticket must carry bit-identical action / target / shares to the thrust-OFF
+    ticket for the same book.
+    """
+    from scripts.run_live_strategy import main as live_main
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    # 10% already held, no sub-strategy decomposition -> the blend-only incumbent shape.
+    holdings_file = _write_json(tmp_path, "holdings.json", {"601857.SH": 0.10})
+    patched_weights({"600000.SH": 0.0, "601857.SH": 0.30, "BIL": 0.70})
+
+    def _run(tag, macro):
+        out_dir = tmp_path / tag
+        out_dir.mkdir()
+        _write_json(out_dir, "stage1_health_report.json", {"market_macro": macro})
+        state_file = str(out_dir / "account_state.json")
+        return live_main(
+            _live_args(
+                tmp_path,
+                universe_file,
+                state_file,
+                _AS_OF_SECOND,
+                extra=[
+                    "--current-holdings-file", holdings_file,
+                    "--entry-confirm-bars", "1",
+                    "--exit-confirm-bars", "1",
+                ],
+                out_dir=out_dir,
+            )
+        )
+
+    # Thrust gate armed (thrust 0.70 >= 0.60); the second run only disarms the label.
+    thrust_on = _run("thrust_on", {"thrust": 0.70, "breadth": 0.50})
+    thrust_off = _run("thrust_off", {"thrust": 0.10, "breadth": 0.50})
+
+    row = thrust_on[thrust_on["symbol"] == "601857.SH"].iloc[0]
+    dim = row["detail_reason"]["dimension_signals"]
+
+    # (1) The incumbent is attributed to the blend-only bucket, at the raw target.
+    assert dim.get("blend_only_incumbent") == pytest.approx(0.30, abs=1e-6)
+    # (2) ...and NOT to the thrust bucket.
+    assert "macro_breadth_thrust" not in dim
+    # (3) No operator-facing text may claim a thrust pre-deployment on this row.
+    assert "宏观动量冲力" not in str(row["reason"])
+    assert "macro_breadth_thrust" not in str(row["reason"])
+
+    # (4) Behaviour-preserving guard: thrust attribution is audit-only, so every
+    # economic field is identical with the gate armed and disarmed.
+    off_row = thrust_off[thrust_off["symbol"] == "601857.SH"].iloc[0]
+    for col in ("action", "target_weight", "target_shares", "delta_shares", "shares", "price"):
+        assert row[col] == off_row[col], f"{col} moved when only the thrust label changed"
+    # The unchanged path: the incumbent is topped up to the untouched model target.
+    assert row["action"] == "BUY"
+    assert float(row["target_weight"]) == pytest.approx(0.30, abs=1e-6)
+    assert int(row["shares"]) > 0
+
+    # (5) The CASH LEG (Phase-4 sweep) carries NEITHER bucket: no `macro_breadth_thrust`
+    # (the 11-03 `BIL` row's 0.1192 mislabel) and no `blend_only_incumbent`. Kept in this
+    # test because both runs already book the cash leg at cur_w > 0 with thrust armed.
+    cash_row = thrust_on[thrust_on["symbol"] == "BIL"].iloc[0]
+    cash_dim = cash_row["detail_reason"]["dimension_signals"]
+    assert "macro_breadth_thrust" not in cash_dim
+    assert "blend_only_incumbent" not in cash_dim
+    # Nothing silently disappeared: the original `{strategy_key: ...}` entry survives.
+    assert cash_dim, "cash leg lost its dimension_signals audit entry"
+    # The sweep verdict itself is untouched, and so is its arithmetic.
+    assert cash_row["action"] in ("SWEEP_CASH", "RELEASE_CASH")
+    off_cash = thrust_off[thrust_off["symbol"] == "BIL"].iloc[0]
+    for col in ("action", "target_weight", "target_shares", "delta_shares", "trade_value"):
+        assert cash_row[col] == off_cash[col], f"{col} moved on the cash leg"
+    assert cash_dim == off_cash["detail_reason"]["dimension_signals"]
+
+
+# ---------------------------------------------------------------------------
+# FIX 7 (2026-11-20 audit, second iteration) -- forced-exit live side channel
+# ---------------------------------------------------------------------------
+
+
+def _forced_exit_weights_patch(forced: bool):
+    """Patch `EqualWeightAllocation.generate_weights` to hand back a flat book.
+
+    `forced=True` additionally publishes the blend engine's OPT-IN side channel
+    (`_last_forced_exits`) for the LAST rebalance row, exactly as
+    `BaseBlendAllocationStrategy.generate_weights` does when
+    `enable_incumbent_requalification` is on. `forced=False` does not touch the
+    attribute at all -- the shape every non-blend strategy has.
+    """
+    from unittest.mock import patch
+
+    from common.allocation_templates import EqualWeightAllocation
+    from pipeline.live_signal.lsig.signal import latest_rebalance_rows
+
+    orig = EqualWeightAllocation.generate_weights
+
+    def gen(self, universe, params=None):
+        df = orig(self, universe, params)
+        last = latest_rebalance_rows(df).index[-1]
+        for sym, w in (("600000.SH", 0.0), ("601857.SH", 0.0), ("BIL", 1.0)):
+            if sym in df.columns:
+                df.loc[last, sym] = w
+        if forced:
+            self._last_forced_exits = {last: {"601857.SH"}}
+        return df
+
+    return patch.object(EqualWeightAllocation, "generate_weights", gen)
+
+
+def test_live_forced_exit_side_channel(tmp_path):
+    """The forced exit reaches the live ticket, and only when the channel exists.
+
+    THE SWALLOW THIS PINS. A 4% position whose target goes to `0.0` never clears
+    the 5% live inertia band, so `step_position_lifecycle` returns
+    HOLD_FILTERED and the ticket keeps the stale weight. The blend engine now
+    publishes `_last_forced_exits` for the rebalance bar it wrote the explicit
+    `0.0` on; the runner forwards that bar's set into the lifecycle call.
+
+    Both arms are asserted: the SAME inputs without the side channel must keep
+    the position untouched (behaviour identical to every non-blend strategy and
+    to a blend with `enable_incumbent_requalification=False`).
+    """
+    from scripts.run_live_strategy import main as live_main
+
+    universe_file = _write_universe(tmp_path, ["600000.SH", "601857.SH", "BIL"])
+    # 4% held: below the live 5% inertia band, so nothing but the channel can move it.
+    holdings_file = _write_json(tmp_path, "holdings.json", {"601857.SH": 0.04})
+
+    def _run(tag, forced):
+        out_dir = tmp_path / tag
+        out_dir.mkdir()
+        with _forced_exit_weights_patch(forced):
+            return live_main(
+                _live_args(
+                    tmp_path,
+                    universe_file,
+                    str(out_dir / "account_state.json"),
+                    _AS_OF_SECOND,
+                    extra=["--current-holdings-file", holdings_file],
+                    out_dir=out_dir,
+                )
+            )
+
+    forced_ticket = _run("forced_on", True)
+    plain_ticket = _run("forced_off", False)
+
+    forced_row = forced_ticket[forced_ticket["symbol"] == "601857.SH"].iloc[0]
+    plain_row = plain_ticket[plain_ticket["symbol"] == "601857.SH"].iloc[0]
+
+    # (1) The channel authorises the sell: target 0.0, action SELL.
+    assert forced_row["action"] == "SELL"
+    assert float(forced_row["target_weight"]) == 0.0
+    assert int(forced_row["delta_shares"]) < 0
+
+    # (2) Without the channel the SAME 4% position stays: unchanged target,
+    # never a sell (the pre-change behaviour for every other strategy).
+    assert plain_row["action"] != "SELL"
+    assert float(plain_row["target_weight"]) == pytest.approx(0.04, abs=1e-9)
+
+    # (3) Nothing else moved: the forced arm's ONLY sell is the released name,
+    # and the cash leg grows by EXACTLY the freed weight.
+    assert list(forced_ticket.loc[forced_ticket["action"] == "SELL", "symbol"]) == ["601857.SH"]
+    assert not (plain_ticket["action"] == "SELL").any()
+    cash_forced = float(forced_ticket[forced_ticket["symbol"] == "BIL"].iloc[0]["target_weight"])
+    cash_plain = float(plain_ticket[plain_ticket["symbol"] == "BIL"].iloc[0]["target_weight"])
+    assert cash_forced - cash_plain == pytest.approx(0.04, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
 # FIX 1 -- 5m reporting honesty (Stage 2 runner and Stage 1 health gate)
 # ---------------------------------------------------------------------------
 
