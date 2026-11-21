@@ -223,6 +223,33 @@ available in the current shell.
      empirical value (or introduce degradation, zero-trade starvation, or double-counting risk)
      **must not be merged into production paths** unless explicitly requested as opt-in
      disabled-by-default experimental flags.
+10. **Discriminating-Power Gate for A/B, Ablation, and Differential Experiments**:
+    - A comparative experiment (A/B, ablation, arm-vs-arm replay) may be used as evidence about
+      the defect under investigation **only if it first demonstrates discriminating power on that
+      defect**: the report must name at least one probe (a value, row, counter, event, or weight
+      cell) that differs between the arms *because of the behaviour being studied*, and quote its
+      value on both sides.
+    - If no artifact can observe the quantity in question — the ledger records only executed
+      orders, the decision log was never written for those runs, the metric aggregates the effect
+      away, or the two arms come out byte-identical — the experiment must **not** be run and its
+      result must **not** be reported as acceptance, rejection, or closure. Build the observability
+      probe first (targeted instrumentation, stage-by-stage trace, or a new recorded field), then
+      decide.
+    - Scope the experiment to the defect's own population and window. Measure the specific symbols,
+      dates, and trades whose behaviour actually differs, and report that isolated leg or cohort
+      before anything else. A general sweep across every strategy, universe, or fold is at most a
+      secondary sanity check; it must never be the primary evidence, because unrelated trades
+      dominate the aggregate and can reverse the sign of the effect under study.
+    - If the affected window falls outside the evaluation window, or the affected population is a
+      subset that the aggregate metric averages away, the broad run cannot adjudicate the question:
+      say so explicitly and build the isolated measurement instead of reporting a global verdict.
+    - A zero-delta A/B proves the experiment cannot see the change. It never proves the change is
+      harmless, inert by design, or that the defect is absent.
+    - Performance verdicts and correctness verdicts are separate. A `FAIL` / `ΔSharpe` result
+      judges the **intervention**, never the **diagnosis**; conversely, a reproduced mechanism
+      probe never establishes that the intervention is worth shipping.
+    - The write-up must record: the probe, its value with and without the change, and why that
+      quantity is the defect itself rather than a proxy for it.
 
 
 
