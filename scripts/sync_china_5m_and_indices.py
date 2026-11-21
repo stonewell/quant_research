@@ -1721,6 +1721,14 @@ def _cross_source_rule_reason(rule: str) -> str:
     )
 
 
+def _provider_keep_logged_in(provider_instance: Any) -> bool:
+    """BaoStockProvider 只暴露私有 `_keep_logged_in`；公开属性优先，其次私有，缺省 False。"""
+    value = getattr(provider_instance, "keep_logged_in", None)
+    if value is None:
+        value = getattr(provider_instance, "_keep_logged_in", None)
+    return value is True
+
+
 def assert_baostock_sequential_sync_contract(
     module_or_path: Any = None,
     *,
@@ -1735,9 +1743,11 @@ def assert_baostock_sequential_sync_contract(
        instantiated at most once, never inside a loop, and ``.logout()`` is inside a
        ``finally:`` block.
     3. When ``provider_instance`` is supplied: real ``BaoStockDataProvider`` instances must
-       have ``keep_logged_in is True`` and ``adjustflag == "3"``; test doubles that omit
-       those attributes are tolerated, while any explicit ``keep_logged_in=False`` or
-       non-raw ``adjustflag`` fails closed with ``RuntimeError``.
+       have ``keep_logged_in is True`` (public attribute, else the private
+       ``_keep_logged_in`` the real class actually stores) and ``adjustflag == "3"``; any
+       explicit ``keep_logged_in=False`` or non-raw ``adjustflag`` fails closed with
+       ``RuntimeError``, and so does a provider carrying neither ``keep_logged_in`` nor
+       ``_keep_logged_in``.
     """
     forbidden_modules = ("multiprocessing", "concurrent.futures", "joblib")
     forbidden_names = {"ThreadPoolExecutor", "ProcessPoolExecutor"}
@@ -1866,12 +1876,17 @@ def assert_baostock_sequential_sync_contract(
         from common.financial_api import BaoStockDataProvider as _RealBaoStockDataProvider
 
         is_real_bs = isinstance(provider_instance, _RealBaoStockDataProvider)
-        if is_real_bs or hasattr(provider_instance, "keep_logged_in"):
-            if getattr(provider_instance, "keep_logged_in", False) is not True:
-                raise RuntimeError(
-                    "BaoStock sequential sync contract violated: "
-                    "provider keep_logged_in must be True"
-                )
+        # 2026-11-20 回归（16dd791 引入该守卫）：原实现只读公开的 `keep_logged_in`，而真实
+        # `BaoStockDataProvider` 把构造参数存进 `self._keep_logged_in`，从不暴露同名公开属性
+        # ——于是「构造时 keep_logged_in=True」也被判为违约，守卫在抓取任何数据之前就抛出
+        # RuntimeError，被 `refresh_stage1_data` 降级成 warn，全宇宙 5m 缓存停在
+        # 2026-11-19 15:00（11-20 起 0 行）。现在公开属性优先、私有字段兜底，两者皆缺仍
+        # fail-closed：只有真正 keep_logged_in=True 的 provider 才能通过。
+        if not _provider_keep_logged_in(provider_instance):
+            raise RuntimeError(
+                "BaoStock sequential sync contract violated: "
+                "provider keep_logged_in must be True"
+            )
         if is_real_bs or hasattr(provider_instance, "adjustflag"):
             if getattr(provider_instance, "adjustflag", None) != "3":
                 raise RuntimeError(

@@ -136,6 +136,55 @@ def test_baostock_sequential_sync_contract_passes_real_script_and_fails_closed()
         sync.assert_baostock_sequential_sync_contract(provider_instance=_BadDouble())
 
 
+def _real_provider(**kwargs):
+    """Construct the real provider without logging in.
+
+    `BaoStockDataProvider.__init__` only stores the params (no socket/login happens until
+    the first fetch), so this stays 100% offline. `baostock.login` is stubbed anyway so a
+    future constructor change can never turn this into a network test.
+    """
+    from common.financial_api import BaoStockDataProvider
+
+    with patch("baostock.login", side_effect=AssertionError("no network in tests")):
+        return BaoStockDataProvider(cache_dir=None, **kwargs)
+
+
+def test_guard_accepts_real_provider_with_keep_logged_in_true():
+    provider = _real_provider(adjustflag="3", keep_logged_in=True)
+    # The real class stores it privately only -- this is exactly what broke the guard.
+    assert not hasattr(provider, "keep_logged_in")
+    assert provider._keep_logged_in is True
+
+    res = sync.assert_baostock_sequential_sync_contract(provider_instance=provider)
+    assert res["ok"] is True
+
+
+def test_guard_rejects_real_provider_with_keep_logged_in_false():
+    provider = _real_provider(adjustflag="3", keep_logged_in=False)
+    with pytest.raises(
+        RuntimeError,
+        match="BaoStock sequential sync contract violated: provider keep_logged_in must be True",
+    ):
+        sync.assert_baostock_sequential_sync_contract(provider_instance=provider)
+
+
+def test_guard_fails_closed_when_attribute_absent():
+    class _NoAttrs:
+        adjustflag = "3"
+
+    assert sync._provider_keep_logged_in(_NoAttrs()) is False
+    with pytest.raises(RuntimeError, match="keep_logged_in must be True"):
+        sync.assert_baostock_sequential_sync_contract(provider_instance=_NoAttrs())
+
+
+def test_keep_logged_in_helper_prefers_public_attribute():
+    class _BothAttrs:
+        keep_logged_in = False
+        _keep_logged_in = True
+
+    assert sync._provider_keep_logged_in(_BothAttrs()) is False
+
+
 def test_full_bars_lt_45_sync_to_feature_gate_alignment():
     cache = DuckDBCache(db_path=":memory:")
     # Day 1: 48 bars; Day 2: 40 bars (09:35-11:30 = 24 + 13:05-14:20 = 16 -> 40 < 45)

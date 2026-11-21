@@ -122,7 +122,15 @@ def _seed_5m(cache: DuckDBCache, symbol: str, frame: pd.DataFrame) -> None:
 
 
 class _FakeProvider:
-    """Offline double: returns a prepared frame, records every fetch, never networks."""
+    """Offline double: returns a prepared frame, records every fetch, never networks.
+
+    `keep_logged_in` mirrors the real ``BaoStockDataProvider(keep_logged_in=True)`` this
+    double stands in for: ``assert_baostock_sequential_sync_contract`` is fail-closed, so a
+    provider carrying neither that attribute nor ``_keep_logged_in`` is rejected.
+    """
+
+    keep_logged_in = True
+    adjustflag = "3"
 
     def __init__(self, frame: pd.DataFrame, calls: list):
         self.frame = frame

@@ -100,7 +100,16 @@ def _factors(days, value: float = 1.30) -> pd.DataFrame:
 
 
 class _FakeProvider:
-    """Offline double: one 5m frame, one factor frame per symbol, records every call."""
+    """Offline double: one 5m frame, one factor frame per symbol, records every call.
+
+    `keep_logged_in` / `adjustflag` mirror the real
+    ``BaoStockDataProvider(adjustflag="3", keep_logged_in=True)`` this double stands in for:
+    ``assert_baostock_sequential_sync_contract`` is fail-closed, so a provider carrying
+    neither that attribute nor ``_keep_logged_in`` is rejected.
+    """
+
+    keep_logged_in = True
+    adjustflag = "3"
 
     def __init__(self, frame: pd.DataFrame, factors: dict, factor_calls: list, **kwargs):
         self.frame = frame

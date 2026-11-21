@@ -7748,3 +7748,81 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
   默认 `True`；`--no-lifecycle-enable-market-breadth` → `False`；
   `--lifecycle-enable-market-breadth` → `True`；
   两开关同时给出时「后者生效」（`--no-` 后接 `--enable` → `True`，反序 → `False`）。
+
+## 57. 回归修复：BaoStock 顺序同步守卫误杀真实 provider，每日 5m 同步自 11-20 起空转（基础设施修复，无版本轴变动，2026-11-20）
+
+### 57.1 缺陷与引入点
+
+- 引入点：`16dd791`（"wire baostock turn column and 5m sequential sync guardrails"）。
+  该提交在 `scripts/sync_china_5m_and_indices.py::assert_baostock_sequential_sync_contract`
+  里加了一条运行时守卫，原文为：
+
+  ```python
+  is_real_bs = isinstance(provider_instance, _RealBaoStockDataProvider)
+  if is_real_bs or hasattr(provider_instance, "keep_logged_in"):
+      if getattr(provider_instance, "keep_logged_in", False) is not True:
+          raise RuntimeError(...)
+  ```
+
+- **守卫与真实类的属性错配**：守卫读的是**公开**的 `keep_logged_in`，而真实
+  `common/financial_api.py::BaoStockDataProvider.__init__` 只把构造参数存进**私有**
+  `self._keep_logged_in`（`financial_api.py` 内该参数共出现于 `__init__`/`_ensure_session`/
+  `logout`/`_repair_*` 等私有路径），全类**没有**公开同名属性。
+- 因此 `sync_5m_intraday` 在 `:1945` 处正确地以 `keep_logged_in=True` 构造 provider，
+  紧接着 `:1950` 的守卫仍然判定「未满足」并抛 `RuntimeError`。
+  离线复现（真实 provider、无网络）：`hasattr(p, "keep_logged_in") is False`、
+  `p._keep_logged_in is True` —— 守卫直接 raise。
+
+### 57.2 后果（缓存事实）
+
+- `refresh_stage1_data` 把该 `RuntimeError` 降级成一条 warn，于是 PART B **零抓取、零写入**；
+  每日 5m 同步从这个提交起静默空转。
+- 落盘证据：`intraday_bars` 的 5m 数据 `max(ts) = 2026-11-19 15:00`，2026-11-20 全宇宙 **0 行**；
+  `intraday_sync_metadata.last_sync_time = 2026-11-19 20:38`（此后不再前进）。
+- 注意这不是数据源故障：同一进程里 PART A 的日线路径不经过该守卫，所以只有 5m 侧被冻住。
+
+### 57.3 为什么现有测试没拦住
+
+- 已有的 `test_baostock_sequential_sync_contract_passes_real_script_and_fails_closed`
+  用的是**假 provider**（`class _GoodDouble: keep_logged_in = True`）。
+  假类自带公开的 `keep_logged_in`，恰好命中了守卫的读取口径，于是「构造参数 → 存储字段」
+  这段真实类的映射关系**从未被测试覆盖**。
+- 结论（Rule 10 口径）：这个 A/B 从未建立区分度 —— 假 provider 在两个臂里都返回 `True`，
+  测量对象（真实类的属性布局）根本不在观测范围内。
+
+### 57.4 修复方式
+
+- 新增模块级小助手 `_provider_keep_logged_in(provider_instance) -> bool`：
+  **公开属性优先，其次私有 `_keep_logged_in`，两者皆缺返回 `False`**。
+- 守卫改为 `if not _provider_keep_logged_in(provider_instance): raise RuntimeError(...)`，
+  异常文案**逐字不变**（`provider keep_logged_in must be True`）。
+- 语义保持 fail-closed：真实 provider 的 `keep_logged_in=True` 放行；
+  `keep_logged_in=False` 仍拒绝；**两个属性都不存在**的 provider 也仍拒绝
+  （原来是「两者皆缺则跳过」，现按任务要求收紧为拒绝）。
+- 收紧后两个端到端假 provider（`pipeline/tests/test_sync_5m_freshness_probe.py::_FakeProvider`、
+  `pipeline/tests/test_sync_5m_cross_source_factor_refusal.py::_FakeProvider`）各补一行
+  `keep_logged_in = True` / `adjustflag = "3"`：它们替代的正是
+  `BaoStockDataProvider(adjustflag="3", keep_logged_in=True)`，此前靠「守卫跳过」侥幸通过，
+  现在显式声明与被替代对象一致的属性（并附注释说明 fail-closed 契约）。
+- 无策略/模板类被触及，无 `version` / `BASE_VERSION` 轴变动，不重跑 `--dump-strategies`。
+
+### 57.5 自动补数
+
+- 下一次计划内运行会以 `start = as_of − 10d` 计算窗口，5m 写入是 **append-only**
+  （`INSERT OR REPLACE` 按 `(symbol, ts)` 覆盖同日已有行），因此 2026-11-20 起的缺口
+  **无需手工回补**：正常调度一次即可补齐，`last_sync_time` 会随之推进。
+
+### 57.6 验证（100% 离线、无网络、`--import-mode=importlib`）
+
+- `pipeline/tests/test_5m_coverage_and_sequential_sync.py`：**8 passed**
+  （原 4 条，新增 4 条：真实 provider `True` 放行、真实 provider `False` 拒绝、
+  两属性皆缺 fail-closed、公开属性优先于私有）。
+- `pipeline/tests` 全量：**1727 passed, 1 skipped**（原 1723 passed, 1 skipped，净 +4 条新用例；
+  两个端到端假 provider 的补属性不改变用例数量），约 9 分 12 秒，`--import-mode=importlib`。
+- 真实 provider 构造用例：`BaoStockDataProvider.__init__` 只存参数、不登录；
+  测试另外 `patch("baostock.login", side_effect=AssertionError)` 兜底，确保不会变成网络测试。
+- 修复前后直接对照（同一真实 provider 对象、无网络）：
+  - 修复前（`HEAD` 版本的函数）：`RuntimeError: BaoStock sequential sync contract violated:
+    provider keep_logged_in must be True`
+  - 修复后：`{'ok': True, 'single_session_verified': True, 'provider_checked': True}`
+  - 修复后 `keep_logged_in=False`：仍 `RuntimeError`（同上文案）
