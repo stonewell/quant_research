@@ -250,6 +250,19 @@ available in the current shell.
       probe never establishes that the intervention is worth shipping.
     - The write-up must record: the probe, its value with and without the change, and why that
       quantity is the defect itself rather than a proxy for it.
+11. **Backtest/Live Parity by Default**:
+    - When the live engine supplies an input to a shared kernel (market breadth/thrust, volumes,
+      prices, calendar, risk state), the backtest path must supply the same class of input **by
+      default**. A backtest that structurally cannot exercise a live decision path is a defect to
+      register and fix, not a baseline to compare against.
+    - Divergence must be **opt-in and recorded**: the flag that restores the divergent behaviour
+      is spelled `--no-...` / `...=False`, it is documented next to the parity note, and any
+      historical result produced under it must be labelled with the differing input set.
+    - A new input to a shared kernel lands with **both** paths wired in the same change, plus a
+      test that the two paths agree on a synthetic fixture. Shipping only one side is a review
+      blocker.
+    - When genuine non-parity is unavoidable (e.g. a live-only data source), record the gap, the
+      measured direction of the bias, and the pending task that closes it.
 
 
 
