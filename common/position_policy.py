@@ -1406,6 +1406,18 @@ class AssetPolicy:
                 detail={
                     "held_bars": st.held_bars,
                     "min_holding_bars": cfg.min_holding_bars,
+                    # ADDITIVE ONLY (2026-11-20 live review): the model's
+                    # PRE-policy target, so a "target 0 but blocked by the
+                    # tenure lock" row is auditable from the row itself instead
+                    # of being inferred from `blocked_action`. The live path
+                    # reaches this branch WITHOUT ever running the inertia
+                    # `is_full_exit` predicate (gate 6 intercepts the literal
+                    # zero first -- docs/version.md §53.5 correction), so this
+                    # key is the only evidence that the request was a full
+                    # exit. No branch reads it; the decision (action, target
+                    # weight, blocking reason, counters) is unchanged, and the
+                    # key is written on THIS branch only.
+                    "raw_target_weight": raw_target_weight,
                     "blocked_action": "full_exit",
                 },
             )

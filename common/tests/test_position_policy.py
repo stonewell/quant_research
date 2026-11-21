@@ -2413,8 +2413,15 @@ def test_exit_confirming_detail_carries_raw_target_weight():
     }
 
 
-def test_only_the_exit_confirming_branch_payload_gained_raw_target_weight():
-    """Every OTHER branch's `detail` keys are unchanged by the L2.63 addition.
+def test_raw_target_weight_payload_growth_is_limited_to_documented_branches():
+    """Branch payloads are pinned: a key appearing is a DELIBERATE audit change.
+
+    (Renamed 2026-11-20 from
+    `test_only_the_exit_confirming_branch_payload_gained_raw_target_weight`:
+    a second branch -- gate 6's `TENURE_LOCKED` full-exit sibling -- has since
+    gained `raw_target_weight` on purpose. See
+    `test_tenure_locked_detail_exposes_raw_target_weight` for that branch's own
+    assertions; this test keeps pinning the branches that did NOT change.)
 
     Pinned explicitly (not merely "the tests still pass") because the payload is
     the forensic ledger: a key appearing or disappearing in a branch is an
@@ -2451,7 +2458,63 @@ def test_only_the_exit_confirming_branch_payload_gained_raw_target_weight():
         cfg,
     )
     assert locked.blocking_reason is BlockingReason.TENURE_LOCKED
+    # (2026-11-20) The TENURE_LOCKED full-exit sibling deliberately GAINED
+    # `raw_target_weight` in the same spirit as EXIT_CONFIRMING -- the live path
+    # never runs the inertia `is_full_exit` predicate, so this key is the only
+    # on-row proof that the request was a zero target. The other keys are
+    # unchanged; the decision itself is asserted separately below.
     assert set(locked.detail) == {
-        "held_bars", "min_holding_bars", "blocked_action", "state_before", "state_after",
+        "held_bars", "min_holding_bars", "blocked_action", "raw_target_weight",
+        "state_before", "state_after",
     }
-    assert "raw_target_weight" not in locked.detail
+    assert locked.detail["raw_target_weight"] == 0.0
+
+
+def test_tenure_locked_detail_exposes_raw_target_weight():
+    """A zero target blocked by `min_holding_bars` records the model request.
+
+    The LIVE path never runs the inertia `is_full_exit` predicate (gate 6's
+    `_is_zero_request` intercepts the literal zero first -- docs/version.md
+    §53.5 correction), so without this key a "model asked for 0, tenure lock
+    held it" row can only be inferred from `blocked_action`. ADDITIVE: the
+    decision is byte-for-byte the pre-change verdict.
+    """
+    cfg = PositionPolicyConfig(guard_latency_bars=2, min_holding_bars=2)
+    state = AssetState(
+        symbol="603662.SH",
+        state=PositionState.HELD_GESTATION,
+        held_bars=0,                 # +1 at gate 2; 1 < min_holding_bars=2 -> tenure lock
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.30,
+    )
+
+    decision = AssetPolicy().step(state, 0.0, PolicyContext(price=10.3), cfg)
+
+    # DECISION UNCHANGED:
+    assert decision.action == PolicyAction.HOLD_FILTERED
+    assert decision.blocking_reason is BlockingReason.TENURE_LOCKED
+    assert decision.target_weight == pytest.approx(0.30)   # still held
+    assert decision.detail["blocked_action"] == "full_exit"
+    assert decision.detail["held_bars"] == 1
+    assert decision.next_state is PositionState.HELD_GESTATION
+    # ... PLUS the auditable fact:
+    assert decision.detail["raw_target_weight"] == 0.0
+
+    # The non-zero partial-trim sibling keeps its (pre-existing) key and value.
+    trim = AssetPolicy().step(
+        AssetState(
+            symbol="603662.SH",
+            state=PositionState.HELD_ACTIVE,
+            held_bars=0,             # +1 at gate 2 -> still < min_holding_bars
+            entry_price=10.0,
+            peak_price=10.5,
+            current_weight=0.30,
+        ),
+        0.20,
+        PolicyContext(price=10.3),
+        PositionPolicyConfig(guard_latency_bars=2, min_holding_bars=2),
+    )
+    assert trim.blocking_reason is BlockingReason.TENURE_LOCKED
+    assert trim.detail["blocked_action"] == "partial_trim"
+    assert trim.detail["raw_target_weight"] == pytest.approx(0.20)
