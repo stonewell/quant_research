@@ -7858,3 +7858,105 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
     provider keep_logged_in must be True`
   - 修复后：`{'ok': True, 'single_session_verified': True, 'provider_checked': True}`
   - 修复后 `keep_logged_in=False`：仍 `RuntimeError`（同上文案）
+
+## 58. Track MS 第二波接线：真实换手率 Option 2 契约、`MS7` 5m 同源接线与 `MS8`/`MS14` CLI 暴露（`MicrostructureAlphaCompositeStrategy` `1.0.0 → 1.1.0`，`BASE_VERSION` 维持 `2.3.0`，2026-11-22）
+
+> **本节编号**：落笔前实测现有最高节号为 **57**，故本节取 **58**，只追加在文件末尾；§1–§57 一字未改。
+> 对应台账见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.26.6（`MS21`–`MS25` `[x]`，`MS26` `[ ]`）。
+
+### 58.1 版本轴与同步更新（AGENTS.md 第 7 条）
+
+| 项 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `MicrostructureAlphaCompositeStrategy.version` | `1.0.0` | **`1.1.0`** | 新增 `df_5m` 因果切片、CYQ 真 `Turn` / 5m 传入与 Rule 10 诊断探针 `_last_ms7_diagnostics` |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.3.0` | **`2.3.0`（不变）** | `blend_base.py` 零改动；`enrich_universe_with_structural_features` 新增 `use_real_turn=False` 默认隔离全部 6 个 Blend 子类 |
+| `ChanFourStateBlendStrategy.version` | `1.8.0` | **`1.8.0`（不变）** | 保持 `blend_weighting_mode="regime_ic_ir_hybrid"`，含/不含 `Turn` 权重 100% 逐位零漂移 |
+| `strategy_dumps/*.json` | `1.0.0` | **已重生成** | 仅 `microstructure_alpha_composite_strategy.json` 升级 `strategy_version: "1.1.0"` |
+
+### 58.2 核心变更摘要（`W1.1`–`W1.3`, `W2.1`–`W2.2`）
+
+- **`W1.1`（`MS21`）三项基础护栏**：
+  - `common/structural_factors.py::_run_cyq_recurrence` 完整保留原有 `rolling(60)` / `fillna(1.0)` 成交量代理公式；修复 `HIGH-1b`（部分 `NaN` `Turn` 按 bar 回退至 `proxy_tau_series` 而非平值 `0.02`），新增 `use_real_turn` 与 `turn_stats_out`；`enrich_universe_with_structural_features` 默认 `use_real_turn=False`，确保全部 6 个既有 Blend 策略零漂移。
+  - `common/allocation_backtester.py` 的 `next_vwap` 路径增加 `Amount.notna().any()` 与 `(Volume > 0).any()` 校验，无 `Amount` 数据源在 `columns="all"` 下仍显式抛 `ValueError`。
+- **`W1.2`（`MS22`）Option 2 列契约与 Rule 11 齐平**：
+  - `common/duckdb_cache.py::_resolve_requested_columns(..., intraday=...)`：保持 `columns=None` 为严格 5 列；日线 `columns="all"` 扩展为 7 列（含 `Amount`, `Turn`）；5m 日内 `columns="all"` 保持 6 列（含 `Amount`）。
+  - `common/data.py::load_universe` 新增 `include_turn: bool = True`；`common/cli_utils.py` 对称提供 `--include-turn` / `--no-include-turn`（均 `default=True`），并仅在显式退出时于 `run_manifest.json`（回测）与 `summary.json`（实盘）写入 `include_turn: false`。
+- **`W1.3`（`MS23`）`MS7` `v1.1.0` 5m 因果接线与 Rule 10 探针**：
+  - `pipeline/research_strategy/rs/microstructure_alpha_strategy.py` 对 `intraday_5m_universe` 施加 `<= master_index[-1]` 因果切片，接入 `cyq_cost_deviation(..., intraday_5m_bars=df_5m, turn_stats_out=...)` 与 `cyq_quantile_spread_90_10`，并填充 `self._last_ms7_diagnostics`（`real_turn_bars`, `proxy_turn_bars`, `n_symbols_with_real_turn`, `n_symbols_with_5m`, `has_any_5m`, `iceberg_5m_bars`, `smart_money_non_nan_cells`, `iceberg_non_nan_cells`）。
+  - `scripts/run_live_strategy.py` 与 `backtester/run_backtest.py`（standard + walkforward 逐折因果切片，新增 `--enable-intraday-5m` / `--no-enable-intraday-5m`）均以浅拷贝瞬态传入 `intraday_5m_universe`，绝不污染持久化 `params`。
+- **`W2.1`（`MS24`）`MS8` CLI 与无泄漏对抗漂移剔除**：
+  - `ml/alpha_mining/amine/config.py` 新增 `AlphaMiningConfig.filter_adversarial_drift: bool = False`；`ml/alpha_mining/run_alpha_mining.py` 暴露 5 项 MS8 CLI 开关（默认与 config 对齐，开启 `--include-ms-terminals` 时自动钳位 `max_depth <= 4`）；`ml/alpha_mining/amine/benchmark.py` 仅在 `discovery_dates` vs `combiner_dates` 上运行 `filter_adversarial_drifted_features`（绝不触碰 holdout / labels），并在报告中写入 `ms_terminals_enabled` 与 `adversarial_feature_filter`（含小写 `surviving_features`）。
+- **`W2.2`（`MS25`）`MS14` Stage-1 CLI 开关**：
+  - `scripts/check_live_portfolio_health.py` 新增 `--enable-factor-crowding-advisory`（默认 `False`，关闭时 `advisory` 块逐字节不变；启用且无因子面板时如实报 `INSUFFICIENT_HISTORY` 且 `gates_orders=False`）。
+
+### 58.3 离线验证状态（100% 离线、无网络）
+
+- `pipeline/.venv/bin/python -m pytest` 覆盖 `test_structural_factors.py`、`test_turn_col_end_to_end.py`、`test_duckdb_cache.py`、`test_strategy_versioning.py`、`test_blend_strategy_versioning.py`、`test_microstructure_alpha_strategy.py`、`test_advisory_wiring.py`、`test_config_wiring.py`、`test_run_backtest.py`（`--import-mode=importlib`）。
+- `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies` 同步刷新策略 dump。
+- `ml/alpha_mining/.venv/bin/python -m pytest ml/alpha_mining/tests -q -m "not slow"` 验证独立环境通过。
+
+### 58.4 Wave 3 实证闭环记录（`MS13` 离线 `N=16` 升级、`MS26` 本地 DuckDB 18 折 Walk-Forward 与 `§52.4`/`§54.5` Rule 10 定向单腿测量，2026-11-22）
+
+> **只读与零漂移声明**：本轮 Wave 3 实证未触碰 `blend_base.py`（`BASE_VERSION = 2.3.0` 不变）、`strategies_config.json`（`chan_four_state_blend` 维持 `regime_ic_ir_hybrid`）与 `selectorbot/scoring.py`；所有本地缓存审计以 `DuckDBCache(..., read_only=True)` 零网络运行，`data/cache.duckdb` 运行前后校验和完全一致：`pre_md5 = post_md5 = ac4aabc6428dea99a66d1edcd1ce7809`（`25,702,400` 字节，`pre_wal_exists = post_wal_exists = False`）。
+
+1. **`W3.1a`（`MS13` 离线准出脚本 `scripts/verify_ms7_exit_gate.py` 升级）**：
+   - 默认参数升级为 `n_symbols=16`（解除 `MS5` `INSUFFICIENT_SYMBOLS` 阻塞），确定性注入 `Amount`/`Turn`（`0.4%–18.0%`）及向量化 5m 序列（48 根/日）；将调仓频率标定切片（`calib_bars=260`）与严格后置 OOS 4 折（`oos_bars=260`）解耦；维持单次 ERS（`ers_called_count=1`）并新增 `rule10_discriminating_probe`（全量臂 `Turn`+5m vs 代理臂无 `Turn`/5m）。
+   - 复现命令：`pipeline/.venv/bin/python scripts/verify_ms7_exit_gate.py --n-days 520 --n-symbols 16 --n-folds 4 --ers-n-random 25 --seed 42`。
+   - 实测结果：`ms7_winner` Sharpe `0.9776` / CAGR `15.18%` / MaxDD `15.16%` / Rebalances `25` / Turnover `10.7876` / DSR `1.0`（`n_obs=519`）；单次 ERS `percentile=0.84`（`trusted=False`，`n_random=25`）；换手消融 `10.7876` vs `18.5334`（`-41.8%`）；`MS5` 诊断 `asymmetric_status="OK"`、`short_leg_illusion=False`、`crowding_status="NORMAL"`；对照 `M1.2` Sharpe `0.8073`（`ΔSharpe=+0.1703`，`ms7_risky_only=0.9730`）与 `M1.3` Sharpe `0.9952`（`ΔSharpe=-0.0177`）；Rule 10 探针确认区分度：全量臂 `real_turn_bars=8320 / proxy_turn_bars=0 / iceberg_5m_bars=8320 / smart_money_non_nan_cells=8288` vs 代理臂 `0 / 8320 / 0 / 0`，权重差分 `176` 格、`24` 调仓行、`max_abs_weight_diff=0.3487`；Option B 复核 `fold_sign_consistency=0.75 < 14/18`，故 `opt_in_exit_gate_passed=True`、`recommend_default_promotion=False`、`modifies_default_config=False`。
+   - 配套单测：`pipeline/research_strategy/tests/test_microstructure_alpha_strategy.py`（**9 passed**）。
+
+2. **`W3.1b`（`MS26` 本地 `data/cache.duckdb` 20 只 A 股 18 折 Walk-Forward 与 5m 活跃窗口隔离测量）**：
+   - 缓存覆盖实况（`20` 只规范 A 股）：日线 `MarketDBDataProvider` 共 `49,986` 行（`2016-01-04`..`2026-11-20`，`n_amount=49,986`，但真实 `Turn` 仅覆盖 `2026-11-20` 单日 `20` 行）；5m `BaoStockDataProvider` 共 `50,880` 行（`2026-09-01 09:35`..`2026-11-20 15:00`，53 个交易日）；为规避 D9 跨源复权因子混拼，日线 QFQ 以单一 `BaoStockDataProvider` `adjust_factors` 派生。
+   - **18 折 Walk-Forward 汇总（`2022-01-05`..`2026-11-20`，`§56` 实盘齐平口径）**：
+
+| 策略臂 | 18 折均值 Sharpe | 18 折均值 CAGR | 18 折均值 MaxDD | 累计换手 | DSR |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `MS7 v1.1.0` 全量臂（真 `Turn` + 5m） | `0.8435` | `19.63%` | `10.41%` | `168.11` | `1.06e-54` |
+| `MS7 v1.1.0` 代理臂（无 `Turn` / 无 5m） | `0.8479` | `19.71%` | `10.41%` | `167.76` | `5.26e-54` |
+| `M1.2`（CSMom Rank-Band） | `0.5526` | `15.32%` | `11.01%` | `152.32` | `1.12e-79` |
+| `M1.3`（MinVar L1） | `0.8518` | `9.23%` | `4.71%` | `38.99` | `2.60e-34` |
+| `ChanFourStateBlendStrategy v1.8.0` | **`1.2347`** | **`20.11%`** | `6.48%` | `137.35` | `3.99e-38` |
+
+   - **配对折与 Option B 裁定**：`MS7` 全量 vs `M1.2` 均值 `ΔSharpe=+0.2909`、`13/18` 正折（`<14/18`）、`t=0.9907`（`<2.0`）；`MS7` 全量 vs `CFSB` 均值 `ΔSharpe=-0.3912`、`8/18` 正折、`t=-1.4358`；全期单次 ERS（`ers_called_count=1`, `n_random=50`）：Sharpe `0.7296`、CAGR `11.62%`、MaxDD `20.28%`、`percentile=0.46`、`trusted=False`。注：上表 `1.06e-54`–`3.99e-38` 为沿用 `backtester/run_backtest.py:1416` 跨折 `n_trials=18` 公式（将折均 Sharpe 与 18 折期望最大值比较）的口径值；若按单试验 / 3 候选口径计算，`MS7`（`0.8435`）与 `CFSB`（`1.2347`）DSR 均约为 `~1.0000`，而 `MS7` 仍独立在 `13/18 < 14/18`、`t=0.9907 < 2.0`、`ΔSharpe vs CFSB = -0.3912` 与单次 ERS `0.46 < 0.90` 上不满足 `§2.21` Option B 默认晋升条件，继续严格保持 opt-in（`modifies_default_config=False`）。
+   - **Rule 10 隔离 5m 活跃窗口（`2026-09-01`..`2026-11-20`，53 交易日）**：因 18 折前 17 折不在 5m 覆盖期内，全 18 折对比仅第 18 折出现差分；在 53 交易日活跃窗口内，全量臂探针 `real_turn_bars=20 / proxy_turn_bars=6080 / n_symbols_with_5m=20 / iceberg_5m_bars=1060 / smart_money_non_nan_cells=6060` vs 代理臂 `0 / 6100 / 0 / 0 / 0`，权重差分 `41` 格、`max_abs_weight_diff=0.3325`（区分度确证）；该 53 日窗口内全量臂 Sharpe `0.9896`（CAGR `18.68%`、MaxDD `7.57%`）优于代理臂 `0.3520`（CAGR `5.17%`、MaxDD `9.40%`），但样本窗仅 53 日且历史 `Turn` 仅 1 日，待持续日更积累更长真 `Turn` + 5m 历史后再复评。
+
+3. **`W3.2`（`§52.4` 与 `§54.5` Rule 10 定向单腿隔离测量，`ChanFourStateBlendStrategy v1.8.0`）**：
+   - **`§52.4` 既有持仓复审（`blend_enable_incumbent_requalification=True` vs `False`）**：
+     - Rule 10 探针：`2022-01-05`..`2026-11-20` 共观测到 `41` 次强制清退事件；权重矩阵差分 `39` 格、`max_abs_weight_diff=0.20`、`first_divergence_date=2026-03-20`（具备区分度）。
+     - **隔离单腿后向收益**：41 次被强制清退腿的均值后向收益为 `fwd_5d=-1.165%`、`fwd_10d=-0.618%`、`fwd_20d=-0.915%`（三期限均为负，方向上回避了后续下跌）。
+     - **组合聚合指标**：全期 `§56` 回测 OFF Sharpe `1.1823`（CAGR `14.15%`）→ ON Sharpe `1.1905`（`+0.0082`，CAGR `14.20%`，MaxDD 均 `10.24%`）；18 折均值 OFF `1.2347` → ON `1.2364`（`+0.0017`）。
+     - **裁定**：增量远小于 Option B `0.15` 门槛，继续维持默认 `False`（opt-in）。
+   - **`§54.5` 行业存量保护动量资格线复审（`BASE_VERSION 2.3.0` `sec_incumbents: row_roc[s] >= incumbent_qualify_roc` vs pre-`§54` 内存反事实移除该谓词，保持 `§53` `is_full_exit` 恒定）**：
+     - Rule 10 探针：`n_disqualified_incumbent_events=0`、`n_admitted_challenger_events=0`、`n_changed_weight_cells=0`、`max_abs_weight_diff=0.0`，全期（`1.1823` vs `1.1823`）与 18 折（`1.2347` vs `1.2347`）均逐位一致。
+     - **诚实 Rule 10 裁定**：在 20 只规范 A 股 `2022-01-05`..`2026-11-20` 连续回测窗口上该对照**零区分度**（根因在于仅当同业挑战者满足 `cand_roc >= +1%` 且同时满足 `cand_roc < inc_roc + 0.03` 时，不合格存量才落在 `(-2%, +1%)` 窄碰撞带内并形成真实阻断）；依 `AGENTS.md` Rule 10，零差分**不得**视为“已验证无害或有效”，故 `§54.5` 在本面板上保持**未裁决（保持现网默认不变）**，留待在触发事件 `> 0` 的实盘/扩展窗口中另行评估。
+
+### 58.5 `W3.1b` 扩展实证（Option B）：2021–2026 全样本日频真实 `Turn` 回填与 2022–2026 五年 5m 独立研究库三臂消融（2026-11-22）
+
+> **动机**：`§58.4` 暴露 `data/cache.duckdb` 在 18 折中前 17 折缺失 5m 数据且历史日频真实 `Turn` 仅覆盖 `2026-11-20` 单日。经用户授权执行 Option B 两步回补与全覆盖三臂消融，在不影响现网策略与实盘缓存体积的前提下取得 18/18 折 100% 区分度实证裁定。
+
+1. **Step B1（现网缓存日频 `Turn`/`Amount` 非破坏性 `COALESCE` 回填）**：
+   - 写前整库备份：`data/repair_backups/20261122_213300Z_daily_turn_backfill/cache.duckdb`（`pre_md5 = ac4aabc6428dea99a66d1edcd1ce7809`）；写后 `data/cache.duckdb` `post_md5 = 6221daabc68b3d36b4f7c88655b4fb45`，体积仍为 `25,702,400` 字节。
+   - 覆盖提升：`MarketDBDataProvider` `n_turn` `20 → 28,076`（`n_amount = 49,986` 不变）；`FuyaoDataProvider` `n_turn` `5 → 16,853`、`n_amount` `7,813 → 21,725`（未新增第 3 个日频 provider 命名空间）。
+   - SQL 与策略零漂移核验：对照备份库 `ohlcv_bars(open..volume)` 差异 `0` 行、`asset_sync_metadata` / `adjust_factors` / `intraday_ohlcv_bars` 差异均为 `0` 行；`ChanFourStateBlendStrategy v1.8.0` 写前后权重差分 **`0` 格（`max_abs_weight_diff = 0.0`）**。
+2. **Step B2（独立研究库 `data/cache_research_ms.duckdb` 五年 5m 回补）**：
+   - 拷贝现网库至 `data/cache_research_ms.duckdb`（已由 `**/data/*.duckdb*` 忽略，现网 `data/cache.duckdb` 保持 `25.7 MB` 不变），以单会话串行 `BaoStockDataProvider(adjustflag="3", keep_logged_in=True)`（`MS9` 契约通过）回补 20 股 5m 数据至 **`1,133,905` 行**（`n_amount = 1,133,905`，`2022-01-04 09:35`..`2026-11-20 15:00`，库体积 `140.5 MB`）。
+3. **100% 覆盖 18 折三臂消融（`2022-01-05`..`2026-11-20`，`1,165` 交易日，`§56` 齐平口径）**：
+
+| 策略臂 | 18 折均值 Sharpe | 18 折均值 CAGR | 18 折均值 MaxDD | 18 折累计换手 | 全期 Sharpe / CAGR / MaxDD | 单试验 / 3 候选 DSR |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Arm A**（`MS7 v1.1.0` 代理 `Turn`、无 5m） | `0.8479` | `19.71%` | `10.41%` | `167.76` | `0.7683` / `12.33%` / `20.22%` | `1.0000` / `1.0000` |
+| **Arm B**（`MS7 v1.1.0` 100% 真 `Turn`、无 5m） | `0.6108` | `12.77%` | `11.28%` | `191.47` | `0.3211` / `4.12%` / `26.11%` | `1.0000` / `1.0000` |
+| **Arm C**（`MS7 v1.1.0` 100% 真 `Turn` + 100% 5m） | `0.6530` | `14.87%` | `11.10%` | `174.58` | `0.4300` / `6.32%` / `24.25%` | `1.0000` / `1.0000` |
+| `M1.2`（CSMom Rank-Band） | `0.5526` | `15.32%` | `11.01%` | `152.32` | — | `1.0000` / `1.0000` |
+| `M1.3`（MinVar L1） | `0.8518` | `9.23%` | `4.71%` | `38.99` | — | `1.0000` / `1.0000` |
+| `CFSB v1.8.0`（默认 `rolling_ic_ir` / 现网 `regime_ic_ir_hybrid` 见 `§58.4`） | **`0.9984` / `1.2347`** | `14.45%` / **`20.11%`** | `6.53%` / `6.48%` | `128.07` / `137.35` | `0.8874` / **`1.1823`** | `1.0000` / `1.0000` |
+
+   - **Rule 10 全样本区分度探针（18/18 折均非零差分）**：
+     - 全期探针：Arm A（`real_turn_bars=0`, `proxy=23,300`, `5m=0`）vs Arm B（`real_turn_bars=23,300`, `proxy=0`, `5m=0`）vs Arm C（`real_turn_bars=23,300`, `n_symbols_with_5m=20`, `iceberg_5m_bars=23,604`, `smart_money_non_nan_cells=23,260`；18 折合计 `real_turn=123,080`、`iceberg_5m=124,714`、`smart_money=122,360`）。
+     - 权重矩阵差分（首分歧日均为 `2022-01-19`）：`B vs A` **`9,240` 格**（`max|Δw|=0.35`）；`C vs B` **`8,645` 格**（`max|Δw|=0.3390`）；`C vs A` **`9,275` 格**（`max|Δw|=0.35`）。
+   - **配对 18 折归因与诚实裁定（Rule 9 / `§2.21` Option B）**：
+     - **日频真 `Turn` 净效应（`B vs A`）**：`ΔSharpe = -0.2371`（`5/18` 正、`13/18` 负，`t = -1.1197`），全期 `0.7683 → 0.3211`（`-0.4472`，换手 `167.76 → 191.47`）—— 真实换手率直接接入 `CYQ` 在该 20 只大盘蓝筹池上呈**负向磨损**。
+     - **五年 5m 净效应（`C vs B`）**：`ΔSharpe = +0.0422`（`9/18` 正、`9/18` 负，`t = +0.3175`），全期 `0.3211 → 0.4300`（`+0.1089`，回撤 `-1.86pp`）—— 方向弱正但统计不显著，`§58.4` 中 53 日窗口的 `+0.64` Sharpe 跃升未能跨 5 年外推。
+     - **合并净效应（`C vs A`）**：`ΔSharpe = -0.1949`（`5/18` 正、`13/18` 负，`t = -1.2451`）；**`C vs M1.2`**：`+0.1004`（`13/18`, `t = 0.3750`）；**`C vs CFSB`**：`-0.3454`（相对 `rolling_ic_ir`）/ `-0.5817`（相对现网 `regime_ic_ir_hybrid`）。
+     - **单次 ERS 与 `MS5` 预喂诊断**：Arm C 单次 ERS（`ers_called_count=1`, `n_random=50`）`percentile = 0.0`、`trusted = False`；`MS5` 在 20 股实盘面板上输出 `asymmetric_status = "OK"`、**`short_leg_illusion = True`**（暴露 `MS7` 在该池存在空头腿幻觉）、`crowding_status = "NORMAL"`（`corr = -0.1184`）。
+     - **最终裁定**：`MS7 v1.1.0` 在 100% 真 `Turn` + 100% 五年 5m 全覆盖下**明确未通过 `§2.21` Option B 门禁**，保持严格 opt-in（`modifies_default_config = False`），`ChanFourStateBlendStrategy v1.8.0` 继续为绝对生产基线。
