@@ -1656,6 +1656,7 @@ def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d", use_cach
     hold (`common.cli_utils.resolve_live_clock_context(...).expected_last_session`);
     every backtest/research caller leaves it `None` (the bit-for-bit legacy path, design §11).
     """
+    kwargs.pop("include_turn", None)
     base_prov = get_data_provider(provider, **kwargs)
     cached = bool(use_cache and cache_dir)
     if cached:
@@ -1679,6 +1680,7 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
                   cache_dir: str = None, provider: Union[str, BaseDataProvider, None] = None,
                   expected_last_session=None, columns: Optional[Union[str, Sequence[str]]] = "all",
                   cache_read_only: bool = False,
+                  include_turn: bool = True,
                   **kwargs) -> dict:
     """Load OHLCV for each symbol; skips (with a warning) any that fail.
     Maintains backward compatibility with original load_universe function signature.
@@ -1689,15 +1691,15 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
     tolerance, no "already synced today" short-circuit). It is `None` for every
     backtest/research caller and a real session for every live caller.
 
-    `columns` defaults to `"all"` (required OHLCV + `Amount`) -- NOT to the cache's own
-    `columns=None` default. Reason: this is the single loader every backtest goes through
+    `columns` defaults to `"all"` (required OHLCV + `Amount` + `Turn` on daily bars,
+    required OHLCV + `Amount` on intraday bars) -- NOT to the cache's own `columns=None`
+    default. Reason: this is the single loader every backtest and live run goes through
     (`common/cli_utils.load_universe_with_banner` -> here), and a universe frame is consumed
     long after loading by code that cannot re-open the cache. `run_allocation_backtest`'s
     `execution_price="next_vwap"` mode needs `VWAP`, or `Amount` + `Volume`, on EVERY symbol
-    (`common/allocation_backtester.py`, the `next_vwap` branch); with the narrower default that
-    mode became an unconditional `ValueError` for every cache-backed run. Requesting the extra
-    `Amount` here costs one nullable column and is all-NaN when the table has no money column,
-    which the price paths ignore. Pass `columns=None` for the strict OHLCV-only shape.
+    (`common/allocation_backtester.py`, the `next_vwap` branch), and CYQ/MS7 consume `Turn`.
+    Pass `include_turn=False` (CLI `--no-include-turn`) to omit `Turn` and restore the 6-column
+    daily shape; pass `columns=None` for the strict 5-column OHLCV-only shape.
 
     `cache_read_only` (2026-10-27) is forwarded to `CachedDataProvider`: it opens the DuckDB cache
     with `read_only=True`, so a MISSING cache raises `FileNotFoundError` instead of being
@@ -1705,6 +1707,14 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
     operator deleted cache.duckdb" stays a fact rather than being repaired behind their back.
     Default `False` keeps every existing caller bit-for-bit unchanged.
     """
+    kwargs.pop("include_turn", None)
+    effective_columns = columns
+    if not include_turn and not is_intraday_interval(interval):
+        if isinstance(columns, str) and columns.strip().lower() == "all":
+            effective_columns = ["Open", "High", "Low", "Close", "Volume", "Amount"]
+        elif isinstance(columns, (list, tuple)):
+            effective_columns = [c for c in columns if str(c).strip() != "Turn"]
+
     base_prov = get_data_provider(provider, **kwargs)
     cached = bool(use_cache and cache_dir)
     if cached:
@@ -1712,20 +1722,28 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
     else:
         prov = base_prov
     if cached:
-        return prov.fetch_universe(
+        universe = prov.fetch_universe(
             symbols, start, end, interval, expected_last_session=expected_last_session,
-            columns=columns,
+            columns=effective_columns,
         )
-    if expected_last_session is not None and not is_synthetic_provider(base_prov):
-        warnings.warn(
-            f"load_universe(expected_last_session={expected_last_session!r}) has no cache layer to "
-            "apply it to (use_cache/cache_dir is off): every bar comes straight from the provider. "
-            "The freshness gate (common/freshness.py) still runs at the call site."
-        )
-    # Raw providers have no column-projection layer (`BaseDataProvider.fetch_universe` accepts
-    # `columns` only for parity) and several of them override `fetch_universe` with the old
-    # 4-arg signature, so it is NOT forwarded on this branch.
-    return prov.fetch_universe(symbols, start, end, interval)
+    else:
+        if expected_last_session is not None and not is_synthetic_provider(base_prov):
+            warnings.warn(
+                f"load_universe(expected_last_session={expected_last_session!r}) has no cache layer to "
+                "apply it to (use_cache/cache_dir is off): every bar comes straight from the provider. "
+                "The freshness gate (common/freshness.py) still runs at the call site."
+            )
+        # Raw providers have no column-projection layer (`BaseDataProvider.fetch_universe` accepts
+        # `columns` only for parity) and several of them override `fetch_universe` with the old
+        # 4-arg signature, so it is NOT forwarded on this branch.
+        universe = prov.fetch_universe(symbols, start, end, interval)
+
+    if not include_turn:
+        universe = {
+            s: (df.drop(columns=["Turn"]) if isinstance(df, pd.DataFrame) and "Turn" in df.columns else df)
+            for s, df in universe.items()
+        }
+    return universe
 
 
 def fetch_fund_metadata(symbol: str, provider: Union[str, BaseDataProvider, None] = None, **kwargs) -> dict:

@@ -984,13 +984,20 @@ def run_allocation_backtest(
         vwap_cols, vwap_missing = {}, []
         for sym, df in universe.items():
             vol = pd.to_numeric(df["Volume"], errors="coerce") if "Volume" in df.columns else None
-            if "VWAP" in df.columns:
-                vwap_cols[sym] = pd.to_numeric(df["VWAP"], errors="coerce")
-            elif "Amount" in df.columns and vol is not None:
+            vwap_col = pd.to_numeric(df["VWAP"], errors="coerce") if "VWAP" in df.columns else None
+            amt_col = pd.to_numeric(df["Amount"], errors="coerce") if "Amount" in df.columns else None
+            if vwap_col is not None and bool(vwap_col.notna().any()):
+                vwap_cols[sym] = vwap_col
+            elif (
+                amt_col is not None
+                and bool(amt_col.notna().any())
+                and vol is not None
+                and bool((vol > 0).any())
+            ):
                 # VWAP = turnover / shares. A zero-volume bar has no VWAP at all
                 # (0/0), so it becomes NaN -> no fill -> deferral, never a
                 # division-by-zero price.
-                vwap_cols[sym] = pd.to_numeric(df["Amount"], errors="coerce") / vol.where(vol > 0)
+                vwap_cols[sym] = amt_col / vol.where(vol > 0)
             else:
                 vwap_missing.append(sym)
         if vwap_missing:

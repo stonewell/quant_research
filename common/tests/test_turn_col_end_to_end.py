@@ -176,7 +176,8 @@ def test_duckdb_schema_migration_and_column_contracts(tmp_path):
     assert list(df_default.columns) == ["Open", "High", "Low", "Close", "Volume"]
 
     df_all = cache.query_bars("BaoStockDataProvider", "600519.SH", adjust="raw", columns="all")
-    assert list(df_all.columns) == ["Open", "High", "Low", "Close", "Volume", "Amount"]
+    assert list(df_all.columns) == ["Open", "High", "Low", "Close", "Volume", "Amount", "Turn"]
+    np.testing.assert_allclose(df_all["Turn"].to_numpy(), bars["Turn"].to_numpy())
 
     req_cols = ["Open", "High", "Low", "Close", "Volume", "Turn"]
     df_turn = cache.query_bars("BaoStockDataProvider", "600519.SH", adjust="raw", columns=req_cols)
@@ -248,3 +249,111 @@ def test_qfq_adjust_does_not_scale_turn_and_feeds_cyq_real_turn_branch():
     assert wk_nan["Turn"].isna().all()
     wk_real = resample_ohlcv(bars, "1wk")
     assert wk_real["Turn"].iloc[0] == pytest.approx(sum([10.0, 12.0, 15.0, 11.0, 14.0]))
+
+
+def test_w12_real_baostock_to_duckdb_to_load_universe_and_no_include_turn(tmp_path):
+    """W1.2 end-to-end (§57.3): real BaoStockDataProvider -> real DuckDBCache -> load_universe
+    delivers Turn by default, and include_turn=False (--no-include-turn) drops it."""
+    import common.financial_api as fapi
+    from common.data import load_universe
+
+    class _FakeBS:
+        class _LoginRes:
+            error_code = "0"
+            error_msg = "success"
+
+        def login(self):
+            return self._LoginRes()
+
+        def logout(self):
+            return self._LoginRes()
+
+        def query_history_k_data_plus(self, code, fields, **kwargs):
+            field_list = [f.strip() for f in fields.split(",")]
+            row_dicts = [
+                {
+                    "date": "2024-01-02", "code": code, "open": "100.0", "high": "102.0",
+                    "low": "99.0", "close": "101.0", "preclose": "100.0", "volume": "10000",
+                    "amount": "1010000", "adjustflag": "3", "turn": "2.50", "pctChg": "1.0", "isST": "0",
+                },
+                {
+                    "date": "2024-01-03", "code": code, "open": "101.0", "high": "103.0",
+                    "low": "100.0", "close": "102.0", "preclose": "101.0", "volume": "11000",
+                    "amount": "1122000", "adjustflag": "3", "turn": "3.10", "pctChg": "1.0", "isST": "0",
+                },
+                {
+                    "date": "2024-01-04", "code": code, "open": "102.0", "high": "104.0",
+                    "low": "101.0", "close": "103.0", "preclose": "102.0", "volume": "12000",
+                    "amount": "1236000", "adjustflag": "3", "turn": "2.80", "pctChg": "1.0", "isST": "0",
+                },
+                {
+                    "date": "2024-01-05", "code": code, "open": "103.0", "high": "105.0",
+                    "low": "102.0", "close": "104.0", "preclose": "103.0", "volume": "13000",
+                    "amount": "1352000", "adjustflag": "3", "turn": "3.40", "pctChg": "1.0", "isST": "0",
+                },
+            ]
+            rows = [[r.get(f, "") for f in field_list] for r in row_dicts]
+            return _MockResultData(field_list, rows)
+
+        def query_adjust_factor(self, code, **kwargs):
+            return _MockResultData(
+                ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"],
+                [[code, "2024-01-02", "1.0", "1.0", "1.0"]],
+            )
+
+    cache_dir = str(tmp_path / "bs_turn_cache")
+    prov = fapi.BaoStockDataProvider(adjustflag="3", keep_logged_in=True)
+
+    with patch.object(prov, "_get_bs", return_value=_FakeBS()):
+        # Default include_turn=True -> 7 columns including Turn
+        u_on = load_universe(
+            ["600519.SH"],
+            "2024-01-02",
+            "2024-01-05",
+            use_cache=True,
+            cache_dir=cache_dir,
+            provider=prov,
+        )
+        assert "600519.SH" in u_on
+        assert list(u_on["600519.SH"].columns) == [
+            "Open", "High", "Low", "Close", "Volume", "Amount", "Turn",
+        ]
+        np.testing.assert_allclose(u_on["600519.SH"]["Turn"].to_numpy(), [2.50, 3.10, 2.80, 3.40])
+
+        # Opt-out include_turn=False -> 6 columns, Turn absent
+        u_off = load_universe(
+            ["600519.SH"],
+            "2024-01-02",
+            "2024-01-05",
+            use_cache=True,
+            cache_dir=cache_dir,
+            provider=prov,
+            include_turn=False,
+        )
+        assert list(u_off["600519.SH"].columns) == [
+            "Open", "High", "Low", "Close", "Volume", "Amount",
+        ]
+
+
+def test_w12_chan_four_state_blend_zero_weight_drift_when_turn_column_present():
+    """W1.1/W1.2 isolation: ChanFourStateBlendStrategy produces 100% bit-identical weights
+    whether or not daily frames carry a Turn column."""
+    from common.testing import make_ohlcv_from_closes
+    from pipeline.research.blend.chan_four_state_blend import ChanFourStateBlendStrategy
+
+    rng = np.random.default_rng(77)
+    dates = pd.bdate_range("2023-01-02", periods=160)
+    u_no_turn = {}
+    u_with_turn = {}
+    for sym in ["600519.SH", "000001.SZ", "600036.SH", "000858.SZ", "BIL"]:
+        rets = rng.normal(0.0004, 0.015, size=len(dates))
+        closes = 100.0 * np.exp(np.cumsum(rets))
+        df = make_ohlcv_from_closes(closes)
+        df.index = dates
+        u_no_turn[sym] = df
+        u_with_turn[sym] = df.assign(Turn=rng.uniform(1.0, 8.0, size=len(dates)))
+
+    strat = ChanFourStateBlendStrategy()
+    w_no = strat.generate_weights(u_no_turn, {"cash_proxy": "BIL"})
+    w_with = strat.generate_weights(u_with_turn, {"cash_proxy": "BIL"})
+    pd.testing.assert_frame_equal(w_with, w_no, rtol=0.0, atol=0.0)

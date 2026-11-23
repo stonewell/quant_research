@@ -140,6 +140,26 @@ def add_data_provider_cli_args(parser, default_provider: str = "yfinance",
     parser.add_argument("--data-dir", type=str, default=None, help="Folder path for CSV data provider")
     kwargs = {"help": no_cache_help} if no_cache_help else {}
     parser.add_argument("--no-cache", action="store_true", **kwargs)
+    parser.add_argument(
+        "--include-turn",
+        dest="include_turn",
+        action="store_true",
+        default=True,
+        help=(
+            "Include the daily 'Turn' (turnover rate) column in default universe loads "
+            "(default: True, Rule 11 backtest/live parity)."
+        ),
+    )
+    parser.add_argument(
+        "--no-include-turn",
+        dest="include_turn",
+        action="store_false",
+        default=True,
+        help=(
+            "Opt out of loading the daily 'Turn' column (restores the 6-column "
+            "Open..Volume, Amount daily contract; recorded in run metadata)."
+        ),
+    )
 
 
 def build_data_kwargs(args) -> dict:
@@ -156,7 +176,8 @@ def load_universe_with_banner(symbols, start, end, interval: str = "1d", *,
                                data_kwargs: Optional[dict] = None,
                                require_nonempty: bool = True,
                                loading_msg: Optional[str] = None,
-                               expected_last_session: Optional[dt.date] = None) -> dict:
+                               expected_last_session: Optional[dt.date] = None,
+                               include_turn: bool = True) -> dict:
     """`common.data.load_universe` wrapped with the standard console banner
     ('Loading N symbols ...' / 'Loaded M/N symbols (see warnings above for any
     skipped).') and, when `require_nonempty`, a ValueError if every symbol
@@ -172,6 +193,7 @@ def load_universe_with_banner(symbols, start, end, interval: str = "1d", *,
     print(loading_msg if loading_msg is not None else f"Loading {len(symbols)} symbols ...")
     universe = load_universe(symbols, start, end, interval, use_cache=use_cache,
                               cache_dir=cache_dir, expected_last_session=expected_last_session,
+                              include_turn=include_turn,
                               **data_kwargs)
     print(f"Loaded {len(universe)}/{len(symbols)} symbols (see warnings above for any skipped).")
     if require_nonempty and not universe:
@@ -739,6 +761,7 @@ def load_live_universe(
     delay = 0.5
     universe: dict = {}
     attempt = 0
+    include_turn = bool(getattr(args, "include_turn", True))
     for attempt in range(1, attempts_max + 1):
         universe = load_universe_with_banner(
             list(symbols),
@@ -751,6 +774,7 @@ def load_live_universe(
             require_nonempty=require_nonempty,
             loading_msg=loading_msg,
             expected_last_session=clock_ctx.expected_last_session,
+            include_turn=include_turn,
         )
         stale_now = [
             sym

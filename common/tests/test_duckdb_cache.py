@@ -2012,10 +2012,10 @@ def test_f6_columns_contract_daily_and_intraday(mem_cache):
     default_cols = ["Open", "High", "Low", "Close", "Volume"]
     # Default: exactly the required OHLCV columns, no `Amount`, even though it IS on disk.
     assert list(mem_cache.query_bars("F6Prov", "600519.F6", adjust="raw").columns) == default_cols
-    # "all" adds it back.
-    assert list(mem_cache.query_bars("F6Prov", "600519.F6", adjust="raw", columns="all").columns) == (
-        default_cols + ["Amount"]
-    )
+    # "all" adds Amount + Turn on daily bars (Option 2 contract: 7 cols).
+    df_all = mem_cache.query_bars("F6Prov", "600519.F6", adjust="raw", columns="all")
+    assert list(df_all.columns) == default_cols + ["Amount", "Turn"]
+    assert df_all["Turn"].isna().all()
     # An explicit sequence returns EXACTLY that, in that order.
     explicit = mem_cache.query_bars(
         "F6Prov", "600519.F6", adjust="raw", columns=["Close", "Amount"]
@@ -2038,7 +2038,7 @@ def test_f6_columns_contract_daily_and_intraday(mem_cache):
     empty_all = mem_cache.query_bars(
         "F6Prov", "600519.F6", start="2030-01-01", end="2030-01-02", adjust="raw", columns="all"
     )
-    assert list(empty_all.columns) == default_cols + ["Amount"] and empty_all.empty
+    assert list(empty_all.columns) == default_cols + ["Amount", "Turn"] and empty_all.empty
 
     # Intraday twin: same contract, and `Amount` really is opt-in there as well.
     ts = pd.to_datetime(["2024-01-02 09:35:00", "2024-01-02 09:40:00"])
@@ -2581,6 +2581,7 @@ def test_p2_next_vwap_works_through_load_universe_default_columns(tmp_path):
     )
     loaded = universe["600000.SH"]
     assert "Amount" in loaded.columns, "load_universe dropped the VWAP ingredient"
+    assert "Turn" in loaded.columns, "load_universe daily columns='all' must include Turn"
 
     idx = loaded.index
     target_weights = pd.DataFrame(np.nan, index=idx, columns=["600000.SH"])
@@ -2606,3 +2607,40 @@ def test_p2_next_vwap_works_through_load_universe_default_columns(tmp_path):
     assert "Amount" not in strict["600000.SH"].columns
     with pytest.raises(ValueError, match="next_vwap"):
         run_allocation_backtest(strict, target_weights, execution_price="next_vwap")
+
+
+def test_w11_next_vwap_all_nan_amount_raises_value_error(tmp_path):
+    """W1.1 guard: a 5-column provider whose Amount is all-NaN under columns='all' must still raise."""
+    from common.allocation_backtester import run_allocation_backtest
+    from common.data import BaseDataProvider, load_universe
+
+    class _FiveColProvider(BaseDataProvider):
+        native_adjust_basis = "qfq"
+
+        def fetch_ohlcv(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+            dates = pd.bdate_range("2024-01-02", periods=6)
+            return pd.DataFrame(
+                {
+                    "Open": [10.0, 10.2, 10.4, 10.3, 10.5, 10.6],
+                    "High": [10.3, 10.5, 10.6, 10.5, 10.8, 10.9],
+                    "Low": [9.9, 10.1, 10.2, 10.1, 10.3, 10.4],
+                    "Close": [10.2, 10.4, 10.3, 10.5, 10.6, 10.8],
+                    "Volume": [1000.0] * 6,
+                },
+                index=dates,
+            )
+
+    universe = load_universe(
+        ["600000.SH"],
+        "2024-01-01",
+        "2024-01-10",
+        use_cache=True,
+        cache_dir=str(tmp_path / "vwap_nan.duckdb"),
+        provider=_FiveColProvider(),
+    )
+    loaded = universe["600000.SH"]
+    assert "Amount" in loaded.columns and loaded["Amount"].isna().all()
+    target_weights = pd.DataFrame(np.nan, index=loaded.index, columns=["600000.SH"])
+    target_weights.iloc[0] = [1.0]
+    with pytest.raises(ValueError, match="next_vwap"):
+        run_allocation_backtest(universe, target_weights, execution_price="next_vwap")

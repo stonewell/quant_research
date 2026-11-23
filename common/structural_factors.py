@@ -18,7 +18,7 @@ inversion and circular dependency bugs.
 
 import math
 import warnings
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -668,6 +668,9 @@ def _run_cyq_recurrence(
     decay_mode: str = "turnover",
     kernel: str = "triangular",
     intraday_5m_bars: Optional[pd.DataFrame] = None,
+    *,
+    use_real_turn: bool = True,
+    turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
     """Shared causal CYQ chip-distribution recurrence kernel (Task C1.3 / MS2).
 
@@ -678,30 +681,50 @@ def _run_cyq_recurrence(
     """
     n_bars = len(bars)
     if n_bars == 0:
+        if turn_stats_out is not None:
+            turn_stats_out["used_real_turn"] = False
+            turn_stats_out["real_turn_bars"] = 0
+            turn_stats_out["proxy_turn_bars"] = 0
         empty = np.zeros(0, dtype=float)
         return empty, empty.copy(), empty.copy(), empty.copy(), False
 
     # 1. Effective turnover series tau_t
+    # Precompute the exact 60-day relative-volume proxy series so `use_real_turn=False`,
+    # no-Turn frames, and partial-NaN Turn bars (HIGH-1b) share one bit-identical fallback.
+    vol = (
+        bars["Volume"].fillna(1.0).astype(float)
+        if ("Volume" in bars.columns and not bars["Volume"].isna().all())
+        else pd.Series(1.0, index=bars.index)
+    )
+    sma_60 = vol.rolling(60, min_periods=1).mean()
+    rel_vol = vol / (sma_60 + 1e-8)
+    proxy_tau_series = (0.02 * rel_vol).clip(lower=0.002, upper=0.50)
+
     has_turn = False
-    if decay_mode == "turnover":
+    real_turn_bars = 0
+    proxy_turn_bars = int(n_bars)
+    tau_series = proxy_tau_series
+
+    if decay_mode == "turnover" and use_real_turn:
         for col in ["Turn", "turn", "Turnover", "turnover"]:
             if col in bars.columns and not bars[col].isna().all():
-                col_s = bars[col].astype(float)
-                med = col_s.dropna().median() if not col_s.dropna().empty else 0.0
-                tau_series = col_s / 100.0 if med > 1.0 else col_s
-                tau_series = tau_series.fillna(0.02).clip(lower=0.001, upper=0.99)
-                has_turn = True
-                break
+                col_s = pd.to_numeric(bars[col], errors="coerce").astype(float)
+                valid_mask = col_s.notna() & np.isfinite(col_s)
+                if bool(valid_mask.any()):
+                    med = float(col_s[valid_mask].median())
+                    scaled = (col_s / 100.0 if med > 1.0 else col_s).clip(lower=0.001, upper=0.99)
+                    # HIGH-1b fix: fill partial-NaN historical bars bar-by-bar with
+                    # `proxy_tau_series` rather than a flat 0.02 constant.
+                    tau_series = scaled.where(valid_mask, other=proxy_tau_series)
+                    has_turn = True
+                    real_turn_bars = int(valid_mask.sum())
+                    proxy_turn_bars = int((~valid_mask).sum())
+                    break
 
-    if not has_turn:
-        vol = (
-            bars["Volume"].fillna(1.0).astype(float)
-            if ("Volume" in bars.columns and not bars["Volume"].isna().all())
-            else pd.Series(1.0, index=bars.index)
-        )
-        sma_60 = vol.rolling(60, min_periods=1).mean()
-        rel_vol = vol / (sma_60 + 1e-8)
-        tau_series = (0.02 * rel_vol).clip(lower=0.002, upper=0.50)
+    if turn_stats_out is not None:
+        turn_stats_out["used_real_turn"] = bool(has_turn)
+        turn_stats_out["real_turn_bars"] = int(real_turn_bars)
+        turn_stats_out["proxy_turn_bars"] = int(proxy_turn_bars)
 
     lows = bars["Low"].to_numpy(dtype=float)
     highs = bars["High"].to_numpy(dtype=float)
@@ -851,6 +874,9 @@ def cyq_chip_distribution(
     decay_mode: str = "turnover",
     kernel: str = "triangular",
     intraday_5m_bars: Optional[pd.DataFrame] = None,
+    *,
+    use_real_turn: bool = True,
+    turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.Series, pd.Series]:
     """Computes recursive turnover-decay chip distribution and derived CYQ factors.
 
@@ -885,6 +911,10 @@ def cyq_chip_distribution(
         (cyq_winner_ratio, cyq_cost_concentration)
     """
     if len(bars) == 0:
+        if turn_stats_out is not None:
+            turn_stats_out["used_real_turn"] = False
+            turn_stats_out["real_turn_bars"] = 0
+            turn_stats_out["proxy_turn_bars"] = 0
         return (
             pd.Series(dtype=float, name="cyq_winner_ratio"),
             pd.Series(dtype=float, name="cyq_cost_concentration"),
@@ -896,6 +926,8 @@ def cyq_chip_distribution(
         decay_mode=decay_mode,
         kernel=kernel,
         intraday_5m_bars=intraday_5m_bars,
+        use_real_turn=use_real_turn,
+        turn_stats_out=turn_stats_out,
     )
     return (
         pd.Series(winner_ratio, index=bars.index, name="cyq_winner_ratio"),
@@ -921,9 +953,16 @@ def cyq_cost_deviation(
     decay_mode: str = "turnover",
     kernel: str = "triangular",
     intraday_5m_bars: Optional[pd.DataFrame] = None,
+    *,
+    use_real_turn: bool = True,
+    turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> pd.Series:
     """Computes CYQ average holding cost deviation: (Close_t - P_cost_t) / P_cost_t."""
     if len(bars) == 0:
+        if turn_stats_out is not None:
+            turn_stats_out["used_real_turn"] = False
+            turn_stats_out["real_turn_bars"] = 0
+            turn_stats_out["proxy_turn_bars"] = 0
         return pd.Series(dtype=float, index=bars.index, name="cyq_cost_deviation")
     _, _, cost_dev, _, _ = _run_cyq_recurrence(
         bars,
@@ -931,6 +970,8 @@ def cyq_cost_deviation(
         decay_mode=decay_mode,
         kernel=kernel,
         intraday_5m_bars=intraday_5m_bars,
+        use_real_turn=use_real_turn,
+        turn_stats_out=turn_stats_out,
     )
     return pd.Series(cost_dev, index=bars.index, name="cyq_cost_deviation")
 
@@ -941,9 +982,16 @@ def cyq_quantile_spread_90_10(
     decay_mode: str = "turnover",
     kernel: str = "triangular",
     intraday_5m_bars: Optional[pd.DataFrame] = None,
+    *,
+    use_real_turn: bool = True,
+    turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> pd.Series:
     """Computes raw CYQ 90-10 quantile price spread: (P_90 - P_10) / P_50."""
     if len(bars) == 0:
+        if turn_stats_out is not None:
+            turn_stats_out["used_real_turn"] = False
+            turn_stats_out["real_turn_bars"] = 0
+            turn_stats_out["proxy_turn_bars"] = 0
         return pd.Series(dtype=float, index=bars.index, name="cyq_quantile_spread_90_10")
     _, _, _, q_spread, _ = _run_cyq_recurrence(
         bars,
@@ -951,6 +999,8 @@ def cyq_quantile_spread_90_10(
         decay_mode=decay_mode,
         kernel=kernel,
         intraday_5m_bars=intraday_5m_bars,
+        use_real_turn=use_real_turn,
+        turn_stats_out=turn_stats_out,
     )
     return pd.Series(q_spread, index=bars.index, name="cyq_quantile_spread_90_10")
 
@@ -959,6 +1009,8 @@ def enrich_universe_with_structural_features(
     universe: Dict[str, pd.DataFrame],
     lookback: int = 60,
     inplace: bool = False,
+    *,
+    use_real_turn: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     """Pre-computes and attaches structural, Wyckoff, fractal, and volume profile features.
 
@@ -1083,7 +1135,7 @@ def enrich_universe_with_structural_features(
         need_wr = "cyq_winner_ratio" not in d.columns
         need_cc = "cyq_cost_concentration" not in d.columns
         if need_wr or need_cc:
-            wr, cc = cyq_chip_distribution(d)
+            wr, cc = cyq_chip_distribution(d, use_real_turn=use_real_turn)
             if need_wr:
                 d["cyq_winner_ratio"] = wr
             if need_cc:

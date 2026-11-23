@@ -456,3 +456,70 @@ def test_ms19_wyckoff_effort_result_kurtosis_multiplier_and_nan_contract():
         wyckoff_effort_result(daily, lag=5, volume_lookback=20),
         check_names=False,
     )
+
+
+def test_w11_high1b_partial_nan_turn_fallback_and_use_real_turn_isolation():
+    """W1.1 HIGH-1b: partial-NaN Turn falls back bar-by-bar to 60d volume proxy,
+    turn_stats_out reports exact counts, and enrich_universe_with_structural_features
+    defaults to use_real_turn=False (zero drift when Turn is present)."""
+    from common.structural_factors import (
+        cyq_chip_distribution,
+        cyq_cost_deviation,
+        enrich_universe_with_structural_features,
+    )
+
+    dates = pd.bdate_range("2025-01-02", periods=30)
+    close = np.linspace(100.0, 140.0, 30)
+    # Varying volume so 60d volume proxy differs materially from flat 0.02
+    vol = np.linspace(1000.0, 8000.0, 30)
+    base = pd.DataFrame(
+        {
+            "Open": close - 0.5,
+            "High": close + 1.0,
+            "Low": close - 1.0,
+            "Close": close,
+            "Volume": vol,
+        },
+        index=dates,
+    )
+
+    # 1. Partial-NaN Turn: only the very last bar has real Turn; prior 29 bars are NaN.
+    # Because bar 0..28 are NaN, their chip distribution MUST match the pure-proxy run
+    # bar-for-bar up through bar 28 (NOT degrade to flat 0.02!).
+    partial = base.copy()
+    partial["Turn"] = np.nan
+    partial.iloc[-1, partial.columns.get_loc("Turn")] = 25.0
+
+    stats_partial = {}
+    cd_partial = cyq_cost_deviation(partial, turn_stats_out=stats_partial)
+    stats_proxy = {}
+    cd_proxy = cyq_cost_deviation(base, turn_stats_out=stats_proxy)
+
+    assert stats_partial == {
+        "used_real_turn": True,
+        "real_turn_bars": 1,
+        "proxy_turn_bars": 29,
+    }
+    assert stats_proxy == {
+        "used_real_turn": False,
+        "real_turn_bars": 0,
+        "proxy_turn_bars": 30,
+    }
+    # Bars 0..28 must be 100% bit-identical to pure proxy; bar 29 diverges due to real Turn=25%
+    np.testing.assert_array_equal(cd_partial.iloc[:-1].to_numpy(), cd_proxy.iloc[:-1].to_numpy())
+    assert cd_partial.iloc[-1] != cd_proxy.iloc[-1]
+
+    # 2. use_real_turn=False on a frame WITH Turn is 100% bit-identical to no-Turn frame
+    full_turn = base.assign(Turn=15.0)
+    wr_off, cc_off = cyq_chip_distribution(full_turn, use_real_turn=False)
+    wr_no, cc_no = cyq_chip_distribution(base)
+    pd.testing.assert_series_equal(wr_off, wr_no)
+    pd.testing.assert_series_equal(cc_off, cc_no)
+
+    # 3. enrich_universe_with_structural_features defaults to use_real_turn=False
+    enr_with = enrich_universe_with_structural_features({"A": full_turn})["A"]
+    enr_without = enrich_universe_with_structural_features({"A": base})["A"]
+    pd.testing.assert_series_equal(enr_with["cyq_winner_ratio"], enr_without["cyq_winner_ratio"])
+    pd.testing.assert_series_equal(
+        enr_with["cyq_cost_concentration"], enr_without["cyq_cost_concentration"]
+    )

@@ -469,20 +469,24 @@ def _day_keys(index: Any) -> np.ndarray:
     return idx.normalize().values.astype("datetime64[ns]")
 
 
-def _resolve_requested_columns(columns: Any) -> Optional[List[str]]:
+def _resolve_requested_columns(columns: Any, *, intraday: bool = False) -> Optional[List[str]]:
     """Normalises the `columns=` argument of the bar queries.
 
-    `None` -> `None`, meaning "the required OHLCV columns only" -- `Amount` is NOT included, per
-    the M3.6 rule that a newer column must be explicitly requested (a cache read must not change
-    shape because a *different* symbol happened to have an amount on disk).
-    `"all"` (case-insensitive) -> required OHLCV + `Amount`.
+    `None` -> `None`, meaning "the required OHLCV columns only" -- `Amount` / `Turn` are NOT
+    included, per the M3.6 rule that a newer column must be explicitly requested (a cache read
+    must not change shape because a *different* symbol happened to have extra columns on disk).
+    `"all"` (case-insensitive):
+      - daily (`intraday=False`): required OHLCV + `Amount` + `Turn` (7 columns, Option 2 contract).
+      - intraday (`intraday=True`): required OHLCV + `Amount` (6 columns; intraday table has no `turn`).
     A sequence (or a single column name) -> exactly that, validated by the caller.
     """
     if columns is None:
         return None
     if isinstance(columns, str):
         if columns.strip().lower() == _COLUMNS_ALL:
-            return list(_REQUIRED_OHLCV_COLUMNS) + ["Amount"]
+            if intraday:
+                return list(_REQUIRED_OHLCV_COLUMNS) + ["Amount"]
+            return list(_REQUIRED_OHLCV_COLUMNS) + ["Amount", "Turn"]
         return [columns]
     return [str(c) for c in columns]
 
@@ -3662,7 +3666,7 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY ts"
         )
 
-        requested_cols = _resolve_requested_columns(columns)
+        requested_cols = _resolve_requested_columns(columns, intraday=True)
 
         con = self._get_connection(read_only=True)
         try:
@@ -3915,7 +3919,7 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY date"
         )
 
-        requested_cols = _resolve_requested_columns(columns)
+        requested_cols = _resolve_requested_columns(columns, intraday=False)
 
         con = self._get_connection(read_only=True)
         try:
@@ -3999,7 +4003,7 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY symbol, ts"
         )
 
-        requested_cols = _resolve_requested_columns(columns)
+        requested_cols = _resolve_requested_columns(columns, intraday=True)
 
         con = self._get_connection(read_only=True)
         try:
@@ -4098,7 +4102,7 @@ class DuckDBCache:
             f"WHERE {' AND '.join(clauses)} ORDER BY symbol, date"
         )
 
-        requested_cols = _resolve_requested_columns(columns)
+        requested_cols = _resolve_requested_columns(columns, intraday=False)
 
         con = self._get_connection(read_only=True)
         try:
