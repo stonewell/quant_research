@@ -74,7 +74,7 @@ from .config import StrategyConfig
 class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
     """Microstructure & Short-Horizon Multi-Factor Composite Strategy (Track MS, MS7)."""
 
-    version: str = "1.1.0"
+    version: str = "1.2.0"
 
     def __init__(
         self,
@@ -82,7 +82,7 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
         version: Optional[str] = None,
     ) -> None:
         self.config = config or StrategyConfig()
-        strat_version = version or getattr(self.__class__, "version", "1.1.0")
+        strat_version = version or getattr(self.__class__, "version", "1.2.0")
         self._last_ms7_diagnostics: Dict[str, Any] = {
             "real_turn_bars": 0,
             "proxy_turn_bars": 0,
@@ -92,6 +92,7 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
             "iceberg_5m_bars": 0,
             "smart_money_non_nan_cells": 0,
             "iceberg_non_nan_cells": 0,
+            "turn_mode": "relative",
         }
         super().__init__(
             name="microstructure_alpha_composite",
@@ -271,12 +272,14 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
                     df_s,
                     n_bins=50,
                     intraday_5m_bars=df_5m,
+                    turn_mode="relative",
                     turn_stats_out=turn_stats,
                 ).reindex(master_index)
                 cs = cyq_quantile_spread_90_10(
                     df_s,
                     n_bins=50,
                     intraday_5m_bars=df_5m,
+                    turn_mode="relative",
                 ).reindex(master_index)
                 real_turn_bars_total += int(turn_stats.get("real_turn_bars", 0))
                 proxy_turn_bars_total += int(turn_stats.get("proxy_turn_bars", 0))
@@ -352,6 +355,7 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
             "iceberg_5m_bars": int(iceberg_5m_bars_total),
             "smart_money_non_nan_cells": int(sm_df.notna().sum().sum()) if not sm_df.empty else 0,
             "iceberg_non_nan_cells": int(ice_df.notna().sum().sum()) if not ice_df.empty else 0,
+            "turn_mode": "relative",
         }
 
         micro_components: List[Tuple[float, pd.DataFrame]] = [

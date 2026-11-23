@@ -7960,3 +7960,40 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
      - **合并净效应（`C vs A`）**：`ΔSharpe = -0.1949`（`5/18` 正、`13/18` 负，`t = -1.2451`）；**`C vs M1.2`**：`+0.1004`（`13/18`, `t = 0.3750`）；**`C vs CFSB`**：`-0.3454`（相对 `rolling_ic_ir`）/ `-0.5817`（相对现网 `regime_ic_ir_hybrid`）。
      - **单次 ERS 与 `MS5` 预喂诊断**：Arm C 单次 ERS（`ers_called_count=1`, `n_random=50`）`percentile = 0.0`、`trusted = False`；`MS5` 在 20 股实盘面板上输出 `asymmetric_status = "OK"`、**`short_leg_illusion = True`**（暴露 `MS7` 在该池存在空头腿幻觉）、`crowding_status = "NORMAL"`（`corr = -0.1184`）。
      - **最终裁定**：`MS7 v1.1.0` 在 100% 真 `Turn` + 100% 五年 5m 全覆盖下**明确未通过 `§2.21` Option B 门禁**，保持严格 opt-in（`modifies_default_config = False`），`ChanFourStateBlendStrategy v1.8.0` 继续为绝对生产基线。
+
+## 59. `MS27`：CYQ 真实换手率跨市值相对归一化修复（`MicrostructureAlphaCompositeStrategy` `1.1.0 → 1.2.0`，`BASE_VERSION` 维持 `2.3.0`，2026-11-22）
+
+> **本节编号**：落笔前实测现有最高节号为 **58**，故本节取 **59**，只追加在文件末尾；§1–§58 一字未改。
+> 对应台账见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.26.6（`MS27` `[x]`）。
+
+### 59.1 版本轴与同步更新（AGENTS.md 第 7 条）
+
+| 项 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `MicrostructureAlphaCompositeStrategy.version` | `1.1.0` | **`1.2.0`** | CYQ 换手默认改用 60 日相对换手归一化 `turn_mode="relative"`（Arm E），并在 `_last_ms7_diagnostics` 记录 `turn_mode` |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.3.0` | **`2.3.0`（不变）** | `blend_base.py` 零改动；`enrich_universe_with_structural_features` 维持 `use_real_turn=False` 隔离全部 6 个 Blend 子类 |
+| `ChanFourStateBlendStrategy.version` | `1.8.0` | **`1.8.0`（不变）** | 保持 `blend_weighting_mode="regime_ic_ir_hybrid"`，含/不含 `Turn` 权重 100% 逐位零漂移 |
+| `strategy_dumps/*.json` | `1.1.0` | **已重生成（59 份）** | 仅 `microstructure_alpha_composite_strategy.json` 升级 `strategy_version: "1.2.0"` |
+
+### 59.2 根因与数学规范
+
+- **根因（2026-11-22 2×2 + Arm E 只读探索，基于 `data/cache_research_ms.duckdb` `2022-01-05..2026-11-20` 1,165 交易日 / 18 折 / 1,133,905 行 5m）**：
+  - 直接消费原始 BaoStock `Turn` 绝对值（Arm B/C）时，超大盘蓝筹（日均换手 ~0.3%）与中盘科技（日均换手 ~10%）静态换手量级相差 30 倍，造成 CYQ 成本衰减速度截面畸变，`MS5` 触发 `short_leg_illusion=True`，多头顶组年化超额从 `+4.76%`（Arm A）崩塌至 `-31.68%`（Arm B）/ `-35.17%`（Arm C），全期 Sharpe 由 `0.7683` 降至 `0.3211 / 0.4300`。
+- **修复公式（`common/structural_factors.py::_run_cyq_recurrence`）**：
+  - 新增关键字参数 `turn_mode: str = "relative"`（校验 `turn_mode in ("relative", "raw")`，非法值抛 `ValueError`），同步透传至 `cyq_chip_distribution`、`cyq_cost_deviation`、`cyq_quantile_spread_90_10` 并在 `turn_stats_out` 记录 `"turn_mode"`：
+    - `turn_mode="relative"`（默认）：$\tau_t = \mathrm{clip}\!\left(0.02 \times \frac{\max(\mathrm{Turn}_t, 0)}{\mathrm{SMA}_{60}(\max(\mathrm{Turn}, 0))_t + 10^{-8}},\; 0.002,\; 0.50\right)$，对 `%` 与小数口径天然量级不变，并完全消除跨市值静态换手偏置；
+    - `turn_mode="raw"`：保留原有绝对换手中位数启发式缩放；
+    - 缺失 `NaN` bar 仍严格按 `MS21`（`HIGH-1b`）逐日回落 `proxy_tau_series`。
+
+### 59.3 生产级 `MS7 v1.2.0` 实证验证（只读 `data/cache_research_ms.duckdb`，`md5 = 7d6a4f03f73d53bb50a44b472aacd22f` 不变）
+
+- 直接以现网 `MicrostructureAlphaCompositeStrategy v1.2.0` 运行于 `data/cache_research_ms.duckdb`（100% 真 `Turn` + 100% 2022–2026 5m，零内存改写 `Turn`）：
+  - **全期（1,165 交易日，`§56` 齐平）**：Sharpe **`0.7718`**（vs Arm C `0.4300`, `+0.3418`；vs Arm A `0.7683`, `+0.0035`）、CAGR **`12.70%`**、MaxDD **`19.49%`**（vs Arm C `24.25%`）、Turnover `84.29`（与 Arm E 探索臂逐位完全一致）。
+  - **18 折 Walk-Forward（严格折内因果 `SMA60(Turn)`）**：均值 Sharpe **`0.7674`**（vs Arm C `0.6530`, `+0.1144`；vs Arm D `0.7397`, `+0.0277`；vs `M1.2` `0.5526`, `+0.2148`）、均值 CAGR `17.91%`、均值 MaxDD `10.94%`、累计换手 `165.57`（注：Arm E 探索脚本在切折前预计算全期 `SMA60` 得 `0.8095`，生产折内严格因果口径为 `0.7674`，二者均显著优于 Arm C 与 Arm D）。
+  - **`MS5` 预喂与 Rule 10 探针**：`real_turn_bars = 23,300`、`proxy_turn_bars = 0`、`n_symbols_with_5m = 20`、`iceberg_5m_bars = 23,604`、`smart_money_non_nan_cells = 23,260`、`turn_mode = "relative"`；`asymmetric_status = "OK"`、`mean_ic = +0.0121`、`ic_ir = 0.7356`、`long_ic_contribution_ratio = 0.4354`、**`short_leg_illusion = False`**、`top_group_excess_return_ann = +7.28%`、`crowding_status = "NORMAL"`。
+  - **边界裁定**：`MS7 v1.2.0` 仍低于现网 `ChanFourStateBlendStrategy v1.8.0`（18 折 `1.2347`、全期 `1.1823`），维持 opt-in（不改默认生产配置）。
+
+### 59.4 离线验证（100% 离线、无网络）
+
+- `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies`（59 份重导）。
+- `pipeline/.venv/bin/python -m pytest common/tests/test_structural_factors.py common/tests/test_turn_col_end_to_end.py common/tests/test_strategy_versioning.py pipeline/research_strategy/tests/test_blend_strategy_versioning.py pipeline/research_strategy/tests/test_microstructure_alpha_strategy.py pipeline/tests/test_config_wiring.py -q --import-mode=importlib` → **57 passed**（含新增 `test_ms27_relative_turn_mode_scale_invariance_and_raw_divergence`）。

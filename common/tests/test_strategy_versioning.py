@@ -241,7 +241,7 @@ def test_research_strategies_versioning():
         WyckoffChanSpringStrategy: "1.1.0",
         ChanMeanReversionDivergenceStrategy: "1.1.0",
         ChanVolumeProfileHybridStrategy: "1.1.0",
-        MicrostructureAlphaCompositeStrategy: "1.1.0",
+        MicrostructureAlphaCompositeStrategy: "1.2.0",
     }
     for cls, expected in expected_versions.items():
         s = cls()

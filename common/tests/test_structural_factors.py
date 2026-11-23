@@ -380,11 +380,11 @@ def test_ms2_real_turn_priority_and_ms12_causality():
     high_turn = base.assign(Turn=50.0)
     low_turn = base.assign(Turn=1.5)
 
-    dev_high = cyq_cost_deviation(high_turn)
-    dev_low = cyq_cost_deviation(low_turn)
+    dev_high = cyq_cost_deviation(high_turn, turn_mode="raw")
+    dev_low = cyq_cost_deviation(low_turn, turn_mode="raw")
     dev_proxy = cyq_cost_deviation(base)
-    q_high = cyq_quantile_spread_90_10(high_turn)
-    q_low = cyq_quantile_spread_90_10(low_turn)
+    q_high = cyq_quantile_spread_90_10(high_turn, turn_mode="raw")
+    q_low = cyq_quantile_spread_90_10(low_turn, turn_mode="raw")
 
     # High turnover anchors mean holding cost much closer to today's close
     assert abs(dev_high.iloc[-1]) < abs(dev_low.iloc[-1])
@@ -499,11 +499,13 @@ def test_w11_high1b_partial_nan_turn_fallback_and_use_real_turn_isolation():
         "used_real_turn": True,
         "real_turn_bars": 1,
         "proxy_turn_bars": 29,
+        "turn_mode": "relative",
     }
     assert stats_proxy == {
         "used_real_turn": False,
         "real_turn_bars": 0,
         "proxy_turn_bars": 30,
+        "turn_mode": "relative",
     }
     # Bars 0..28 must be 100% bit-identical to pure proxy; bar 29 diverges due to real Turn=25%
     np.testing.assert_array_equal(cd_partial.iloc[:-1].to_numpy(), cd_proxy.iloc[:-1].to_numpy())
@@ -523,3 +525,56 @@ def test_w11_high1b_partial_nan_turn_fallback_and_use_real_turn_isolation():
     pd.testing.assert_series_equal(
         enr_with["cyq_cost_concentration"], enr_without["cyq_cost_concentration"]
     )
+
+
+def test_ms27_relative_turn_mode_scale_invariance_and_raw_divergence():
+    """MS27 (Arm E): turn_mode='relative' is scale-invariant across mega-cap (0.5% base Turn)
+    vs mid-cap (10.0% base Turn) sharing the same relative turnover spike profile, whereas
+    turn_mode='raw' diverges; invalid turn_mode raises ValueError."""
+    from common.structural_factors import (
+        cyq_chip_distribution,
+        cyq_cost_deviation,
+        cyq_quantile_spread_90_10,
+    )
+
+    dates = pd.bdate_range("2025-01-02", periods=80)
+    rng = np.random.default_rng(27)
+    close = 50.0 * np.exp(np.cumsum(rng.normal(0.001, 0.015, size=80)))
+    rel_spike = rng.uniform(0.5, 3.0, size=80)
+    base = pd.DataFrame(
+        {
+            "Open": close * 0.995,
+            "High": close * 1.015,
+            "Low": close * 0.985,
+            "Close": close,
+            "Volume": np.full(80, 10000.0),
+        },
+        index=dates,
+    )
+    mega_cap = base.assign(Turn=0.5 * rel_spike)   # ~0.5% base daily turnover
+    mid_cap = base.assign(Turn=10.0 * rel_spike)   # ~10.0% base daily turnover (20x scale)
+
+    # Under turn_mode="relative" (default), both stocks produce identical CYQ series
+    stats_mega: dict = {}
+    stats_mid: dict = {}
+    cd_mega_rel = cyq_cost_deviation(mega_cap, turn_mode="relative", turn_stats_out=stats_mega)
+    cd_mid_rel = cyq_cost_deviation(mid_cap, turn_mode="relative", turn_stats_out=stats_mid)
+    qs_mega_rel = cyq_quantile_spread_90_10(mega_cap, turn_mode="relative")
+    qs_mid_rel = cyq_quantile_spread_90_10(mid_cap, turn_mode="relative")
+
+    np.testing.assert_allclose(cd_mega_rel.to_numpy(), cd_mid_rel.to_numpy(), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(qs_mega_rel.to_numpy(), qs_mid_rel.to_numpy(), rtol=1e-6, atol=1e-6)
+    assert stats_mega["turn_mode"] == "relative"
+    assert stats_mid["turn_mode"] == "relative"
+    assert stats_mega["real_turn_bars"] == 80
+
+    # Under turn_mode="raw", the 20x turnover level difference causes material divergence
+    cd_mega_raw = cyq_cost_deviation(mega_cap, turn_mode="raw")
+    cd_mid_raw = cyq_cost_deviation(mid_cap, turn_mode="raw")
+    assert float((cd_mega_raw - cd_mid_raw).abs().max()) > 1e-2
+
+    # Invalid turn_mode raises ValueError (non-empty and empty frames)
+    with pytest.raises(ValueError, match="turn_mode"):
+        cyq_cost_deviation(mega_cap, turn_mode="bogus")
+    with pytest.raises(ValueError, match="turn_mode"):
+        cyq_chip_distribution(mega_cap.iloc[:0], turn_mode="bogus")

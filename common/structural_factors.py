@@ -670,21 +670,37 @@ def _run_cyq_recurrence(
     intraday_5m_bars: Optional[pd.DataFrame] = None,
     *,
     use_real_turn: bool = True,
+    turn_mode: str = "relative",
     turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Shared causal CYQ chip-distribution recurrence kernel (Task C1.3 / MS2).
+    """Shared causal CYQ chip-distribution recurrence kernel (Task C1.3 / MS2 / MS27).
 
     Returns ``(winner_ratio, cost_concentration, cost_deviation, quantile_spread_90_10,
     used_real_turn)``. Preserves the exact recurrence and bin-grid math of
     ``cyq_chip_distribution`` with zero numerical drift on ``winner_ratio`` and
     ``cost_concentration``.
+
+    Parameters
+    ----------
+    turn_mode : {"relative", "raw"}, default "relative"
+        How real exchange turnover (`Turn`) is converted into effective decay ``tau_t``:
+        - ``"relative"`` (MS27 / Arm E): normalizes ``Turn`` by its own causal 60-day
+          rolling mean ``clip(0.02 * Turn / (SMA60(Turn) + 1e-8), 0.002, 0.50)``,
+          which is scale-invariant across ``%`` vs decimal and eliminates static
+          cross-sectional size bias (e.g. 0.3% mega-cap banks vs 10% mid-cap tech)
+          that caused ``short_leg_illusion=True`` under raw absolute ``Turn``.
+        - ``"raw"``: legacy absolute turnover decay ``clip(Turn/100 if med>1 else Turn, 0.001, 0.99)``.
     """
+    if turn_mode not in ("relative", "raw"):
+        raise ValueError(f"turn_mode must be 'relative' or 'raw', got {turn_mode!r}")
+
     n_bars = len(bars)
     if n_bars == 0:
         if turn_stats_out is not None:
             turn_stats_out["used_real_turn"] = False
             turn_stats_out["real_turn_bars"] = 0
             turn_stats_out["proxy_turn_bars"] = 0
+            turn_stats_out["turn_mode"] = str(turn_mode)
         empty = np.zeros(0, dtype=float)
         return empty, empty.copy(), empty.copy(), empty.copy(), False
 
@@ -711,8 +727,16 @@ def _run_cyq_recurrence(
                 col_s = pd.to_numeric(bars[col], errors="coerce").astype(float)
                 valid_mask = col_s.notna() & np.isfinite(col_s)
                 if bool(valid_mask.any()):
-                    med = float(col_s[valid_mask].median())
-                    scaled = (col_s / 100.0 if med > 1.0 else col_s).clip(lower=0.001, upper=0.99)
+                    if turn_mode == "relative":
+                        nonneg_turn = col_s.where(valid_mask).clip(lower=0.0)
+                        sma_60_turn = nonneg_turn.rolling(60, min_periods=1).mean()
+                        rel_turn = nonneg_turn / (sma_60_turn + 1e-8)
+                        scaled = (0.02 * rel_turn).clip(lower=0.002, upper=0.50)
+                    else:
+                        med = float(col_s[valid_mask].median())
+                        scaled = (col_s / 100.0 if med > 1.0 else col_s).clip(
+                            lower=0.001, upper=0.99
+                        )
                     # HIGH-1b fix: fill partial-NaN historical bars bar-by-bar with
                     # `proxy_tau_series` rather than a flat 0.02 constant.
                     tau_series = scaled.where(valid_mask, other=proxy_tau_series)
@@ -725,6 +749,7 @@ def _run_cyq_recurrence(
         turn_stats_out["used_real_turn"] = bool(has_turn)
         turn_stats_out["real_turn_bars"] = int(real_turn_bars)
         turn_stats_out["proxy_turn_bars"] = int(proxy_turn_bars)
+        turn_stats_out["turn_mode"] = str(turn_mode)
 
     lows = bars["Low"].to_numpy(dtype=float)
     highs = bars["High"].to_numpy(dtype=float)
@@ -876,6 +901,7 @@ def cyq_chip_distribution(
     intraday_5m_bars: Optional[pd.DataFrame] = None,
     *,
     use_real_turn: bool = True,
+    turn_mode: str = "relative",
     turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.Series, pd.Series]:
     """Computes recursive turnover-decay chip distribution and derived CYQ factors.
@@ -911,10 +937,13 @@ def cyq_chip_distribution(
         (cyq_winner_ratio, cyq_cost_concentration)
     """
     if len(bars) == 0:
+        if turn_mode not in ("relative", "raw"):
+            raise ValueError(f"turn_mode must be 'relative' or 'raw', got {turn_mode!r}")
         if turn_stats_out is not None:
             turn_stats_out["used_real_turn"] = False
             turn_stats_out["real_turn_bars"] = 0
             turn_stats_out["proxy_turn_bars"] = 0
+            turn_stats_out["turn_mode"] = str(turn_mode)
         return (
             pd.Series(dtype=float, name="cyq_winner_ratio"),
             pd.Series(dtype=float, name="cyq_cost_concentration"),
@@ -927,6 +956,7 @@ def cyq_chip_distribution(
         kernel=kernel,
         intraday_5m_bars=intraday_5m_bars,
         use_real_turn=use_real_turn,
+        turn_mode=turn_mode,
         turn_stats_out=turn_stats_out,
     )
     return (
@@ -955,14 +985,18 @@ def cyq_cost_deviation(
     intraday_5m_bars: Optional[pd.DataFrame] = None,
     *,
     use_real_turn: bool = True,
+    turn_mode: str = "relative",
     turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> pd.Series:
     """Computes CYQ average holding cost deviation: (Close_t - P_cost_t) / P_cost_t."""
     if len(bars) == 0:
+        if turn_mode not in ("relative", "raw"):
+            raise ValueError(f"turn_mode must be 'relative' or 'raw', got {turn_mode!r}")
         if turn_stats_out is not None:
             turn_stats_out["used_real_turn"] = False
             turn_stats_out["real_turn_bars"] = 0
             turn_stats_out["proxy_turn_bars"] = 0
+            turn_stats_out["turn_mode"] = str(turn_mode)
         return pd.Series(dtype=float, index=bars.index, name="cyq_cost_deviation")
     _, _, cost_dev, _, _ = _run_cyq_recurrence(
         bars,
@@ -971,6 +1005,7 @@ def cyq_cost_deviation(
         kernel=kernel,
         intraday_5m_bars=intraday_5m_bars,
         use_real_turn=use_real_turn,
+        turn_mode=turn_mode,
         turn_stats_out=turn_stats_out,
     )
     return pd.Series(cost_dev, index=bars.index, name="cyq_cost_deviation")
@@ -984,14 +1019,18 @@ def cyq_quantile_spread_90_10(
     intraday_5m_bars: Optional[pd.DataFrame] = None,
     *,
     use_real_turn: bool = True,
+    turn_mode: str = "relative",
     turn_stats_out: Optional[Dict[str, Any]] = None,
 ) -> pd.Series:
     """Computes raw CYQ 90-10 quantile price spread: (P_90 - P_10) / P_50."""
     if len(bars) == 0:
+        if turn_mode not in ("relative", "raw"):
+            raise ValueError(f"turn_mode must be 'relative' or 'raw', got {turn_mode!r}")
         if turn_stats_out is not None:
             turn_stats_out["used_real_turn"] = False
             turn_stats_out["real_turn_bars"] = 0
             turn_stats_out["proxy_turn_bars"] = 0
+            turn_stats_out["turn_mode"] = str(turn_mode)
         return pd.Series(dtype=float, index=bars.index, name="cyq_quantile_spread_90_10")
     _, _, _, q_spread, _ = _run_cyq_recurrence(
         bars,
@@ -1000,6 +1039,7 @@ def cyq_quantile_spread_90_10(
         kernel=kernel,
         intraday_5m_bars=intraday_5m_bars,
         use_real_turn=use_real_turn,
+        turn_mode=turn_mode,
         turn_stats_out=turn_stats_out,
     )
     return pd.Series(q_spread, index=bars.index, name="cyq_quantile_spread_90_10")

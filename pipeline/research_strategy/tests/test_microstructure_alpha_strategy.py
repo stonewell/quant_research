@@ -39,7 +39,7 @@ from scripts.verify_ms7_exit_gate import (
 
 def test_ms7_version_and_registration():
     inst = MicrostructureAlphaCompositeStrategy()
-    assert inst.version == "1.1.0"
+    assert inst.version == "1.2.0"
     assert getattr(inst, "base_version", None) is None
     assert "MicrostructureAlphaCompositeStrategy" in STRATEGY_CLASS_MAP
     assert STRATEGY_CLASS_MAP["MicrostructureAlphaCompositeStrategy"] is MicrostructureAlphaCompositeStrategy
@@ -53,7 +53,7 @@ def test_ms7_version_and_registration():
         "microstructure_alpha_composite", cfg["microstructure_alpha_composite"]
     )
     assert isinstance(built, MicrostructureAlphaCompositeStrategy)
-    assert built.version == "1.1.0"
+    assert built.version == "1.2.0"
 
 
 def test_ms7_sparse_weights_and_explicit_zero_exit_contract():
@@ -247,7 +247,7 @@ def test_w13_ms7_consumes_real_turn_and_intraday_5m_with_discriminating_probes()
     }
 
     strat = MicrostructureAlphaCompositeStrategy()
-    assert strat.version == "1.1.0"
+    assert strat.version == "1.2.0"
 
     base_params = {"ms7_rebalance_freq_days": 10, "cash_proxy": "BIL"}
     w_proxy = strat.generate_weights(universe_base, base_params)
@@ -256,6 +256,7 @@ def test_w13_ms7_consumes_real_turn_and_intraday_5m_with_discriminating_probes()
     assert diag_proxy["proxy_turn_bars"] > 0
     assert diag_proxy["has_any_5m"] is False
     assert diag_proxy["iceberg_5m_bars"] == 0
+    assert diag_proxy["turn_mode"] == "relative"
 
     w_5m = strat.generate_weights(
         universe_turn, {**base_params, "intraday_5m_universe": universe_5m}
@@ -268,6 +269,7 @@ def test_w13_ms7_consumes_real_turn_and_intraday_5m_with_discriminating_probes()
     assert diag_5m["iceberg_5m_bars"] > 0
     assert diag_5m["smart_money_non_nan_cells"] > 0
     assert diag_5m["iceberg_non_nan_cells"] > 0
+    assert diag_5m["turn_mode"] == "relative"
 
     # Rule 10 discriminating probe: weights differ when real Turn + 5m bars are supplied
     diff = (w_5m.fillna(0.0) - w_proxy.fillna(0.0)).abs().to_numpy().max()
