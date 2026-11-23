@@ -74,7 +74,7 @@ from .config import StrategyConfig
 class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
     """Microstructure & Short-Horizon Multi-Factor Composite Strategy (Track MS, MS7)."""
 
-    version: str = "1.0.0"
+    version: str = "1.1.0"
 
     def __init__(
         self,
@@ -82,7 +82,17 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
         version: Optional[str] = None,
     ) -> None:
         self.config = config or StrategyConfig()
-        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        strat_version = version or getattr(self.__class__, "version", "1.1.0")
+        self._last_ms7_diagnostics: Dict[str, Any] = {
+            "real_turn_bars": 0,
+            "proxy_turn_bars": 0,
+            "n_symbols_with_real_turn": 0,
+            "n_symbols_with_5m": 0,
+            "has_any_5m": False,
+            "iceberg_5m_bars": 0,
+            "smart_money_non_nan_cells": 0,
+            "iceberg_non_nan_cells": 0,
+        }
         super().__init__(
             name="microstructure_alpha_composite",
             param_grid={},
@@ -217,15 +227,61 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
             return pd.DataFrame(out, index=master_index, columns=risky_symbols, dtype=np.float64)
 
         # 2. Multi-Factor Panel Extraction (MS2, MS3, MS4, MS16)
+        # Pre-slice intraday 5m bars causally to <= master_index[-1] so walkforward
+        # fold evaluation can never peek past the fold's last session.
+        cutoff_day = pd.Timestamp(master_index[-1]).normalize() if len(master_index) > 0 else None
+        sliced_5m_map: Dict[str, Optional[pd.DataFrame]] = {}
+        n_symbols_with_5m = 0
+        iceberg_5m_bars_total = 0
+        for s in risky_symbols:
+            raw_5m = intraday_5m_map.get(s) if isinstance(intraday_5m_map, dict) else None
+            if raw_5m is not None and not raw_5m.empty:
+                df_5m = raw_5m
+                if cutoff_day is not None and isinstance(df_5m.index, pd.DatetimeIndex):
+                    idx_5m = df_5m.index.tz_localize(None) if df_5m.index.tz is not None else df_5m.index
+                    df_5m = df_5m.loc[idx_5m.normalize() <= cutoff_day]
+                if not df_5m.empty:
+                    sliced_5m_map[s] = df_5m
+                    n_symbols_with_5m += 1
+                    if isinstance(df_5m.index, pd.DatetimeIndex):
+                        idx_norm = (
+                            df_5m.index.tz_localize(None).normalize()
+                            if df_5m.index.tz is not None
+                            else df_5m.index.normalize()
+                        )
+                        iceberg_5m_bars_total += int((df_5m.groupby(idx_norm).size() >= 8).sum())
+                else:
+                    sliced_5m_map[s] = None
+            else:
+                sliced_5m_map[s] = None
+
         # Family 1: Chip & Structural (MS2) — positive Capital Gains Overhang (Grinblatt & Han 2005)
         # paired with tight chip peak (-chip_spread_panel).
         cost_dev_cols: Dict[str, pd.Series] = {}
         chip_spread_cols: Dict[str, pd.Series] = {}
+        real_turn_bars_total = 0
+        proxy_turn_bars_total = 0
+        n_symbols_with_real_turn = 0
         for s in risky_symbols:
             df_s = universe[s]
+            df_5m = sliced_5m_map.get(s)
             if len(df_s) >= 5:
-                cd = cyq_cost_deviation(df_s, n_bins=50).reindex(master_index)
-                cs = cyq_quantile_spread_90_10(df_s, n_bins=50).reindex(master_index)
+                turn_stats: Dict[str, Any] = {}
+                cd = cyq_cost_deviation(
+                    df_s,
+                    n_bins=50,
+                    intraday_5m_bars=df_5m,
+                    turn_stats_out=turn_stats,
+                ).reindex(master_index)
+                cs = cyq_quantile_spread_90_10(
+                    df_s,
+                    n_bins=50,
+                    intraday_5m_bars=df_5m,
+                ).reindex(master_index)
+                real_turn_bars_total += int(turn_stats.get("real_turn_bars", 0))
+                proxy_turn_bars_total += int(turn_stats.get("proxy_turn_bars", 0))
+                if turn_stats.get("used_real_turn"):
+                    n_symbols_with_real_turn += 1
                 cost_dev_cols[s] = cd
                 chip_spread_cols[s] = cs
             else:
@@ -269,15 +325,12 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
         magnet_break = limit_up_magnet_and_break(open_df, high_df, low_df, close_df, volume_df)
         magnet_smooth = magnet_break.rolling(5, min_periods=1).mean()
 
-        has_any_5m = any(
-            (s in intraday_5m_map and intraday_5m_map[s] is not None and not intraday_5m_map[s].empty)
-            for s in risky_symbols
-        )
+        has_any_5m = bool(n_symbols_with_5m > 0)
         ice_cols: Dict[str, pd.Series] = {}
         sm_cols: Dict[str, pd.Series] = {}
         for s in risky_symbols:
             df_s = universe[s]
-            df_5m = intraday_5m_map.get(s)
+            df_5m = sliced_5m_map.get(s)
             ice_s = iceberg_accumulation_score(
                 df_5m, daily_df=df_s, symbol=s, degradation_trace=diag_sink
             ).reindex(master_index)
@@ -288,14 +341,27 @@ class MicrostructureAlphaCompositeStrategy(AllocationTemplate):
                 ).reindex(master_index)
                 sm_cols[s] = sm_s.rolling(lookback_days, min_periods=3).mean()
 
+        ice_df = pd.DataFrame(ice_cols, index=master_index)
+        sm_df = pd.DataFrame(sm_cols, index=master_index) if sm_cols else pd.DataFrame(index=master_index)
+        self._last_ms7_diagnostics = {
+            "real_turn_bars": int(real_turn_bars_total),
+            "proxy_turn_bars": int(proxy_turn_bars_total),
+            "n_symbols_with_real_turn": int(n_symbols_with_real_turn),
+            "n_symbols_with_5m": int(n_symbols_with_5m),
+            "has_any_5m": bool(has_any_5m),
+            "iceberg_5m_bars": int(iceberg_5m_bars_total),
+            "smart_money_non_nan_cells": int(sm_df.notna().sum().sum()) if not sm_df.empty else 0,
+            "iceberg_non_nan_cells": int(ice_df.notna().sum().sum()) if not ice_df.empty else 0,
+        }
+
         micro_components: List[Tuple[float, pd.DataFrame]] = [
             (0.55 if not has_any_5m else 0.45, _norm_comp(intra_minus_on)),
-            (0.35 if not has_any_5m else 0.30, _norm_comp(pd.DataFrame(ice_cols, index=master_index))),
+            (0.35 if not has_any_5m else 0.30, _norm_comp(ice_df)),
             (0.10, _norm_comp(magnet_smooth)),
         ]
         if has_any_5m:
             micro_components.append(
-                (0.15, _norm_comp(pd.DataFrame(sm_cols, index=master_index)))
+                (0.15, _norm_comp(sm_df))
             )
         f_micro = _weighted_nanmean(micro_components)
 

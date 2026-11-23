@@ -63,15 +63,18 @@ def test_backtester_cannot_enrich_5m_for_blend_strategies():
     # `ast.unparse` DROPS comments on purpose: the retirement note above names the removed
     # symbols, and documentation is allowed to; only executable code is checked.
     code = ast.unparse(ast.parse(src))
+    # Note (2026-11-22, W1.3 / MS23): opt-in `--enable-intraday-5m` (default False) may load raw
+    # 5m bars transiently into `intraday_5m_universe` for 5m-aware strategies (e.g. MS7), without
+    # enriching daily bars or touching any blend strategy. Track-T blend 5m enrichment remains
+    # strictly forbidden (`track_t_flags`, `has_track_t`, `enrich_universe_with_intraday_features`).
     for forbidden in (
         "track_t_flags",
         "has_track_t",
-        "load_intraday_5m_universe",
         "enrich_universe_with_intraday_features",
     ):
         assert forbidden not in code, (
             f"`{forbidden}` reappeared in backtester.run_backtest.main -- the Track-T 5m "
-            "switches were retired on 2026-11-17 and the research path must stay daily-only"
+            "switches were retired on 2026-11-17 and the research path must not enrich daily bars"
         )
 
     # ... and the module-level default the live runners share is still the full session.
@@ -3206,3 +3209,61 @@ def test_market_breadth_flag_is_threaded_by_the_walkforward_path_too(monkeypatch
         ),
     )
     assert seen and all(value is None for value in seen), seen
+
+
+def test_w12_w13_cli_include_turn_and_enable_intraday_5m_and_manifest(tmp_path):
+    """W1.2 / W1.3: verifies --include-turn / --no-include-turn (default True),
+    --enable-intraday-5m / --no-enable-intraday-5m (default False), and Rule 11 opt-out
+    recording in run_manifest.json only when include_turn=False."""
+    from backtester.run_backtest import _dump_run_manifest, build_arg_parser
+
+    parser = build_arg_parser()
+    base_argv = ["--strategy-file", "dummy.json"]
+
+    args_default = parser.parse_args(base_argv)
+    assert args_default.include_turn is True
+    assert args_default.enable_intraday_5m is False
+
+    args_no_turn = parser.parse_args(base_argv + ["--no-include-turn"])
+    assert args_no_turn.include_turn is False
+
+    args_turn_on = parser.parse_args(base_argv + ["--no-include-turn", "--include-turn"])
+    assert args_turn_on.include_turn is True
+
+    args_5m = parser.parse_args(base_argv + ["--enable-intraday-5m", "--intraday-5m-provider", "baostock"])
+    assert args_5m.enable_intraday_5m is True
+    assert args_5m.intraday_5m_provider == "baostock"
+
+    args_5m_off = parser.parse_args(base_argv + ["--enable-intraday-5m", "--no-enable-intraday-5m"])
+    assert args_5m_off.enable_intraday_5m is False
+
+    # Manifest omits top-level include_turn when True (default), records False on opt-out
+    m_on_path = _dump_run_manifest(
+        str(tmp_path / "m_on"),
+        mode="standard",
+        group="",
+        strategy_name="test",
+        strategy_file="dummy.json",
+        strategy_dump_path="",
+        db_path="",
+        db_used=False,
+        include_turn=True,
+    )
+    with open(m_on_path, encoding="utf-8") as fh:
+        m_on = json.load(fh)
+    assert "include_turn" not in m_on
+
+    m_off_path = _dump_run_manifest(
+        str(tmp_path / "m_off"),
+        mode="standard",
+        group="",
+        strategy_name="test",
+        strategy_file="dummy.json",
+        strategy_dump_path="",
+        db_path="",
+        db_used=False,
+        include_turn=False,
+    )
+    with open(m_off_path, encoding="utf-8") as fh:
+        m_off = json.load(fh)
+    assert m_off["include_turn"] is False

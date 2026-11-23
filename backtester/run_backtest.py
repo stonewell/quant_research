@@ -414,6 +414,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hk-trading", action="store_true",
                    help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085%% dual-sided stamp duty/levies, T+0 trading).")
     add_data_provider_cli_args(p)
+    p.add_argument(
+        "--enable-intraday-5m",
+        dest="enable_intraday_5m",
+        action="store_true",
+        default=False,
+        help=(
+            "Load 5-minute intraday bars via load_intraday_5m_universe and supply "
+            "intraday_5m_universe transiently to 5m-aware strategies (e.g. microstructure_alpha_composite)."
+        ),
+    )
+    p.add_argument(
+        "--no-enable-intraday-5m",
+        dest="enable_intraday_5m",
+        action="store_false",
+        default=False,
+        help="Disable loading 5-minute intraday bars (default).",
+    )
+    p.add_argument(
+        "--intraday-5m-provider",
+        default=None,
+        help="Optional data provider override for 5m intraday bars (defaults to --data-provider).",
+    )
     add_output_dir_override_args(p, RESULTS_DIR, DATA_DIR, "equity/weights/report CSVs")
     p.add_argument("--no-plots", action="store_true",
                    help="Skip the equity-curve chart normally produced in --mode standard (charts are ON by default).")
@@ -495,6 +517,27 @@ def _slice_universe_for_range(universe: dict, date_range: pd.DatetimeIndex) -> d
         common = df.index.intersection(date_range)
         if len(common) > 0:
             sliced[sym] = df.loc[common]
+    return sliced
+
+
+def _slice_intraday_universe_for_range(
+    intraday_5m_universe: dict | None,
+    date_range: pd.DatetimeIndex,
+) -> dict:
+    """Causally slices each symbol's 5m DataFrame to ``[date_range[0], date_range[-1]]`` (day-normalized)."""
+    if not intraday_5m_universe or len(date_range) == 0:
+        return {}
+    start_day = pd.Timestamp(date_range[0]).normalize()
+    end_day = pd.Timestamp(date_range[-1]).normalize()
+    sliced = {}
+    for sym, df_5m in intraday_5m_universe.items():
+        if df_5m is None or df_5m.empty or not isinstance(df_5m.index, pd.DatetimeIndex):
+            continue
+        idx = df_5m.index.tz_localize(None) if df_5m.index.tz is not None else df_5m.index
+        norm = idx.normalize()
+        sub = df_5m.loc[(norm >= start_day) & (norm <= end_day)]
+        if not sub.empty:
+            sliced[sym] = sub
     return sliced
 
 
@@ -643,7 +686,9 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
         if not buffered_universe:
             fold_metrics = _nan_fold_metrics()
         else:
-            full_weights = template.generate_weights(buffered_universe, params)
+            fold_5m = _slice_intraday_universe_for_range(ctx.get("intraday_5m_universe"), fold_dates)
+            _gen_params = {**params, "intraday_5m_universe": fold_5m} if fold_5m else params
+            full_weights = template.generate_weights(buffered_universe, _gen_params)
             if full_weights.empty:
                 fold_metrics = _nan_fold_metrics()
             else:
@@ -1060,14 +1105,25 @@ def lifecycle_records_to_frame(records, *, fold_index: int | None = None) -> pd.
     return pd.DataFrame(rows, columns=columns)
 
 
-def run_standard(universe: dict, template, params: dict, args) -> dict:
+def run_standard(
+    universe: dict,
+    template,
+    params: dict,
+    args,
+    intraday_5m_universe: dict | None = None,
+) -> dict:
     master_calendar, effective_start = _resolve_master_calendar(
         universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
     )
     if master_calendar.empty:
         raise ValueError("Universe contains no valid trading dates.")
 
-    raw_target_weights = template.generate_weights(universe, params)
+    _gen_params = (
+        {**params, "intraday_5m_universe": intraday_5m_universe}
+        if intraday_5m_universe
+        else params
+    )
+    raw_target_weights = template.generate_weights(universe, _gen_params)
     if raw_target_weights.empty:
         raise ValueError("Template generated empty weights.")
 
@@ -1211,7 +1267,13 @@ def run_standard(universe: dict, template, params: dict, args) -> dict:
     return result
 
 
-def run_walkforward(universe: dict, template, params: dict, args) -> list:
+def run_walkforward(
+    universe: dict,
+    template,
+    params: dict,
+    args,
+    intraday_5m_universe: dict | None = None,
+) -> list:
     master_calendar, effective_start = _resolve_master_calendar(
         universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
     )
@@ -1279,6 +1341,7 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
 
     ctx = {
         "universe": universe,
+        "intraday_5m_universe": intraday_5m_universe,
         "template": template,
         "params": params,
         "args": args,
@@ -1320,15 +1383,15 @@ def run_walkforward(universe: dict, template, params: dict, args) -> list:
     return folds
 
 
-def _standard_score_fn(universe, args):
+def _standard_score_fn(universe, args, intraday_5m_universe=None):
     def score_fn(template, params):
-        return run_standard(universe, template, params, args)
+        return run_standard(universe, template, params, args, intraday_5m_universe=intraday_5m_universe)
     return score_fn
 
 
-def _walkforward_score_fn(universe, args):
+def _walkforward_score_fn(universe, args, intraday_5m_universe=None):
     def score_fn(template, params):
-        folds = run_walkforward(universe, template, params, args)
+        folds = run_walkforward(universe, template, params, args, intraday_5m_universe=intraday_5m_universe)
         sharpes = [f["sharpe_ratio"] for f in folds if np.isfinite(f["sharpe_ratio"])]
         mean_sharpe = float(np.mean(sharpes)) if sharpes else float("-inf")
         # Mean-fold reductions for cagr/max_drawdown/calmar_ratio, same
@@ -1414,6 +1477,7 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
         use_cache=not args.no_cache, cache_dir=cache_dir,
         data_kwargs=data_kwargs, require_nonempty=True,
         expected_last_session=backtest_expected_last_session(),
+        include_turn=bool(getattr(args, "include_turn", True)),
     )
 
     if aligned_index is not None:
@@ -1774,6 +1838,7 @@ def _dump_run_manifest(
     artifacts: list[dict] | None = None,
     enable_position_lifecycle: bool = True,
     position_lifecycle_config: dict | None = None,
+    include_turn: bool = True,
 ) -> str:
     """Phase 1: persist the reproducibility fingerprint skeleton *before* the
     backtest runs, so a mid-run crash still leaves an auditable run_manifest.json behind."""
@@ -1825,6 +1890,8 @@ def _dump_run_manifest(
         # every file it can see" true right up to a mid-run crash (§1 Phase-1 NOTE).
         "artifacts": artifacts if artifacts is not None else _artifact_sizes(results_dir),
     }
+    if not include_turn:
+        manifest["include_turn"] = False
     manifest_path = os.path.join(results_dir, "run_manifest.json")
     write_json_report(manifest, manifest_path)
     return manifest_path
@@ -1965,10 +2032,32 @@ def main():
         warmup_calendar_days = int(round(warmup_bars * 7 / 5)) + 45
         fetch_start = (pd.Timestamp(args.start) - pd.Timedelta(days=warmup_calendar_days)).strftime("%Y-%m-%d")
 
+    include_turn = bool(getattr(args, "include_turn", True))
     universe = load_universe_with_banner(universe_symbols, fetch_start, args.end, args.interval,
                                           use_cache=not args.no_cache, cache_dir=cache_dir,
                                           data_kwargs=data_kwargs, require_nonempty=True,
-                                          expected_last_session=backtest_expected_last_session())
+                                          expected_last_session=backtest_expected_last_session(),
+                                          include_turn=include_turn)
+
+    intraday_5m_universe = None
+    if bool(getattr(args, "enable_intraday_5m", False)):
+        try:
+            from common.data import get_data_provider
+            from common.intraday_features import load_intraday_5m_universe
+
+            prov_5m_name = getattr(args, "intraday_5m_provider", None) or args.data_provider
+            provider_5m = get_data_provider(prov_5m_name, **data_kwargs)
+            intraday_5m_universe = load_intraday_5m_universe(
+                list(universe.keys()),
+                start=fetch_start,
+                end=args.end,
+                data_provider=provider_5m,
+                cache_dir=cache_dir,
+                max_lookback_days=None,
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to load 5m intraday bars in backtester: {exc}")
+            intraday_5m_universe = None
 
     # (2026-11-17 owner ruling) The Track-T 5m enrichment branch that used to sit here is
     # DELETED. Its `track_t_flags` set contained only the six blend 5m FEATURE switches,
@@ -2010,7 +2099,11 @@ def main():
             template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec,
             bnn_spec,
         )
-        score_fn = _standard_score_fn(universe, args) if args.mode == "standard" else _walkforward_score_fn(universe, args)
+        score_fn = (
+            _standard_score_fn(universe, args, intraday_5m_universe=intraday_5m_universe)
+            if args.mode == "standard"
+            else _walkforward_score_fn(universe, args, intraday_5m_universe=intraday_5m_universe)
+        )
 
         original_result = score_fn(optimize_template_instance, params)
 
@@ -2111,6 +2204,7 @@ def main():
         artifacts=None,        # Phase 1 -> scan the dir: only strategy_dump.json exists yet
         enable_position_lifecycle=enable_pl,
         position_lifecycle_config=pl_cfg_dict,
+        include_turn=include_turn,
     )
 
     wf_summary: dict | None = None
@@ -2124,6 +2218,7 @@ def main():
                 universe,
                 get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec),
                 params, args,
+                intraday_5m_universe=intraday_5m_universe,
             )
 
         print(f"\n=== Strategy: {strategy_name} ===")
@@ -2254,6 +2349,7 @@ def main():
                 universe,
                 get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec),
                 params, args,
+                intraday_5m_universe=intraday_5m_universe,
             )
 
         all_wf_trades = []
