@@ -662,6 +662,67 @@ def consolidation_density(
     return density.clip(0.0, 1.0).rename("consolidation_density")
 
 
+def _pregroup_intraday_5m_for_cyq(
+    intraday_5m_bars: pd.DataFrame,
+) -> Tuple[str, Dict[Any, Tuple[np.ndarray, np.ndarray, np.ndarray]]]:
+    """Pre-group 5-minute OHLCV bars once by local calendar day for O(1) CYQ lookup.
+
+    Eliminates the O(N * 48N) per-day ``index.date ==`` scan + ``.iterrows()`` loop
+    inside ``_run_cyq_recurrence`` while preserving bit-identical arithmetic.
+    """
+    if intraday_5m_bars is None or len(intraday_5m_bars) == 0:
+        return ("none", {})
+
+    ml_all = intraday_5m_bars["Low"].to_numpy(dtype=float)
+    mh_all = intraday_5m_bars["High"].to_numpy(dtype=float)
+    if "Volume" in intraday_5m_bars.columns:
+        v_raw = pd.to_numeric(intraday_5m_bars["Volume"], errors="coerce").to_numpy(dtype=float)
+        mv_all = np.where(np.isnan(v_raw), 1.0, v_raw)
+    else:
+        mv_all = np.ones(len(intraday_5m_bars), dtype=float)
+
+    if isinstance(intraday_5m_bars.index, pd.DatetimeIndex):
+        idx = intraday_5m_bars.index
+        idx_naive = idx.tz_localize(None) if idx.tz is not None else idx
+        valid = ~idx_naive.isna()
+        if not bool(valid.all()):
+            idx_naive = idx_naive[valid]
+            ml_all = ml_all[valid]
+            mh_all = mh_all[valid]
+            mv_all = mv_all[valid]
+        if len(idx_naive) == 0:
+            return ("day_i8", {})
+        day_i8 = idx_naive.to_numpy(dtype="datetime64[D]").astype(np.int64)
+        if len(day_i8) > 1 and not bool(np.all(day_i8[1:] >= day_i8[:-1])):
+            order = np.argsort(day_i8, kind="mergesort")
+            day_i8 = day_i8[order]
+            ml_all = ml_all[order]
+            mh_all = mh_all[order]
+            mv_all = mv_all[order]
+        splits = np.flatnonzero(day_i8[1:] != day_i8[:-1]) + 1
+        starts = np.concatenate(([0], splits))
+        ends = np.concatenate((splits, [len(day_i8)]))
+        day_map = {
+            int(day_i8[s]): (ml_all[s:e], mh_all[s:e], mv_all[s:e])
+            for s, e in zip(starts, ends)
+        }
+        return ("day_i8", day_map)
+
+    for c in ("date", "Date", "datetime", "Datetime"):
+        if c in intraday_5m_bars.columns:
+            keys = intraday_5m_bars[c].astype(str).str.slice(0, 10).to_numpy()
+            by_key: Dict[str, List[int]] = {}
+            for i, k in enumerate(keys):
+                by_key.setdefault(k, []).append(i)
+            day_map = {
+                k: (ml_all[idxs], mh_all[idxs], mv_all[idxs])
+                for k, idxs in by_key.items()
+            }
+            return ("date_str", day_map)
+
+    return ("none", {})
+
+
 def _run_cyq_recurrence(
     bars: pd.DataFrame,
     n_bins: int = 100,
@@ -751,9 +812,40 @@ def _run_cyq_recurrence(
         turn_stats_out["proxy_turn_bars"] = int(proxy_turn_bars)
         turn_stats_out["turn_mode"] = str(turn_mode)
 
+    tau_arr = tau_series.to_numpy(dtype=float)
     lows = bars["Low"].to_numpy(dtype=float)
     highs = bars["High"].to_numpy(dtype=float)
     closes = bars["Close"].to_numpy(dtype=float)
+    vwap_arr = (
+        pd.to_numeric(bars["VWAP"], errors="coerce").to_numpy(dtype=float)
+        if "VWAP" in bars.columns
+        else None
+    )
+
+    # Pre-group 5m intraday bars once by calendar day for O(1) lookup inside the loop
+    day_5m_map: Dict[Any, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    bar_keys: Optional[List[Any]] = None
+    if intraday_5m_bars is not None and len(intraday_5m_bars) > 0:
+        pg_mode, day_5m_map = _pregroup_intraday_5m_for_cyq(intraday_5m_bars)
+        if day_5m_map:
+            if pg_mode == "day_i8":
+                if isinstance(bars.index, pd.DatetimeIndex):
+                    b_idx = bars.index.tz_localize(None) if bars.index.tz is not None else bars.index
+                    b_valid = ~b_idx.isna()
+                    b_i8 = b_idx.to_numpy(dtype="datetime64[D]").astype(np.int64)
+                    bar_keys = [int(b_i8[i]) if bool(b_valid[i]) else None for i in range(n_bars)]
+                else:
+                    bar_keys = [
+                        int(np.datetime64(idx.date(), "D").astype(np.int64))
+                        if (pd.notna(idx) and hasattr(idx, "date"))
+                        else None
+                        for idx in bars.index
+                    ]
+            elif pg_mode == "date_str":
+                bar_keys = [
+                    idx.strftime("%Y-%m-%d") if (pd.notna(idx) and hasattr(idx, "strftime")) else None
+                    for idx in bars.index
+                ]
 
     # 2. Initialize strictly causal dynamic price grid [p_min, p_max]
     l_0 = lows[0]
@@ -808,26 +900,18 @@ def _run_cyq_recurrence(
         k_t = np.zeros(n_bins, dtype=float)
 
         used_5m = False
-        if (intraday_5m_bars is not None or kernel == "intraday_5m") and intraday_5m_bars is not None and len(intraday_5m_bars) > 0:
-            day_5m = None
-            if isinstance(intraday_5m_bars.index, pd.DatetimeIndex) and hasattr(bars.index[t], "date"):
-                day_5m = intraday_5m_bars[intraday_5m_bars.index.date == bars.index[t].date()]
-            elif hasattr(bars.index[t], "strftime"):
-                cur_str = bars.index[t].strftime("%Y-%m-%d")
-                for c in ["date", "Date", "datetime", "Datetime"]:
-                    if c in intraday_5m_bars.columns:
-                        day_5m = intraday_5m_bars[intraday_5m_bars[c].astype(str).str.startswith(cur_str)]
-                        break
-            if day_5m is not None and not day_5m.empty:
-                for _, r in day_5m.iterrows():
-                    ml, mh = float(r["Low"]), float(r["High"])
-                    mv = float(r["Volume"]) if ("Volume" in r and not np.isnan(r["Volume"])) else 1.0
-                    bl = max(0, min(n_bins - 1, int(np.searchsorted(bin_edges, ml, side="right") - 1)))
-                    bh = max(0, min(n_bins - 1, int(np.searchsorted(bin_edges, mh, side="left"))))
-                    if bh < bl:
-                        bh = bl
-                    k_t[bl : bh + 1] += mv / (bh - bl + 1)
-                sum_k = np.sum(k_t)
+        if bar_keys is not None:
+            bkey = bar_keys[t]
+            entry = day_5m_map.get(bkey) if bkey is not None else None
+            if entry is not None:
+                ml_arr, mh_arr, mv_arr = entry
+                bl_arr = np.clip(np.searchsorted(bin_edges, ml_arr, side="right") - 1, 0, n_bins - 1)
+                bh_arr = np.clip(np.searchsorted(bin_edges, mh_arr, side="left"), 0, n_bins - 1)
+                bh_arr = np.maximum(bh_arr, bl_arr)
+                contrib = mv_arr / (bh_arr - bl_arr + 1)
+                for k_i in range(len(ml_arr)):
+                    k_t[bl_arr[k_i] : bh_arr[k_i] + 1] += contrib[k_i]
+                sum_k = float(np.sum(k_t))
                 if sum_k > 1e-12:
                     k_t /= sum_k
                     used_5m = True
@@ -844,8 +928,8 @@ def _run_cyq_recurrence(
                 k_t[i_start : i_end + 1] = 1.0 / (i_end - i_start + 1)
             else:  # triangular
                 vwap_val = (
-                    bars["VWAP"].iloc[t]
-                    if ("VWAP" in bars.columns and not np.isnan(bars["VWAP"].iloc[t]))
+                    vwap_arr[t]
+                    if (vwap_arr is not None and not np.isnan(vwap_arr[t]))
                     else (h_t + l_t + c_t) / 3.0
                 )
                 p_peak = float(np.clip(vwap_val, l_t, h_t))
@@ -866,7 +950,7 @@ def _run_cyq_recurrence(
         if t == 0:
             chips = k_t.copy()
         else:
-            tau_t = float(tau_series.iloc[t])
+            tau_t = float(tau_arr[t])
             chips = chips * (1.0 - tau_t) + tau_t * k_t
             chips /= np.sum(chips)
 

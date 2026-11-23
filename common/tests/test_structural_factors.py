@@ -578,3 +578,243 @@ def test_ms27_relative_turn_mode_scale_invariance_and_raw_divergence():
         cyq_cost_deviation(mega_cap, turn_mode="bogus")
     with pytest.raises(ValueError, match="turn_mode"):
         cyq_chip_distribution(mega_cap.iloc[:0], turn_mode="bogus")
+
+
+def test_cyq_5m_pregrouped_kernel_matches_legacy_reference_and_edge_cases():
+    """Zero-drift equivalence of pre-grouped 5m CYQ kernel vs literal legacy .iterrows()
+    reference across edge cases, strict causality, and offline speed check."""
+    import time
+    from common.structural_factors import (
+        cyq_chip_distribution,
+        cyq_cost_deviation,
+        cyq_quantile_spread_90_10,
+    )
+
+    def _legacy_cyq_reference(bars, intraday_5m_bars, n_bins=50, turn_mode="relative"):
+        n_bars = len(bars)
+        vol = bars["Volume"].fillna(1.0).astype(float)
+        sma_60 = vol.rolling(60, min_periods=1).mean()
+        proxy_tau = (0.02 * (vol / (sma_60 + 1e-8))).clip(lower=0.002, upper=0.50)
+        tau_series = proxy_tau
+        if "Turn" in bars.columns and not bars["Turn"].isna().all():
+            col_s = pd.to_numeric(bars["Turn"], errors="coerce").astype(float)
+            valid_mask = col_s.notna() & np.isfinite(col_s)
+            if bool(valid_mask.any()):
+                if turn_mode == "relative":
+                    nt = col_s.where(valid_mask).clip(lower=0.0)
+                    scaled = (0.02 * (nt / (nt.rolling(60, min_periods=1).mean() + 1e-8))).clip(lower=0.002, upper=0.50)
+                else:
+                    med = float(col_s[valid_mask].median())
+                    scaled = (col_s / 100.0 if med > 1.0 else col_s).clip(lower=0.001, upper=0.99)
+                tau_series = scaled.where(valid_mask, other=proxy_tau)
+
+        lows = bars["Low"].to_numpy(dtype=float)
+        highs = bars["High"].to_numpy(dtype=float)
+        closes = bars["Close"].to_numpy(dtype=float)
+        l_0, h_0 = lows[0], highs[0]
+        if h_0 <= l_0:
+            h_0 = l_0 * 1.01 + 0.01
+            l_0 = l_0 * 0.99 - 0.01
+        p_min, p_max = l_0 * 0.95, h_0 * 1.05
+        if p_max <= p_min:
+            p_max = p_min + 1.0
+        bin_edges = np.linspace(p_min, p_max, n_bins + 1)
+        chips = np.zeros(n_bins, dtype=float)
+        wr = np.zeros(n_bars, dtype=float)
+        cc = np.zeros(n_bars, dtype=float)
+        cd = np.full(n_bars, np.nan, dtype=float)
+        qs = np.full(n_bars, np.nan, dtype=float)
+
+        for t in range(n_bars):
+            l_t, h_t, c_t = lows[t], highs[t], closes[t]
+            if h_t <= l_t:
+                h_t = l_t * 1.001 + 0.001
+                l_t = l_t * 0.999 - 0.001
+            cand_min, cand_max = l_t * 0.95, h_t * 1.05
+            if cand_min < p_min or cand_max > p_max:
+                new_p_min, new_p_max = min(p_min, cand_min), max(p_max, cand_max)
+                new_edges = np.linspace(new_p_min, new_p_max, n_bins + 1)
+                old_cdf = np.concatenate([[0.0], np.cumsum(chips)])
+                chips = np.maximum(0.0, np.diff(np.interp(new_edges, bin_edges, old_cdf, left=0.0, right=1.0)))
+                sc = float(np.sum(chips))
+                chips = chips / sc if sc > 1e-12 else np.full(n_bins, 1.0 / n_bins)
+                p_min, p_max, bin_edges = new_p_min, new_p_max, new_edges
+
+            bin_mids = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+            k_t = np.zeros(n_bins, dtype=float)
+            used_5m = False
+            if intraday_5m_bars is not None and len(intraday_5m_bars) > 0:
+                day_5m = None
+                if isinstance(intraday_5m_bars.index, pd.DatetimeIndex) and hasattr(bars.index[t], "date"):
+                    day_5m = intraday_5m_bars[intraday_5m_bars.index.date == bars.index[t].date()]
+                elif hasattr(bars.index[t], "strftime"):
+                    cur_str = bars.index[t].strftime("%Y-%m-%d")
+                    for c in ["date", "Date", "datetime", "Datetime"]:
+                        if c in intraday_5m_bars.columns:
+                            day_5m = intraday_5m_bars[intraday_5m_bars[c].astype(str).str.startswith(cur_str)]
+                            break
+                if day_5m is not None and not day_5m.empty:
+                    for _, r in day_5m.iterrows():
+                        ml, mh = float(r["Low"]), float(r["High"])
+                        mv = float(r["Volume"]) if ("Volume" in r and not np.isnan(r["Volume"])) else 1.0
+                        bl = max(0, min(n_bins - 1, int(np.searchsorted(bin_edges, ml, side="right") - 1)))
+                        bh = max(0, min(n_bins - 1, int(np.searchsorted(bin_edges, mh, side="left"))))
+                        if bh < bl:
+                            bh = bl
+                        k_t[bl : bh + 1] += mv / (bh - bl + 1)
+                    sk = float(np.sum(k_t))
+                    if sk > 1e-12:
+                        k_t /= sk
+                        used_5m = True
+            if not used_5m:
+                i_start = max(0, min(n_bins - 1, int(np.searchsorted(bin_edges, l_t, side="right") - 1)))
+                i_end = max(0, min(n_bins - 1, int(np.searchsorted(bin_edges, h_t, side="left"))))
+                if i_end < i_start:
+                    i_end = i_start
+                if i_start == i_end:
+                    k_t[i_start : i_end + 1] = 1.0
+                else:
+                    p_peak = float(np.clip((h_t + l_t + c_t) / 3.0, l_t, h_t))
+                    w = np.zeros(i_end - i_start + 1, dtype=float)
+                    for idx_w, j in enumerate(range(i_start, i_end + 1)):
+                        m = bin_mids[j]
+                        if m <= p_peak:
+                            w[idx_w] = max(0.0, 1.0 - (p_peak - m) / (p_peak - l_t + 1e-8)) if p_peak > l_t else 1.0
+                        else:
+                            w[idx_w] = max(0.0, 1.0 - (m - p_peak) / (h_t - p_peak + 1e-8)) if h_t > p_peak else 1.0
+                    sw = float(np.sum(w))
+                    k_t[i_start : i_end + 1] = (w / sw) if sw > 1e-12 else (1.0 / (i_end - i_start + 1))
+
+            if t == 0:
+                chips = k_t.copy()
+            else:
+                tau_t = float(tau_series.iloc[t])
+                chips = chips * (1.0 - tau_t) + tau_t * k_t
+                chips /= float(np.sum(chips))
+
+            wr[t] = float(np.clip(np.sum(chips[bin_mids <= c_t]), 0.0, 1.0))
+            cdf = np.concatenate([[0.0], np.cumsum(chips)])
+            cdf[-1] = 1.0
+            p5, p95 = float(np.interp(0.05, cdf, bin_edges)), float(np.interp(0.95, cdf, bin_edges))
+            cc[t] = float(np.clip(1.0 - (p95 - p5) / (p95 + p5 + 1e-8), 0.0, 1.0))
+            p_cost = float(np.sum(chips * bin_mids))
+            if np.isfinite(p_cost) and p_cost > 1e-12:
+                cd[t] = (c_t - p_cost) / p_cost
+            p10, p50, p90 = (
+                float(np.interp(0.10, cdf, bin_edges)),
+                float(np.interp(0.50, cdf, bin_edges)),
+                float(np.interp(0.90, cdf, bin_edges)),
+            )
+            if np.isfinite(p50) and p50 > 1e-12:
+                qs[t] = (p90 - p10) / p50
+        return wr, cc, cd, qs
+
+    rng = np.random.default_rng(123)
+    dates = pd.bdate_range("2025-02-03", periods=25)
+    close = 20.0 * np.exp(np.cumsum(rng.normal(0.002, 0.02, size=len(dates))))
+    daily = pd.DataFrame(
+        {
+            "Open": close * 0.995,
+            "High": close * 1.025,
+            "Low": close * 0.975,
+            "Close": close,
+            "Volume": rng.uniform(5e5, 2e6, size=len(dates)),
+            "Turn": rng.uniform(0.5, 4.0, size=len(dates)),
+        },
+        index=dates,
+    )
+
+    # Build 5m bars with partial missing days (skip days 3, 11, 18 -> triangular fallback)
+    frames = []
+    for i, d in enumerate(dates):
+        if i in (3, 11, 18):
+            continue
+        idx5 = pd.date_range(f"{d.date()} 09:35:00", f"{d.date()} 11:30:00", freq="5min").append(
+            pd.date_range(f"{d.date()} 13:05:00", f"{d.date()} 15:00:00", freq="5min")
+        )
+        mid = daily["Close"].iloc[i] * (1.0 + rng.normal(0.0, 0.008, size=len(idx5)))
+        frames.append(
+            pd.DataFrame(
+                {
+                    "Low": mid * 0.996,
+                    "High": mid * 1.004,
+                    "Close": mid,
+                    "Volume": rng.uniform(1e4, 5e4, size=len(idx5)),
+                },
+                index=idx5,
+            )
+        )
+    df_5m = pd.concat(frames)
+    df_5m_nan_vol = df_5m.copy()
+    df_5m_nan_vol.iloc[::7, df_5m_nan_vol.columns.get_loc("Volume")] = np.nan
+    df_5m_no_vol = df_5m.drop(columns=["Volume"])
+    df_5m_tz = df_5m.copy()
+    df_5m_tz.index = df_5m_tz.index.tz_localize("Asia/Shanghai")
+    df_5m_unsorted = df_5m.sample(frac=1.0, random_state=7)
+    df_5m_col = df_5m.reset_index().rename(columns={"index": "datetime"})
+    df_5m_col["datetime"] = df_5m_col["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    cases = [
+        ("relative", df_5m),
+        ("raw", df_5m),
+        ("relative", df_5m_nan_vol),
+        ("relative", df_5m_no_vol),
+        ("relative", df_5m_tz),
+        ("relative", df_5m_unsorted),
+        ("relative", df_5m_col),
+    ]
+    for mode, f5m in cases:
+        wr_ref, cc_ref, cd_ref, qs_ref = _legacy_cyq_reference(daily, f5m, n_bins=50, turn_mode=mode)
+        wr, cc = cyq_chip_distribution(daily, n_bins=50, intraday_5m_bars=f5m, turn_mode=mode)
+        cd = cyq_cost_deviation(daily, n_bins=50, intraday_5m_bars=f5m, turn_mode=mode)
+        qs = cyq_quantile_spread_90_10(daily, n_bins=50, intraday_5m_bars=f5m, turn_mode=mode)
+        np.testing.assert_allclose(wr.to_numpy(), wr_ref, rtol=0.0, atol=1e-12, equal_nan=True)
+        np.testing.assert_allclose(cc.to_numpy(), cc_ref, rtol=0.0, atol=1e-12, equal_nan=True)
+        np.testing.assert_allclose(cd.to_numpy(), cd_ref, rtol=0.0, atol=1e-12, equal_nan=True)
+        np.testing.assert_allclose(qs.to_numpy(), qs_ref, rtol=0.0, atol=1e-12, equal_nan=True)
+
+    # Strict causality with 5m bars attached
+    wr_full, cc_full = cyq_chip_distribution(daily, n_bins=50, intraday_5m_bars=df_5m)
+    cd_full = cyq_cost_deviation(daily, n_bins=50, intraday_5m_bars=df_5m)
+    cut = 15
+    cut_date = dates[cut - 1]
+    df_5m_pre = df_5m.loc[df_5m.index <= cut_date + pd.Timedelta(hours=23, minutes=59)]
+    wr_pre, cc_pre = cyq_chip_distribution(daily.iloc[:cut], n_bins=50, intraday_5m_bars=df_5m_pre)
+    cd_pre = cyq_cost_deviation(daily.iloc[:cut], n_bins=50, intraday_5m_bars=df_5m_pre)
+    np.testing.assert_allclose(wr_pre.to_numpy(), wr_full.iloc[:cut].to_numpy(), rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(cc_pre.to_numpy(), cc_full.iloc[:cut].to_numpy(), rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(cd_pre.to_numpy(), cd_full.iloc[:cut].to_numpy(), rtol=0.0, atol=1e-12)
+
+    # Offline performance benchmark: 250 daily bars x 48 5m bars/day = 12,000 rows (< 2.0s)
+    b_dates = pd.bdate_range("2024-01-02", periods=250)
+    b_close = 30.0 * np.exp(np.cumsum(rng.normal(0.0005, 0.015, size=250)))
+    b_daily = pd.DataFrame(
+        {
+            "Open": b_close * 0.995,
+            "High": b_close * 1.02,
+            "Low": b_close * 0.98,
+            "Close": b_close,
+            "Volume": rng.uniform(5e5, 2e6, size=250),
+            "Turn": rng.uniform(0.5, 4.0, size=250),
+        },
+        index=b_dates,
+    )
+    b_5m_idx = pd.DatetimeIndex(
+        np.concatenate(
+            [
+                pd.date_range(f"{d.date()} 09:35:00", f"{d.date()} 11:30:00", freq="5min")
+                .append(pd.date_range(f"{d.date()} 13:05:00", f"{d.date()} 15:00:00", freq="5min"))
+                .to_numpy()
+                for d in b_dates
+            ]
+        )
+    )
+    b_mid = np.repeat(b_close, 48) * (1.0 + rng.normal(0.0, 0.005, size=len(b_5m_idx)))
+    b_5m = pd.DataFrame(
+        {"Low": b_mid * 0.997, "High": b_mid * 1.003, "Close": b_mid, "Volume": rng.uniform(1e4, 5e4, size=len(b_5m_idx))},
+        index=b_5m_idx,
+    )
+    t0 = time.perf_counter()
+    _ = cyq_cost_deviation(b_daily, n_bins=50, intraday_5m_bars=b_5m, turn_mode="relative")
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 2.0, f"Pre-grouped 5m CYQ took {elapsed:.3f}s (expected < 2.0s)"
