@@ -5,6 +5,7 @@ Guaranteed 100% offline using temporary files and mock modules.
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -21,7 +22,9 @@ from common.universe import (
     FileUniverseProvider,
     StaticUniverseProvider,
     add_universe_cli_args,
+    get_stock_name,
     get_universe_provider,
+    is_placeholder_stock_name,
     register_universe_provider,
     resolve_universe_from_args,
     resolve_universe_symbols,
@@ -289,4 +292,186 @@ def test_core_satellite_universes_exist_and_load():
     assert "BRK-B" in symbols_us
     assert "NVDA" in symbols_us
     assert "AAPL" in symbols_us
+
+
+def _parse_china_universe_structure(file_path: str):
+    """Parse section headers, subsection counts, and per-ticker inline comment names."""
+    sections = {}  # section_name -> (declared_count, actual_count)
+    subsections = []  # list of (header, declared_count, actual_count)
+    comment_names = {}  # ticker -> short Chinese name from preceding '# <name> (...)' comment
+
+    current_section = None
+    last_comment_name = None
+
+    section_re = re.compile(r"^#\s*---\s*\[.*?\b(Core|Satellite):\s*(\d+)只")
+    subsec_re = re.compile(r"^#\s*---\s*\d+\.\s+.*\((\d+)只\)\s*---$")
+    name_comment_re = re.compile(r"^#\s*([^\s(#]+)\s*\(")
+    ticker_re = re.compile(r"^\d{6}\.(SH|SZ)$")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            sec_m = section_re.match(line)
+            if sec_m:
+                current_section = sec_m.group(1)
+                sections[current_section] = [int(sec_m.group(2)), 0]
+                last_comment_name = None
+                continue
+
+            sub_m = subsec_re.match(line)
+            if sub_m:
+                subsections.append([line, int(sub_m.group(1)), 0])
+                last_comment_name = None
+                continue
+
+            if line.startswith("#"):
+                name_m = name_comment_re.match(line)
+                if name_m and current_section is not None:
+                    last_comment_name = name_m.group(1).strip()
+                continue
+
+            if ticker_re.match(line):
+                assert current_section is not None, f"Ticker {line} appeared before any section header"
+                assert subsections, f"Ticker {line} appeared before any subsection header"
+                sections[current_section][1] += 1
+                subsections[-1][2] += 1
+                assert last_comment_name is not None, f"Missing '# <简称> (...)' comment before {line} in {file_path}"
+                comment_names[line] = last_comment_name
+                last_comment_name = None
+
+    return sections, subsections, comment_names
+
+
+def _parse_blacklist_md(blacklist_path: str):
+    """Parse §2 (#1-6 price-cap, #7-35 non-price-cap) and §5 (#1-5 forensic) from docs/black_list.md."""
+    price_cap = set()
+    non_price_cap = set()
+    mode = None
+    row_re = re.compile(r"^\|\s*(\d+)\s*\|\s*`(\d{6}\.(?:SH|SZ))`\s*\|")
+
+    with open(blacklist_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if line.startswith("## 2."):
+                mode = "sec2"
+                continue
+            if line.startswith("## 5."):
+                mode = "sec5"
+                continue
+            if line.startswith("## "):
+                mode = None
+                continue
+
+            if mode in ("sec2", "sec5"):
+                m = row_re.match(line)
+                if not m:
+                    continue
+                idx = int(m.group(1))
+                sym = m.group(2)
+                if mode == "sec2" and 1 <= idx <= 6:
+                    price_cap.add(sym)
+                else:
+                    non_price_cap.add(sym)
+
+    return price_cap, non_price_cap
+
+
+def _parse_js_known_stock_names(js_path: str):
+    """Parse KNOWN_STOCK_NAMES object literal from web/livetrading/static/js/app.js."""
+    with open(js_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    m = re.search(r"const\s+KNOWN_STOCK_NAMES\s*=\s*\{(.*?)\};", content, re.DOTALL)
+    assert m is not None, f"Could not find KNOWN_STOCK_NAMES in {js_path}"
+    block = m.group(1)
+    pairs = re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', block)
+    return dict(pairs)
+
+
+def test_china_core_satellite_100_and_200k_universes_invariants():
+    """Verify structural, blacklist, set-divergence, and 3-way name-parity invariants for both 100-stock China pools."""
+    repo_root = _PROJECT_ROOT
+    path_100 = os.path.join(repo_root, "docs", "universe", "china", "core_satellite_100_stocks.txt")
+    path_200k = os.path.join(repo_root, "docs", "universe", "china", "core_satellite_200k_stocks.txt")
+
+    # 1. Both symlinks exist, resolve to distinct real files, and each loads 100 unique valid .SH/.SZ tickers.
+    assert os.path.islink(path_100), f"Expected symlink at {path_100}"
+    assert os.path.islink(path_200k), f"Expected symlink at {path_200k}"
+    real_100 = os.path.realpath(path_100)
+    real_200k = os.path.realpath(path_200k)
+    assert os.path.isfile(real_100), f"Symlink target missing: {real_100}"
+    assert os.path.isfile(real_200k), f"Symlink target missing: {real_200k}"
+    assert real_100 != real_200k, "core_satellite_100_stocks.txt and core_satellite_200k_stocks.txt must resolve to distinct files"
+
+    syms_100 = FileUniverseProvider(path_100).get_symbols()
+    syms_200k = FileUniverseProvider(path_200k).get_symbols()
+    assert len(syms_100) == 100 and len(set(syms_100)) == 100
+    assert len(syms_200k) == 100 and len(set(syms_200k)) == 100
+
+    ticker_re = re.compile(r"^\d{6}\.(SH|SZ)$")
+    for sym in syms_100 + syms_200k:
+        assert ticker_re.match(sym), f"Invalid A-share symbol format: {sym}"
+
+    # 2. Section headers (54+46=100; 58+42=100) and all 20 subsection count comments match actual ticker lines.
+    sec_100, sub_100, names_100 = _parse_china_universe_structure(real_100)
+    sec_200k, sub_200k, names_200k = _parse_china_universe_structure(real_200k)
+
+    assert sec_100["Core"] == [54, 54]
+    assert sec_100["Satellite"] == [46, 46]
+    assert sec_200k["Core"] == [58, 58]
+    assert sec_200k["Satellite"] == [42, 42]
+
+    assert len(sub_100) == 20
+    assert len(sub_200k) == 20
+    for header, declared, actual in sub_100:
+        assert actual == declared, f"100_stocks subsection mismatch ({actual} != {declared}): {header}"
+    for header, declared, actual in sub_200k:
+        assert actual == declared, f"200k_stocks subsection mismatch ({actual} != {declared}): {header}"
+    assert sum(actual for _, _, actual in sub_100) == 100
+    assert sum(actual for _, _, actual in sub_200k) == 100
+
+    # 3. Exact 6-for-6 divergence and 94 shared backbone.
+    set_100 = set(syms_100)
+    set_200k = set(syms_200k)
+    expected_100_only = {"600519.SH", "688256.SH", "002371.SZ", "300308.SZ", "300502.SZ", "300750.SZ"}
+    expected_200k_only = {"600919.SH", "601319.SH", "600150.SH", "600066.SH", "605499.SH", "002920.SZ"}
+    assert set_100 - set_200k == expected_100_only
+    assert set_200k - set_100 == expected_200k_only
+    assert len(set_100 & set_200k) == 94
+
+    # 4. Blacklist, liquor/condiment exclusions, and 002601.SZ bug-fix checks parsed directly from docs/black_list.md.
+    blacklist_path = os.path.join(repo_root, "docs", "black_list.md")
+    price_cap_blacklist, non_price_cap_blacklist = _parse_blacklist_md(blacklist_path)
+    assert len(price_cap_blacklist) == 6
+    assert price_cap_blacklist == expected_100_only
+    assert len(non_price_cap_blacklist) == 34
+
+    liquor_condiment_exclusions = {"002304.SZ", "000568.SZ", "000858.SZ", "600809.SH", "603288.SH"}
+    forbidden_both = non_price_cap_blacklist | liquor_condiment_exclusions | {"002601.SZ"}
+
+    assert set_100.isdisjoint(forbidden_both), f"100_stocks overlaps forbidden tickers: {set_100 & forbidden_both}"
+    assert set_200k.isdisjoint(forbidden_both), f"200k_stocks overlaps forbidden tickers: {set_200k & forbidden_both}"
+    assert set_200k.isdisjoint(price_cap_blacklist), f"200k_stocks overlaps price-cap blacklist: {set_200k & price_cap_blacklist}"
+
+    # 5. Name resolution and 3-way parity across .txt comments, common/universe.py, and app.js KNOWN_STOCK_NAMES.
+    assert get_stock_name("002601.SZ") == "龙佰集团"
+    assert get_stock_name("603596.SH") == "伯特利"
+
+    js_path = os.path.join(repo_root, "web", "livetrading", "static", "js", "app.js")
+    js_known_names = _parse_js_known_stock_names(js_path)
+    assert js_known_names.get("002601.SZ") == "龙佰集团"
+    assert js_known_names.get("603596.SH") == "伯特利"
+
+    for sym in sorted(set_100 | set_200k):
+        py_name = get_stock_name(sym)
+        assert not is_placeholder_stock_name(py_name, sym), f"Placeholder stock name for {sym}: {py_name!r}"
+        if sym in names_100:
+            assert names_100[sym] == py_name, f"100_stocks comment name mismatch for {sym}: {names_100[sym]} != {py_name}"
+        if sym in names_200k:
+            assert names_200k[sym] == py_name, f"200k_stocks comment name mismatch for {sym}: {names_200k[sym]} != {py_name}"
+        assert js_known_names.get(sym) == py_name, f"JS KNOWN_STOCK_NAMES mismatch for {sym}: {js_known_names.get(sym)!r} != {py_name!r}"
+
 

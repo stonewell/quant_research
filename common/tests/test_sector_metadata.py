@@ -22,6 +22,7 @@ import pytest
 
 from common.factor_analyzer import compute_rank_ic
 from common.sector_metadata import (
+    VALID_SECTORS,
     _prefix_sector,
     load_sector_map,
     resolve_sector,
@@ -493,4 +494,42 @@ def test_sector_neutral_demean_series_branch_shuffled():
     assert np.isclose(float(result[["s1", "s2"]].mean()), global_mean, atol=1e-9)
     assert np.isclose(float(result[["s3", "s4"]].mean()), global_mean, atol=1e-9)
     assert result["s5"] == 50.0
+
+
+def test_sector_map_json_bethel_and_valid_sectors():
+    """Verify docs/universe/sector_map.json fixes Bethel (603596.SH vs 002601.SZ),
+    maps all newly added/restored China tickers, and uses only VALID_SECTORS.
+    """
+    sector_map_path = os.path.join(_PROJECT_ROOT, "docs", "universe", "sector_map.json")
+    assert os.path.isfile(sector_map_path), f"sector_map.json missing at {sector_map_path}"
+
+    sector_map = load_sector_map(sector_map_path)
+    assert sector_map, "sector_map.json should not be empty"
+
+    # Bethel code fix: 603596.SH is auto_parts; 002601.SZ (Lomon Billions) is NOT auto_parts.
+    assert sector_map.get("603596.SH") == "auto_parts"
+    assert sector_map.get("002601.SZ") != "auto_parts"
+
+    # All newly added / restored China tickers map to their expected sectors.
+    expected_new_mappings = {
+        "601939.SH": "banking",
+        "600919.SH": "banking",
+        "601319.SH": "insurance",
+        "600938.SH": "oil_petrochem",
+        "002920.SZ": "auto_parts",
+        "688256.SH": "semiconductor",
+        "300308.SZ": "telecom_cpo",
+        "300502.SZ": "telecom_cpo",
+        "002281.SZ": "telecom_cpo",
+    }
+    for sym, expected_sector in expected_new_mappings.items():
+        assert sector_map.get(sym) == expected_sector, (
+            f"Expected {sym} -> {expected_sector!r}, got {sector_map.get(sym)!r}"
+        )
+
+    # Every sector value in sector_map.json must belong to VALID_SECTORS.
+    valid_set = set(VALID_SECTORS)
+    invalid = {sym: sec for sym, sec in sector_map.items() if sec not in valid_set}
+    assert not invalid, f"Invalid sector labels in sector_map.json: {invalid}"
+
 
