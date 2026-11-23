@@ -96,6 +96,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Top-N assets held equal-weight in backtest book (default: 5)")
     p.add_argument("--lowdin-combiner", action="store_true",
                    help="Enable signed Löwdin orthogonalization before LightGBM combiner")
+    p.add_argument("--include-ms-terminals", action=argparse.BooleanOptionalAction, default=False,
+                   help="(MS8) Include 6 Track-MS microstructure terminals in GP discovery (default: False; auto-caps GP max_depth <= 4 when enabled)")
+    p.add_argument("--ms-lookback", type=int, default=20,
+                   help="(MS8) Lookback window for Track-MS GP terminals (default: 20)")
+    p.add_argument("--asymmetric-long-only", action="store_true", default=False,
+                   help="(MS8) Enable asymmetric long-only LightGBM lambdarank label gains (up-weights top-quantile labels)")
+    p.add_argument("--long-leg-weight-multiplier", type=float, default=2.0,
+                   help="(MS8) Top-quantile label gain multiplier when --asymmetric-long-only is enabled (default: 2.0)")
+    p.add_argument("--filter-adversarial-drift", action="store_true", default=False,
+                   help="(MS8) Automatically drop GP features with adversarial drift AUC > threshold (discovery vs combiner ONLY, never peeking at holdout) before Stage-2 fitting")
     p.add_argument("--small-data", action="store_true",
                    help="Use compact GP/LightGBM/CV profile for fast synthetic runs")
     p.add_argument("--seed", type=int, default=42, help="Deterministic RNG seed (default: 42)")
@@ -110,6 +120,8 @@ def build_config_from_args(args: argparse.Namespace) -> AlphaMiningConfig:
     else:
         base = AlphaMiningConfig(seed=args.seed)
 
+    include_ms = bool(getattr(args, "include_ms_terminals", False))
+    gp_max_depth = min(base.gp.max_depth, 4) if include_ms else base.gp.max_depth
     gp_cfg = GPConfig(
         population_size=args.gp_population if args.gp_population is not None else base.gp.population_size,
         n_generations=args.gp_generations if args.gp_generations is not None else base.gp.n_generations,
@@ -117,7 +129,10 @@ def build_config_from_args(args: argparse.Namespace) -> AlphaMiningConfig:
             base.gp.tournament_size,
             args.gp_population if args.gp_population is not None else base.gp.population_size,
         ),
+        max_depth=gp_max_depth,
         top_k=args.top_k_factors if args.top_k_factors is not None else base.gp.top_k,
+        include_ms_terminals=include_ms,
+        ms_lookback=int(getattr(args, "ms_lookback", base.gp.ms_lookback)),
         seed=args.seed,
     )
     cv_cfg = PurgedCVConfig(
@@ -134,6 +149,10 @@ def build_config_from_args(args: argparse.Namespace) -> AlphaMiningConfig:
         learning_rate=base.combiner.learning_rate,
         num_boost_round=base.combiner.num_boost_round,
         min_child_samples=base.combiner.min_child_samples,
+        asymmetric_long_only=bool(getattr(args, "asymmetric_long_only", False)),
+        long_leg_weight_multiplier=float(
+            getattr(args, "long_leg_weight_multiplier", base.combiner.long_leg_weight_multiplier)
+        ),
         seed=args.seed,
     )
     return AlphaMiningConfig(
@@ -144,6 +163,7 @@ def build_config_from_args(args: argparse.Namespace) -> AlphaMiningConfig:
         residual_min_obs=base.residual_min_obs,
         lowdin_for_gp_library=base.lowdin_for_gp_library,
         lowdin_for_combiner=bool(args.lowdin_combiner),
+        filter_adversarial_drift=bool(getattr(args, "filter_adversarial_drift", False)),
         top_n=args.top_n,
         seed=args.seed,
         gp=gp_cfg,

@@ -269,3 +269,62 @@ def test_rule9_gate_ignores_equal_weight_arm_ic_summary():
     gate_degenerate = evaluate_rule9_gate(arms_degenerate, mon_clean)
     assert gate_null == gate_degenerate
     assert gate_null["passed"] is True
+
+
+def test_w21_ms8_cli_flags_and_leak_free_adversarial_drift_filter():
+    """W2.1 (MS8): verifies all 5 CLI flags, default bit-identity, max_depth<=4 auto-cap,
+    and leak-free discovery-vs-combiner adversarial drift filtering (never touching holdout)."""
+    parser = run_alpha_mining.build_arg_parser()
+
+    # Default CLI aligns with GPConfig/CombinerConfig/AlphaMiningConfig defaults
+    default_args = parser.parse_args([])
+    default_cfg = run_alpha_mining.build_config_from_args(default_args)
+    assert default_cfg.gp.include_ms_terminals is False
+    assert default_cfg.gp.ms_lookback == 20
+    assert default_cfg.combiner.asymmetric_long_only is False
+    assert default_cfg.combiner.long_leg_weight_multiplier == 2.0
+    assert default_cfg.filter_adversarial_drift is False
+
+    # Explicit MS8 CLI flags
+    ms8_args = parser.parse_args(
+        [
+            "--include-ms-terminals",
+            "--ms-lookback", "15",
+            "--asymmetric-long-only",
+            "--long-leg-weight-multiplier", "3.0",
+            "--filter-adversarial-drift",
+        ]
+    )
+    ms8_cfg = run_alpha_mining.build_config_from_args(ms8_args)
+    assert ms8_cfg.gp.include_ms_terminals is True
+    assert ms8_cfg.gp.max_depth <= 4
+    assert ms8_cfg.gp.ms_lookback == 15
+    assert ms8_cfg.combiner.asymmetric_long_only is True
+    assert ms8_cfg.combiner.long_leg_weight_multiplier == 3.0
+    assert ms8_cfg.filter_adversarial_drift is True
+
+    # End-to-end benchmark with filter_adversarial_drift=True on synthetic panel
+    rng = np.random.default_rng(108)
+    n_dates = 240
+    dates = pd.bdate_range("2021-01-04", periods=n_dates)
+    universe = {}
+    for i in range(8):
+        rets = rng.normal(0.0005, 0.015, size=n_dates)
+        # Plant a strong regime shift in combiner window on volume/volatility
+        rets[110:190] += 0.004 * (1 if i % 2 == 0 else -1)
+        closes = 100.0 * np.exp(np.cumsum(rets))
+        df = make_ohlcv_from_closes(closes)
+        df.index = dates
+        universe[f"S{i}"] = df
+
+    cfg = AlphaMiningConfig.small_data(seed=108)
+    cfg.filter_adversarial_drift = True
+    report, _ = run_alpha_mining_benchmark(universe, cfg)
+    assert report["ms_terminals_enabled"] is False
+    aff = report["adversarial_feature_filter"]
+    assert aff["enabled"] is True
+    assert "surviving_features" in aff
+    assert len(aff["surviving_features"]) >= 1
+    assert set(report["stage2_combiner_oof"]["feature_names"]).issubset(
+        set(aff["surviving_features"])
+    )

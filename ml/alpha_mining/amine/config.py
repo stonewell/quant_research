@@ -311,6 +311,7 @@ class AlphaMiningConfig:
     residual_min_obs: int = 30
     lowdin_for_gp_library: bool = True
     lowdin_for_combiner: bool = False
+    filter_adversarial_drift: bool = False
     discovery_ratio: float = 0.45
     combiner_ratio: float = 0.35
     holdout_ratio: float = 0.20

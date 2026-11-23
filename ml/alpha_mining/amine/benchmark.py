@@ -49,6 +49,7 @@ from amine.monitoring import (
     adversarial_validation,
     check_importance_decay,
     check_turnover_breaker,
+    filter_adversarial_drifted_features,
 )
 from amine.orthogonalize import lowdin_orthogonalize_panel
 from amine.purged_cv import split_timeline_three_way
@@ -317,9 +318,56 @@ def run_alpha_mining_benchmark(
         gp_fallback_used = True
         gp_panels = dict(seed_lib)
 
+    # (MS8 / W2.1) Leak-free adversarial covariate-shift feature filter:
+    # strictly discovery_dates vs combiner_dates ONLY (never peeks at holdout or labels).
+    disc_long, disc_feat_cols = prepare_long_dataset(
+        gp_panels,
+        labels=None,
+        dates_subset=split.discovery_dates,
+        apply_lowdin=cfg.lowdin_for_combiner,
+        require_label=False,
+    )
+    comb_long, _ = prepare_long_dataset(
+        gp_panels,
+        labels=None,
+        dates_subset=split.combiner_dates,
+        apply_lowdin=cfg.lowdin_for_combiner,
+        require_label=False,
+    )
+    if disc_feat_cols and not disc_long.empty and not comb_long.empty:
+        kept_feats, flagged_feats, drift_adv = filter_adversarial_drifted_features(
+            disc_long,
+            comb_long,
+            disc_feat_cols,
+            n_splits=cfg.monitoring.adv_n_splits,
+            drop_auc_threshold=cfg.monitoring.adv_drop_auc_threshold,
+            max_feature_gain_share=cfg.monitoring.adv_max_feature_gain_share,
+            min_surviving_features=1,
+            seed=cfg.seed,
+        )
+        drift_final_auc = None if not np.isfinite(drift_adv.auc) else float(drift_adv.auc)
+    else:
+        kept_feats = list(gp_panels.keys())
+        flagged_feats = []
+        drift_final_auc = None
+
+    active_gp_panels = (
+        {k: gp_panels[k] for k in kept_feats if k in gp_panels}
+        if (cfg.filter_adversarial_drift and kept_feats)
+        else gp_panels
+    )
+    adversarial_feature_filter_report = {
+        "enabled": bool(cfg.filter_adversarial_drift),
+        "drop_auc_threshold": float(cfg.monitoring.adv_drop_auc_threshold),
+        "final_auc": drift_final_auc,
+        "flagged_features": list(flagged_feats),
+        "dropped_features": list(flagged_feats) if cfg.filter_adversarial_drift else [],
+        "surviving_features": list(active_gp_panels.keys()),
+    }
+
     # Stage 2: Purged Walk-Forward CV -> OOF strictly on combiner_dates
     cv_res = run_purged_cv_oof(
-        gp_panels,
+        active_gp_panels,
         labels,
         cv_config=cfg.cv,
         combiner_config=cfg.combiner,
@@ -348,7 +396,7 @@ def run_alpha_mining_benchmark(
 
     # Holdout predictions: arm (a) LightGBM top-N and arm (e) LightGBM + Löwdin on
     holdout_a = fit_predict_holdout(
-        gp_panels,
+        active_gp_panels,
         labels,
         train_dates=split.combiner_dates,
         holdout_dates=split.holdout_dates,
@@ -358,9 +406,9 @@ def run_alpha_mining_benchmark(
         all_dates=all_dates,
         apply_lowdin=cfg.lowdin_for_combiner,
     )
-    if len(gp_panels) >= 2:
+    if len(active_gp_panels) >= 2:
         holdout_e = fit_predict_holdout(
-            gp_panels,
+            active_gp_panels,
             labels,
             train_dates=split.combiner_dates,
             holdout_dates=split.holdout_dates,
@@ -476,14 +524,14 @@ def run_alpha_mining_benchmark(
 
     # Monitoring diagnostics (report-only in v1)
     ref_long, feat_cols = prepare_long_dataset(
-        gp_panels,
+        active_gp_panels,
         labels=None,
         dates_subset=split.combiner_dates,
         apply_lowdin=cfg.lowdin_for_combiner,
         require_label=False,
     )
     rec_long, _ = prepare_long_dataset(
-        gp_panels,
+        active_gp_panels,
         labels=None,
         dates_subset=split.holdout_dates,
         apply_lowdin=cfg.lowdin_for_combiner,
@@ -571,6 +619,8 @@ def run_alpha_mining_benchmark(
         },
         "holdout_arms": arms,
         "window_alignment": window_alignment,
+        "ms_terminals_enabled": bool(cfg.gp.include_ms_terminals),
+        "adversarial_feature_filter": adversarial_feature_filter_report,
         "monitoring": monitoring_report,
         "rule9_gate": gate,
     }
