@@ -609,3 +609,58 @@ def test_monitor_rejects_unusable_configuration():
         ICDecayMonitor(close, max_recording_lag_days=-1)
     with pytest.raises(MonitorInputError):
         ICDecayMonitor(close, start_date="not-a-date")
+
+
+def test_friday_snapshot_recorded_over_weekend_or_monday_preopen_is_accepted():
+    """AT3-W1: Trading-session-aware lag guard accepts Friday snapshots recorded
+    on Sunday (0 elapsed trading sessions) or Monday pre-open (1 elapsed session),
+    while still rejecting Wednesday post-hoc backfills (3 elapsed sessions > 1)."""
+    # 2026-01-05 (Mon) .. 2026-01-30 (Fri); 2026-01-09 is Friday
+    dates = pd.bdate_range("2026-01-05", periods=20)
+    friday = pd.Timestamp("2026-01-09")
+    assert friday in dates and friday.weekday() == 4
+    syms = [f"600{i:03d}.SH" for i in range(1, 21)]
+    rng = np.random.default_rng(17)
+    close = pd.DataFrame(
+        20.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, size=(len(dates), 20)), axis=0)),
+        index=dates,
+        columns=syms,
+    )
+    scores = {s: float(i) for i, s in enumerate(syms)}
+
+    # Sunday 20:00 -> 0 elapsed trading sessions -> accepted
+    m_sun = ICDecayMonitor(close, max_recording_lag_days=1)
+    snap_sun = SignalSnapshot(
+        date=friday,
+        strategy="chan_four_state_blend",
+        universe_id="cn_core",
+        scores=scores,
+        candidates=tuple(syms),
+        recorded_at=pd.Timestamp("2026-01-11 20:00:00"),
+    )
+    m_sun.add_snapshot(snap_sun)
+
+    # Monday 08:30 -> 1 elapsed trading session -> accepted
+    m_mon = ICDecayMonitor(close, max_recording_lag_days=1)
+    snap_mon = SignalSnapshot(
+        date=friday,
+        strategy="chan_four_state_blend",
+        universe_id="cn_core",
+        scores=scores,
+        candidates=tuple(syms),
+        recorded_at=pd.Timestamp("2026-01-12 08:30:00"),
+    )
+    m_mon.add_snapshot(snap_mon)
+
+    # Wednesday 09:00 -> 3 elapsed trading sessions > 1 -> rejected as backfill
+    m_wed = ICDecayMonitor(close, max_recording_lag_days=1)
+    snap_wed = SignalSnapshot(
+        date=friday,
+        strategy="chan_four_state_blend",
+        universe_id="cn_core",
+        scores=scores,
+        candidates=tuple(syms),
+        recorded_at=pd.Timestamp("2026-01-14 09:00:00"),
+    )
+    with pytest.raises(BackfilledSnapshotError, match="trading session"):
+        m_wed.add_snapshot(snap_wed)

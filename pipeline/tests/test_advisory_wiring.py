@@ -1233,6 +1233,7 @@ def test_p3_enforced_run_marks_r1_gates_orders(stage2):
 
 
 def test_ms14_factor_crowding_omitted_is_bit_identical():
+    import numpy as np
     from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
 
     b1 = build_advisory_block(phase=ADVISORY_PHASE_P1, as_of="2026-11-19")
@@ -1244,6 +1245,7 @@ def test_ms14_factor_crowding_omitted_is_bit_identical():
 def test_ms14_factor_crowding_insufficient_history_and_three_states():
     import numpy as np
 
+    import numpy as np
     from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
     from common.factor_crowding import (
         CROWDING_STATUS_INSUFFICIENT,
@@ -1301,6 +1303,7 @@ def test_ms14_factor_crowding_strict_json_roundtrip():
 
     import numpy as np
 
+    import numpy as np
     from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
 
     blk = build_advisory_block(
@@ -1324,6 +1327,7 @@ def test_ms14_factor_crowding_strict_json_roundtrip():
 
 
 def test_ms14_factor_crowding_never_changes_stage2_orders(stage2):
+    import numpy as np
     from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
 
     mod = stage2
@@ -1373,3 +1377,181 @@ def test_ms14_factor_crowding_never_changes_stage2_orders(stage2):
     )
     for k in ("target_shares", "current_shares", "delta_shares", "trade_value"):
         assert r_plain[k] == r_crowded[k]
+
+
+def test_w22_stage1_cli_enable_factor_crowding_advisory_flag():
+    """W2.2 / 2026-11-22 user-approved flip (MS14): --enable-factor-crowding-advisory
+    defaults to True (emits advisory.factor_crowding with advisory=True, gates_orders=False),
+    while --no-enable-factor-crowding-advisory opts out (bit-identical advisory block)."""
+    from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
+    from common.factor_crowding import CROWDING_STATUS_INSUFFICIENT
+    from scripts import check_live_portfolio_health as s1
+
+    args_def = s1.parse_args([])
+    assert getattr(args_def, "enable_factor_crowding_advisory", False) is True
+
+    args_on = s1.parse_args(["--enable-factor-crowding-advisory"])
+    assert args_on.enable_factor_crowding_advisory is True
+
+    args_off = s1.parse_args(["--no-enable-factor-crowding-advisory"])
+    assert args_off.enable_factor_crowding_advisory is False
+
+    fc_off = s1.compute_stage1_factor_crowding_advisory(
+        enabled=args_off.enable_factor_crowding_advisory
+    )
+    assert fc_off is None
+    blk_off = build_advisory_block(
+        phase=ADVISORY_PHASE_P1, as_of="2026-11-22", factor_crowding=fc_off
+    )
+    blk_base = build_advisory_block(phase=ADVISORY_PHASE_P1, as_of="2026-11-22")
+    assert blk_off == blk_base
+    assert "factor_crowding" not in blk_off
+
+    fc_def = s1.compute_stage1_factor_crowding_advisory(
+        enabled=args_def.enable_factor_crowding_advisory
+    )
+    assert fc_def is not None
+    blk_def = build_advisory_block(
+        phase=ADVISORY_PHASE_P1, as_of="2026-11-22", factor_crowding=fc_def
+    )
+    assert blk_def["factor_crowding"]["status"] == CROWDING_STATUS_INSUFFICIENT
+    assert blk_def["factor_crowding"]["advisory"] is True
+    assert blk_def["factor_crowding"]["gates_orders"] is False
+
+
+def test_at3_stage2_emits_signal_snapshot_and_stage1_ingests_archive(tmp_path):
+    """AT3-W2 & AT3-W3: Stage-2 emits signal_snapshot.json by default (zero order impact),
+    storage/repair whitelists register it, and Stage-1 ingests >=12 archived snapshots into
+    ICDecayMonitor + alert_matrix + MS14 factor_crowding."""
+    import numpy as np
+    from common.advisory_report import ADVISORY_PHASE_P1, build_advisory_block
+    from common.factor_crowding import CROWDING_STATUS_INSUFFICIENT
+    from common.signal_snapshot import (
+        SIGNAL_SNAPSHOT_FILENAME,
+        record_signal_snapshot,
+        serialize_snapshot,
+    )
+    from common.testing import make_ohlcv_from_closes
+    from pipeline.research.blend.chan_four_state_blend import ChanFourStateBlendStrategy
+    from scripts import check_live_portfolio_health as s1
+    from scripts import repair_live_run_snapshots as repair_mod
+    from scripts import run_live_strategy as s2
+
+    # 1. CLI default True & opt-out False
+    a_def = s2.parse_args(["--strategy", "chan_four_state_blend", "--portfolio-value", "100000"])
+    a_off = s2.parse_args(
+        ["--strategy", "chan_four_state_blend", "--portfolio-value", "100000", "--no-record-signal-snapshot"]
+    )
+    assert a_def.record_signal_snapshot is True
+    assert a_off.record_signal_snapshot is False
+
+    # 2. Repair whitelist + storage.py contract (import via file path, no fastapi needed)
+    assert SIGNAL_SNAPSHOT_FILENAME in repair_mod.NEVER_REWRITTEN_BY_REPAIR
+    storage_src = _source(os.path.join(_REPO_ROOT, "web", "livetrading", "storage.py"))
+    assert '"signal_snapshot.json"' in storage_src
+    # Verify signal_snapshot.json is in is_run_dir and NOT in has_stage2_artifact
+    has_s2_idx = storage_src.index("def has_stage2_artifact(")
+    is_rd_idx = storage_src.index("def is_run_dir(")
+    assert '"signal_snapshot.json"' in storage_src[is_rd_idx : is_rd_idx + 1800]
+    assert '"signal_snapshot.json"' not in storage_src[has_s2_idx : has_s2_idx + 1800]
+
+    # 3. Synthetic 20-stock universe across 90 trading days
+    dates = pd.bdate_range("2025-01-02", periods=90)
+    rng = np.random.default_rng(123)
+    syms = [f"600{i:03d}.SH" for i in range(1, 21)]
+    universe = {}
+    for idx, sym in enumerate(syms):
+        drift = 0.0003 * (idx - 10)
+        rets = drift + rng.normal(0.0, 0.015, size=len(dates))
+        closes = 25.0 * np.exp(np.cumsum(rets))
+        df = make_ohlcv_from_closes(closes, start=str(dates[0].date()))
+        df.index = dates
+        df["Volume"] = rng.uniform(1e5, 5e5, size=len(dates))
+        df["Amount"] = df["Close"] * df["Volume"]
+        df["Turn"] = rng.uniform(0.5, 6.0, size=len(dates))
+        universe[sym] = df
+
+    # Stage-2 atomic snapshot write helper produces valid file
+    out_single = tmp_path / "single_run"
+    written = s2._write_signal_snapshot_atomic(
+        str(out_single),
+        template=ChanFourStateBlendStrategy(),
+        universe=universe,
+        params={},
+        candidate_symbols=syms,
+        as_of_date=dates[-1].strftime("%Y-%m-%d"),
+        strategy_key="chan_four_state_blend",
+        universe_file="custom_astock_20.txt",
+        cutoff_time="15:00",
+        data_provider="synthetic",
+    )
+    assert written is not None and os.path.isfile(written)
+
+    # 4. Stage-1 archive collector + ICDecayMonitor + MS14 score-panel auto-feed (>=12 sessions)
+    archive_root = tmp_path / "runs_archive"
+    # Build 65 sessions of archived snapshots (with 10-bar horizon maturity remaining at end)
+    snap_dates = dates[15:80]
+    for dt in snap_dates:
+        day_inst = archive_root / dt.strftime("%Y-%m-%d") / "153000"
+        day_inst.mkdir(parents=True, exist_ok=True)
+        scores = {
+            sym: float((idx - 10) * 0.1 + rng.normal(0.0, 0.05))
+            for idx, sym in enumerate(syms)
+        }
+        snap = record_signal_snapshot(
+            date=dt,
+            strategy="chan_four_state_blend",
+            universe_id="custom_astock_20",
+            scores=scores,
+            candidates=syms,
+            recorded_at=dt,
+            source="stage2:chan_four_state_blend",
+        )
+        (day_inst / SIGNAL_SNAPSHOT_FILENAME).write_text(
+            serialize_snapshot(snap) + "\n", encoding="utf-8"
+        )
+
+    as_of_str = dates[-1].strftime("%Y-%m-%d")
+    collected = s1.collect_archived_signal_snapshots(
+        str(archive_root),
+        as_of_date=as_of_str,
+        strategy_key="chan_four_state_blend",
+    )
+    assert len(collected) == len(snap_dates)
+
+    ic_rep, legs, score_panel, ret_panel, turn_panel = s1.evaluate_stage1_signal_decay(
+        collected,
+        universe,
+        cash_proxy="BIL",
+        as_of_date=as_of_str,
+    )
+    assert ic_rep is not None
+    assert len(legs) == 1
+    assert legs[0].status == "OK"
+    assert legs[0].n_valid_eval_dates >= 10
+    assert score_panel.shape[1] == 20
+
+    fc = s1.compute_stage1_factor_crowding_advisory(
+        factor_scores=score_panel,
+        returns_panel=ret_panel,
+        turnover_panel=turn_panel,
+        enabled=True,
+    )
+    assert fc is not None
+    assert fc["status"] != CROWDING_STATUS_INSUFFICIENT
+    assert fc["advisory"] is True
+    assert fc["gates_orders"] is False
+
+    adv = build_advisory_block(
+        phase=ADVISORY_PHASE_P1,
+        leg_reports=legs,
+        as_of=as_of_str,
+        factor_crowding=fc,
+        ic_decay=ic_rep,
+    )
+    assert "ic_decay" in adv
+    assert adv["ic_decay"]["legs"][0]["status"] == "OK"
+    assert adv["worst_measured_level"] is not None
+    assert adv["worst_measured_level"] != "INSUFFICIENT"
+    # Strictly JSON-native (no NaN / Timestamp)
+    json.dumps(adv, ensure_ascii=False, allow_nan=False)

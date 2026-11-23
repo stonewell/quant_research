@@ -48,7 +48,7 @@ import re
 import sys
 import unicodedata
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1057,6 +1057,125 @@ def _write_effective_params(
     except Exception as exc:
         print(
             f"[EFFECTIVE PARAMS] warning: 写入失败，运行继续（参数溯源缺失）: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def resolve_snapshot_universe_id(universe_file: Optional[str]) -> str:
+    """Canonical non-empty universe_id token from `--universe-file` basename stem."""
+    if not universe_file:
+        return "default_universe"
+    stem = os.path.splitext(os.path.basename(str(universe_file).strip()))[0].strip()
+    return stem or "default_universe"
+
+
+def _resolve_snapshot_recorded_at(
+    as_of_date: Any,
+    *,
+    data_provider: str = "",
+    clock_ctx: Any = None,
+) -> pd.Timestamp:
+    """Resolve honest `recorded_at` for AT3 anti-backfill validation.
+
+    Synthetic/offline test runs anchor `recorded_at` to `as_of_date` so synthetic
+    dates pass deterministic tests; real live runs stamp the actual naive wall-clock
+    time (`clock_ctx.clock.local_now()` if available, else `pd.Timestamp.now()`) so
+    genuine post-hoc backfills are caught by `ICDecayMonitor`.
+    """
+    if str(data_provider or "").strip().lower() == "synthetic":
+        return pd.Timestamp(as_of_date)
+    clock = getattr(clock_ctx, "clock", None)
+    if clock is not None and hasattr(clock, "local_now"):
+        try:
+            now_val = clock.local_now()
+            ts = pd.Timestamp(now_val)
+            return ts.tz_localize(None) if ts.tzinfo is not None else ts
+        except Exception:
+            pass
+    now_ts = pd.Timestamp.now()
+    return now_ts.tz_localize(None) if now_ts.tzinfo is not None else now_ts
+
+
+def _write_signal_snapshot_atomic(
+    output_dir: str,
+    *,
+    template: Any,
+    universe: Dict[str, pd.DataFrame],
+    params: Dict[str, Any],
+    candidate_symbols: Sequence[str],
+    as_of_date: Any,
+    strategy_key: str,
+    universe_file: Optional[str],
+    cutoff_time: str = "15:00",
+    data_provider: str = "",
+    clock_ctx: Any = None,
+) -> Optional[str]:
+    """Emit `<output_dir>/signal_snapshot.json` atomically (AT3-W2, advisory-only).
+
+    Never raises into order generation: any extraction or IO error logs a stderr
+    warning and returns None.
+    """
+    try:
+        from common.signal_snapshot import (
+            CLOSE_INFORMATION_SET,
+            INTRADAY_INFORMATION_SET,
+            SIGNAL_SNAPSHOT_FILENAME,
+            compute_cross_sectional_scores_for_snapshot,
+            record_signal_snapshot,
+            serialize_snapshot,
+        )
+
+        scores = compute_cross_sectional_scores_for_snapshot(
+            template,
+            universe,
+            params,
+            candidate_symbols,
+            as_of_date=as_of_date,
+        )
+        if not scores:
+            return None
+        cutoff_str = str(cutoff_time or "15:00").strip()
+        info_set = (
+            CLOSE_INFORMATION_SET
+            if cutoff_str >= "15:00"
+            else INTRADAY_INFORMATION_SET
+        )
+        recorded_at = _resolve_snapshot_recorded_at(
+            as_of_date,
+            data_provider=data_provider,
+            clock_ctx=clock_ctx,
+        )
+        snap = record_signal_snapshot(
+            date=as_of_date,
+            strategy=str(strategy_key),
+            universe_id=resolve_snapshot_universe_id(universe_file),
+            scores=scores,
+            candidates=candidate_symbols,
+            information_set=info_set,
+            recorded_at=recorded_at,
+            source=f"stage2:{strategy_key}",
+        )
+        payload_text = serialize_snapshot(snap)
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, SIGNAL_SNAPSHOT_FILENAME)
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(payload_text + "\n")
+                f.flush()
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        print(f"[SIGNAL SNAPSHOT] 横截面信号快照已写入: {path} (N={len(scores)}, info={info_set})")
+        return path
+    except Exception as exc:
+        print(
+            f"[SIGNAL SNAPSHOT] warning: 信号快照写入失败，运行继续（零下单影响）: {exc}",
             file=sys.stderr,
         )
         return None
@@ -2183,6 +2302,24 @@ def parse_args(args: Optional[List[str]] = None):
             "an unidentifiable dump, or a registered strategy whose blend_weighting_mode is "
             "missing entirely. Do NOT archive the resulting run as a live ticket."
         ),
+    )
+    parser.add_argument(
+        "--record-signal-snapshot",
+        dest="record_signal_snapshot",
+        action="store_true",
+        default=True,
+        help=(
+            "(AT3) Emit <output-dir>/signal_snapshot.json covering all candidate risky "
+            "symbols for Stage-1 live IC/ICIR decay monitoring (default: True; "
+            "advisory-only, zero impact on weights or orders)."
+        ),
+    )
+    parser.add_argument(
+        "--no-record-signal-snapshot",
+        dest="record_signal_snapshot",
+        action="store_false",
+        default=True,
+        help="(AT3) Opt out of emitting <output-dir>/signal_snapshot.json.",
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     # (L2.3) --market / --allow-intraday / --strict-market-clock / --strict-freshness /
@@ -6676,6 +6813,9 @@ def main(cli_args: Optional[List[str]] = None):
                 if degraded_gate_acknowledged()
                 else {}
             ),
+            # (Rule 11 / W1.2) Record opt-out when --no-include-turn was explicitly supplied;
+            # omitted on default include_turn=True so summary.json stays byte-identical.
+            **({"include_turn": False} if not bool(getattr(args, "include_turn", True)) else {}),
         },
     )
 
@@ -6730,6 +6870,7 @@ def main(cli_args: Optional[List[str]] = None):
         cli_override=bool(_cli_5m_provider),
         config_origin=_effective_origin,
     )
+    universe_5m: Dict[str, pd.DataFrame] = {}
     if enable_intraday_5m:
         try:
             from common.intraday_features import (
@@ -6888,7 +7029,10 @@ def main(cli_args: Optional[List[str]] = None):
     )
 
     # 3. Generate Weights & Extract Latest Rebalance
-    sparse_weights = template.generate_weights(universe, params)
+    # (W1.3 / MS23) Pass raw 5m bars transiently to 5m-aware strategies (e.g. MS7)
+    # without mutating `params` (which is serialized into effective_params.json).
+    _gen_params = {**params, "intraday_5m_universe": universe_5m} if universe_5m else params
+    sparse_weights = template.generate_weights(universe, _gen_params)
     rebalances = latest_rebalance_rows(sparse_weights)
     if rebalances.empty:
         print("\n[ERROR] No rebalance rows generated at or before this date. Ensure sufficient lookback history.")
@@ -7575,6 +7719,35 @@ def main(cli_args: Optional[List[str]] = None):
             f"[EFFECTIVE PARAMS] warning: 参数溯源构建失败，运行继续: {exc}",
             file=sys.stderr,
         )
+
+    # ---- AT3-W2: emit point-in-time cross-sectional signal snapshot. ADVISORY ONLY ---
+    if bool(getattr(args, "record_signal_snapshot", True)):
+        try:
+            _snap_cash_keys = resolve_cash_proxy_target_symbols(
+                list(universe.keys()), cash_proxy
+            )
+            _snap_candidates = tuple(
+                sorted(s for s in universe.keys() if s not in _snap_cash_keys)
+            )
+            if _snap_candidates:
+                _write_signal_snapshot_atomic(
+                    args.output_dir,
+                    template=template,
+                    universe=universe,
+                    params=_gen_params,
+                    candidate_symbols=_snap_candidates,
+                    as_of_date=as_of_date,
+                    strategy_key=strategy_key,
+                    universe_file=getattr(args, "universe_file", None),
+                    cutoff_time=getattr(args, "cutoff_time", "15:00"),
+                    data_provider=getattr(args, "data_provider", ""),
+                    clock_ctx=clock_ctx,
+                )
+        except Exception as exc:
+            print(
+                f"[SIGNAL SNAPSHOT] warning: 信号快照阶段异常，运行继续: {exc}",
+                file=sys.stderr,
+            )
 
     # Sector holding counts & throttle limit
     sector_counts: Dict[str, int] = {}

@@ -346,3 +346,72 @@ def test_module_is_advisory_with_no_io_dependencies():
     source = inspect.getsource(snapshot_mod)
     for delegated in ("spearmanr", "compute_rank_ic", "ic_ir", "icir"):
         assert delegated not in source
+
+
+def test_compute_cross_sectional_scores_for_snapshot_tier1_ms7_and_tier2_blend():
+    """AT3-W1: Option-C two-tier score extractor covers MS7 (Tier 1), CFSB (Tier 2),
+    and returns None for static fixed-weight templates."""
+    import numpy as np
+    from common.allocation_templates import EqualWeightAllocation
+    from common.signal_snapshot import compute_cross_sectional_scores_for_snapshot
+    from common.testing import make_ohlcv_from_closes
+    from pipeline.research.blend.chan_four_state_blend import ChanFourStateBlendStrategy
+    from pipeline.research_strategy.rs.microstructure_alpha_strategy import (
+        MicrostructureAlphaCompositeStrategy,
+    )
+
+    dates = pd.bdate_range("2025-01-02", periods=90)
+    rng = np.random.default_rng(77)
+    syms = [f"600{i:03d}.SH" for i in range(1, 21)]
+    universe = {}
+    for idx, sym in enumerate(syms):
+        drift = 0.0002 * (idx - 10)
+        rets = drift + rng.normal(0.0, 0.015, size=len(dates))
+        closes = 20.0 * np.exp(np.cumsum(rets))
+        df = make_ohlcv_from_closes(closes, start=str(dates[0].date()))
+        df.index = dates
+        df["Volume"] = rng.uniform(1e5, 5e5, size=len(dates))
+        df["Amount"] = df["Close"] * df["Volume"]
+        df["Turn"] = rng.uniform(0.5, 8.0, size=len(dates))
+        universe[sym] = df
+    as_of = dates[-1]
+
+    # Tier 1: MS7 native compute_composite_scores
+    ms7 = MicrostructureAlphaCompositeStrategy()
+    ms7_params = {"ms7_rebalance_freq_days": 10, "cash_proxy": None}
+    comp_df = ms7.compute_composite_scores(universe, ms7_params)
+    expected_ms7 = comp_df.loc[comp_df.index <= as_of].iloc[-1]
+    scores_ms7 = compute_cross_sectional_scores_for_snapshot(
+        ms7, universe, ms7_params, syms, as_of_date=as_of
+    )
+    assert scores_ms7 is not None
+    assert set(scores_ms7.keys()) == set(syms)
+    for sym in syms:
+        assert scores_ms7[sym] == pytest.approx(float(expected_ms7[sym]), rel=1e-9, abs=1e-9)
+
+    # Tier 2: ChanFourStateBlendStrategy continuous scores across all 20 candidates
+    cfsb = ChanFourStateBlendStrategy()
+    scores_cfsb = compute_cross_sectional_scores_for_snapshot(
+        cfsb, universe, {}, syms, as_of_date=as_of
+    )
+    assert scores_cfsb is not None
+    assert set(scores_cfsb.keys()) == set(syms)
+    assert len(set(round(v, 8) for v in scores_cfsb.values())) >= 15
+    snap = record_signal_snapshot(
+        date=as_of,
+        strategy="chan_four_state_blend",
+        universe_id="test_cn20",
+        scores=scores_cfsb,
+        candidates=syms,
+        recorded_at=as_of,
+    )
+    assert snap.is_complete is True
+
+    # Static fixed-ratio template -> None
+    static_tpl = EqualWeightAllocation()
+    assert (
+        compute_cross_sectional_scores_for_snapshot(
+            static_tpl, universe, {}, syms, as_of_date=as_of
+        )
+        is None
+    )

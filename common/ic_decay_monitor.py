@@ -126,6 +126,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+STATUS_OK = "OK"
+STATUS_INSUFFICIENT_HISTORY = "INSUFFICIENT_HISTORY"
+
 from common import factor_analyzer as _fa
 from common.market_clock import UnknownSymbolMarketError, infer_market_from_symbol
 from common.signal_snapshot import (
@@ -143,9 +146,6 @@ FROZEN_PRICE_FIELD = "Close"
 FROZEN_HORIZON_BARS = 5
 #: A snapshot may be recorded at most this many calendar days after its session.
 MAX_RECORDING_LAG_DAYS = 1
-
-STATUS_OK = "OK"
-STATUS_INSUFFICIENT_HISTORY = "INSUFFICIENT_HISTORY"
 
 LegKey = Tuple[str, str, str]  # (market, universe_id, strategy)
 
@@ -471,6 +471,31 @@ class ICDecayMonitor:
         self._market_map = {str(k): str(v) for k, v in (market_map or {}).items()}
         self._snapshots: Dict[Tuple[pd.Timestamp, str, str], SignalSnapshot] = {}
 
+    def _recording_lag_sessions(
+        self, session_date: pd.Timestamp, recorded_day: pd.Timestamp
+    ) -> int:
+        """Count elapsed trading sessions in (session_date, recorded_day].
+
+        Within `self._close.index`, counts actual trading sessions in the price panel
+        (respecting market weekends and exchange holidays). If `recorded_day` extends
+        past `self._close.index[-1]`, adds weekday business days after the panel end
+        so a post-hoc backfill past the loaded price panel is still caught.
+        When `self.max_recording_lag_days == 0`, returns calendar days so a strict
+        0-lag caller still demands same-day recording.
+        """
+        if recorded_day <= session_date:
+            return 0
+        if self.max_recording_lag_days == 0:
+            return int((recorded_day - session_date).days)
+        idx = self._close.index
+        in_panel = int(((idx > session_date) & (idx <= recorded_day)).sum())
+        panel_end = idx[-1]
+        if recorded_day <= panel_end:
+            return in_panel
+        anchor = max(session_date, panel_end)
+        extra_bdays = int(len(pd.bdate_range(anchor + pd.Timedelta(days=1), recorded_day)))
+        return in_panel + extra_bdays
+
     # -- ingestion ---------------------------------------------------------
     def add_snapshot(self, snapshot: SignalSnapshot) -> SignalSnapshot:
         """Register one snapshot, enforcing completeness + information set + no-backfill.
@@ -495,11 +520,13 @@ class ICDecayMonitor:
                 "config/dump drift), so a late snapshot cannot be back-filled from today's data"
             )
         if snapshot.recorded_at is not None:
-            lag_days = int((snapshot.recorded_at.normalize() - snapshot.date).days)
+            lag_days = self._recording_lag_sessions(
+                snapshot.date, snapshot.recorded_at.normalize()
+            )
             if lag_days > self.max_recording_lag_days:
                 raise BackfilledSnapshotError(
                     f"snapshot for {snapshot.date.date()} was recorded at "
-                    f"{snapshot.recorded_at} ({lag_days} days later, tolerance "
+                    f"{snapshot.recorded_at} ({lag_days} trading session(s) later, tolerance "
                     f"{self.max_recording_lag_days}); that is a reconstruction from "
                     "post-hoc data, not a live snapshot"
                 )

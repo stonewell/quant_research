@@ -1505,6 +1505,10 @@ def is_run_dir(path: Optional[str]) -> bool:
             # refuses/crashes afterwards leaves it behind -- hence it stays OUT of
             # `has_stage2_artifact` (see that function's docstring).
             "effective_params.json",
+            # AT3: point-in-time cross-sectional signal snapshot written beside
+            # effective_params.json by Stage 2 (advisory-only, also excluded from
+            # `has_stage2_artifact` for the same reason).
+            "signal_snapshot.json",
         )
     )
 

@@ -1527,7 +1527,10 @@ NOT_RECOMPUTED: Tuple[str, ...] = (
 # (an absent artifact stays absent rather than being back-filled from today's code).
 # Deliberately NOT part of `NOT_RECOMPUTED` above: that tuple enumerates TICKET fields
 # copied into `detail_reason`, while this is a separate run-level artifact.
-NEVER_REWRITTEN_BY_REPAIR: Tuple[str, ...] = ("effective_params.json",)
+NEVER_REWRITTEN_BY_REPAIR: Tuple[str, ...] = (
+    "effective_params.json",
+    "signal_snapshot.json",
+)
 
 
 def recompute_ticket(

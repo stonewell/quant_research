@@ -226,6 +226,7 @@ def build_advisory_block(
     r1: Any = None,
     real_buy_scale: Any = None,
     factor_crowding: Any = None,
+    ic_decay: Any = None,
 ) -> Dict[str, Any]:
     """Build the one advisory dict every pass (`P1`/`P2`/`P3`) writes.
 
@@ -306,5 +307,10 @@ def build_advisory_block(
 
     if factor_crowding is not None:
         block["factor_crowding"] = factor_crowding_to_dict(factor_crowding)
+
+    if ic_decay is not None:
+        block["ic_decay"] = (
+            ic_decay.to_dict() if hasattr(ic_decay, "to_dict") else dict(ic_decay)
+        )
 
     return block

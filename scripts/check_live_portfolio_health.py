@@ -40,7 +40,7 @@ import os
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -544,6 +544,27 @@ def parse_args(args: Optional[List[str]] = None):
             "仅在你确实要重建缓存库时使用: 默认情况下，缓存库（<cache-dir>/cache.duckdb）缺失会被"
             "直接拒绝 (status=refused, 退出码非 0)，因为 Stage-1 的职责是刷新行情，而不是重建缓存。"
             "缓存被误删时应先恢复备份；确需从零重建再显式加本开关。"
+        ),
+    )
+    parser.add_argument(
+        "--enable-factor-crowding-advisory",
+        dest="enable_factor_crowding_advisory",
+        action="store_true",
+        default=True,
+        help=(
+            "(MS14) Enable Stage-1 advisory-only factor crowding monitoring in "
+            "stage1_health_report.json::advisory.factor_crowding (default: True; "
+            "always advisory=True, gates_orders=False)."
+        ),
+    )
+    parser.add_argument(
+        "--no-enable-factor-crowding-advisory",
+        dest="enable_factor_crowding_advisory",
+        action="store_false",
+        default=True,
+        help=(
+            "(MS14) Opt out of Stage-1 advisory-only factor crowding monitoring "
+            "(omits advisory.factor_crowding)."
         ),
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
@@ -1942,6 +1963,143 @@ def collect_leg_verified_navs(
             if value is not None:
                 navs.append(value)
     return navs
+
+
+SIGNAL_SNAPSHOT_FILENAME: str = "signal_snapshot.json"
+
+
+def collect_archived_signal_snapshots(
+    runs_root: Optional[str],
+    *,
+    as_of_date: Optional[str] = None,
+    strategy_key: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    max_dates: int = 120,
+) -> List[Any]:
+    """Collect point-in-time `SignalSnapshot`s from `<runs_root>/<YYYY-MM-DD>[/<HHMMSS>]/signal_snapshot.json`.
+
+    Strictly read-only and causal (`date_name <= as_of_date`). Supports both flat
+    `<date>/signal_snapshot.json` and `<date>/<HHMMSS>/signal_snapshot.json`
+    instances (latest valid close-anchored snapshot per `(date, universe_id, strategy)`
+    wins). Unreadable, incomplete, or intraday-cutoff snapshots are skipped safely
+    without failing Stage 1.
+    """
+    from common.signal_snapshot import CLOSE_INFORMATION_SET, read_snapshots
+
+    candidate_paths: List[str] = []
+    if runs_root and os.path.isdir(runs_root):
+        date_names = _round_archive_date_dirs(runs_root)
+        if as_of_date:
+            date_names = [name for name in date_names if name <= str(as_of_date)]
+        if max_dates and max_dates > 0:
+            date_names = date_names[-int(max_dates):]
+        for date_name in date_names:
+            day_dir = os.path.join(runs_root, date_name)
+            flat_path = os.path.join(day_dir, SIGNAL_SNAPSHOT_FILENAME)
+            if os.path.isfile(flat_path):
+                candidate_paths.append(flat_path)
+            try:
+                instance_names = sorted(os.listdir(day_dir))
+            except OSError:
+                instance_names = []
+            for instance in instance_names:
+                if not _ARCHIVE_INSTANCE_DIR_RE.match(instance):
+                    continue
+                inst_path = os.path.join(day_dir, instance, SIGNAL_SNAPSHOT_FILENAME)
+                if os.path.isfile(inst_path):
+                    candidate_paths.append(inst_path)
+
+    if output_dir and os.path.isdir(output_dir):
+        direct_path = os.path.join(output_dir, SIGNAL_SNAPSHOT_FILENAME)
+        if os.path.isfile(direct_path) and os.path.abspath(direct_path) not in {
+            os.path.abspath(p) for p in candidate_paths
+        }:
+            candidate_paths.append(direct_path)
+
+    as_of_ts = pd.Timestamp(as_of_date).normalize() if as_of_date else None
+    deduped: Dict[Tuple[pd.Timestamp, str, str], Any] = {}
+    for path in candidate_paths:
+        try:
+            snaps = read_snapshots(path)
+        except Exception:
+            continue
+        for snap in snaps:
+            if as_of_ts is not None and snap.date > as_of_ts:
+                continue
+            if not getattr(snap, "is_complete", False):
+                continue
+            if getattr(snap, "information_set", None) != CLOSE_INFORMATION_SET:
+                continue
+            if strategy_key and str(snap.strategy) != str(strategy_key):
+                continue
+            deduped[(snap.date, snap.universe_id, snap.strategy)] = snap
+
+    return [deduped[k] for k in sorted(deduped.keys())]
+
+
+def evaluate_stage1_signal_decay(
+    snapshots: Sequence[Any],
+    universe: Mapping[str, pd.DataFrame],
+    *,
+    cash_proxy: str = "BIL",
+    as_of_date: Optional[str] = None,
+) -> Tuple[Optional[Any], Tuple[Any, ...], pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
+    """Run Stage-1 `ICDecayMonitor` on archived snapshots and build panels for `MS14`.
+
+    Returns ``(ic_report, leg_reports, score_panel, returns_panel, turnover_panel)``.
+    When ``snapshots`` is empty (or none pass anti-backfill validation), returns
+    ``(None, (), empty_score_df, returns_panel, turnover_panel)`` so Stage-1's
+    `advisory` block stays 100% byte-identical when no snapshots exist yet.
+    """
+    as_of_ts = pd.Timestamp(as_of_date).normalize() if as_of_date else None
+    close_cols: Dict[str, pd.Series] = {}
+    turn_cols: Dict[str, pd.Series] = {}
+    cash_upper = str(cash_proxy or "BIL").strip().upper()
+    for sym, df in (universe or {}).items():
+        if str(sym).strip().upper() == cash_upper:
+            continue
+        if not isinstance(df, pd.DataFrame) or df.empty or "Close" not in df.columns:
+            continue
+        sub = df.loc[df.index <= as_of_ts] if as_of_ts is not None else df
+        if sub.empty:
+            continue
+        c_ser = pd.to_numeric(sub["Close"], errors="coerce")
+        close_cols[str(sym)] = c_ser
+        if "Turn" in sub.columns and pd.to_numeric(sub["Turn"], errors="coerce").notna().any():
+            turn_cols[str(sym)] = pd.to_numeric(sub["Turn"], errors="coerce")
+        elif "Amount" in sub.columns and pd.to_numeric(sub["Amount"], errors="coerce").notna().any():
+            turn_cols[str(sym)] = pd.to_numeric(sub["Amount"], errors="coerce")
+        elif "Volume" in sub.columns and pd.to_numeric(sub["Volume"], errors="coerce").notna().any():
+            turn_cols[str(sym)] = pd.to_numeric(sub["Volume"], errors="coerce")
+
+    close_panel = pd.DataFrame(close_cols).sort_index() if close_cols else pd.DataFrame()
+    returns_panel = close_panel.pct_change() if not close_panel.empty else pd.DataFrame()
+    turnover_panel = pd.DataFrame(turn_cols).sort_index() if turn_cols else None
+
+    if not snapshots or close_panel.empty:
+        return None, (), pd.DataFrame(), returns_panel, turnover_panel
+
+    from common.ic_decay_monitor import ICDecayMonitor
+
+    monitor = ICDecayMonitor(close_panel)
+    ingested: List[Any] = []
+    for snap in snapshots:
+        try:
+            monitor.add_snapshot(snap)
+            ingested.append(snap)
+        except Exception as exc:
+            print(
+                f"[AT3/IC DECAY] skip snapshot {getattr(snap, 'date', '?')}: {exc}",
+                file=sys.stderr,
+            )
+
+    if not ingested:
+        return None, (), pd.DataFrame(), returns_panel, turnover_panel
+
+    score_rows = {snap.date: dict(snap.scores) for snap in ingested}
+    score_panel = pd.DataFrame.from_dict(score_rows, orient="index").sort_index()
+    ic_report = monitor.evaluate()
+    return ic_report, tuple(ic_report.legs), score_panel, returns_panel, turnover_panel
 
 
 def inspect_portfolio_drawdown(
@@ -4686,6 +4844,8 @@ def build_stage2_command(
         cmd.extend(["--max-probe-attempts", str(args.max_probe_attempts)])
     if getattr(args, "allow_weighting_mode_override", False):
         cmd.append("--allow-weighting-mode-override")
+    if not getattr(args, "record_signal_snapshot", True):
+        cmd.append("--no-record-signal-snapshot")
     return cmd
 
 
@@ -5644,16 +5804,39 @@ def main(cli_args: Optional[List[str]] = None):
         single_stock_cap=single_stock_cap,
     )
 
-    # (`AT7` P1 / `MS14`) One advisory block for this run, built from HONEST EMPTY INPUTS:
-    # no cross-sectional score source exists in the live chain yet
-    # (`common/signal_snapshot.py:12-38`) and there is no executed-notional
-    # ledger, so the matrix renders INSUFFICIENT and both capacity labels
-    # render MISSING. Nothing is fabricated to make the report look measured.
-    factor_crowding_block = compute_stage1_factor_crowding_advisory(enabled=False)
+    # (`AT3` / `AT7` P1 / `MS14`) Collect archived Stage-2 signal snapshots (if any),
+    # run `ICDecayMonitor` + optional `MS14` factor crowding, and build the advisory block.
+    # When no archived snapshots exist, `_leg_reports == ()` and `_ic_report is None`,
+    # keeping the advisory block 100% byte-identical to pre-AT3.
+    _archive_root_for_signals = locate_run_archive_root(
+        args.output_dir, args.account_state_file
+    )
+    _archived_snapshots = collect_archived_signal_snapshots(
+        _archive_root_for_signals,
+        as_of_date=as_of_date,
+        strategy_key=strat_name,
+        output_dir=args.output_dir,
+    )
+    _ic_report, _leg_reports, _score_panel, _ret_panel, _turn_panel = (
+        evaluate_stage1_signal_decay(
+            _archived_snapshots,
+            universe,
+            cash_proxy=params.get("cash_proxy", "BIL"),
+            as_of_date=as_of_date,
+        )
+    )
+    factor_crowding_block = compute_stage1_factor_crowding_advisory(
+        factor_scores=_score_panel,
+        returns_panel=_ret_panel,
+        turnover_panel=_turn_panel,
+        enabled=bool(getattr(args, "enable_factor_crowding_advisory", True)),
+    )
     advisory_block = build_advisory_block(
         phase=ADVISORY_PHASE_P1,
+        leg_reports=_leg_reports,
         as_of=as_of_date,
         factor_crowding=factor_crowding_block,
+        ic_decay=_ic_report,
     )
     # (2026-11-16) The R1 block, when one is present, now says WHICH drawdown it read;
     # `dd_source="dd_trough"` only names the field. No-op for today's P1 shape (no `r1`

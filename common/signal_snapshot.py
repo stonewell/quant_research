@@ -95,6 +95,9 @@ SNAPSHOT_COLUMNS: Tuple[str, ...] = ("date", "strategy", "symbol", "score", "uni
 #: must refuse the payload rather than guess at its meaning.
 SNAPSHOT_SCHEMA = "signal_snapshot.v1"
 
+#: Canonical per-run filename written by Stage 2 and scanned by Stage 1.
+SIGNAL_SNAPSHOT_FILENAME: str = "signal_snapshot.json"
+
 #: Cross-sectional floor (shared with the monitor, single source of truth).
 #: A single-day cross-section below this many symbols cannot support a Rank IC
 #: estimate; the monitor reports `INSUFFICIENT_HISTORY` for it and never fills 0.
@@ -738,3 +741,196 @@ def record_signal_snapshot(
     if path is not None:
         write_snapshot(snapshot, path, append=append)
     return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Option-C two-tier read-only cross-sectional score extractor (AT3-W1)
+# ---------------------------------------------------------------------------
+def _zscore_map(values: Mapping[str, float]) -> Dict[str, float]:
+    """Cross-sectional z-score across finite values; non-finite/missing -> 0.0."""
+    finite_items = {
+        k: float(v)
+        for k, v in values.items()
+        if v is not None and not isinstance(v, bool) and math.isfinite(float(v))
+    }
+    if len(finite_items) < 2:
+        return {k: 0.0 for k in values}
+    arr = np.asarray(list(finite_items.values()), dtype=float)
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1))
+    if not math.isfinite(std) or std <= 1e-12:
+        return {k: 0.0 for k in values}
+    return {
+        k: float((finite_items[k] - mean) / std) if k in finite_items else 0.0
+        for k in values
+    }
+
+
+def _extract_sleeve_items(sub_strats: Any) -> List[Tuple[str, Any]]:
+    """Normalize `get_sub_strategies` return shape (Mapping or Sequence of pairs)."""
+    if isinstance(sub_strats, Mapping):
+        return [(str(k), v) for k, v in sub_strats.items()]
+    if isinstance(sub_strats, Sequence) and not isinstance(sub_strats, (str, bytes)):
+        out: List[Tuple[str, Any]] = []
+        for idx, item in enumerate(sub_strats):
+            if isinstance(item, tuple) and len(item) >= 2:
+                out.append((str(item[0]), item[1]))
+            else:
+                out.append((f"sleeve_{idx}", item))
+        return out
+    return []
+
+
+def compute_cross_sectional_scores_for_snapshot(
+    template: Any,
+    universe: Mapping[str, pd.DataFrame],
+    params: Mapping[str, Any],
+    candidates: Iterable[str],
+    *,
+    as_of_date: Any,
+) -> Optional[Dict[str, float]]:
+    """Extract a complete, non-truncated cross-sectional score dict over ``candidates``.
+
+    Two-Tier Read-Only Protocol (Option C, zero edits to blend_base.py):
+    1. Tier 1 (native score hook): if ``template`` exposes ``compute_composite_scores(universe, params)``
+       (e.g. ``MicrostructureAlphaCompositeStrategy`` / ``MS7``), evaluate its row at or
+       before ``as_of_date``. Handles both single-DataFrame and tuple returns safely.
+    2. Tier 2 (blend / multi-sleeve hook): if ``template`` exposes ``get_sub_strategies(universe, params)``
+       (all 6 ``BaseBlendAllocationStrategy`` subclasses), compute each sleeve's latest
+       pre-selection weight vector across ``candidates``, average across active sleeves to form
+       ``raw_blend[s]``, and add a continuous tie-breaking rank term ``0.05 * z_tie[s]``
+       (risk-adjusted 20d/60d momentum + negative 20d Close-to-SMA20 deviation across all
+       candidates) so unselected 0-weight candidates carry a strict continuous cross-sectional
+       ordering without altering any portfolio weight.
+    3. Single-sleeve continuous fallback for research strategies (``WorldQuantAlphaStrategy``,
+       ``CrossSectionalMomentumStrategy``, etc.): if ``template.generate_weights`` is available
+       and the template is not a fixed-ratio static asset-class preset, combine the template's
+       latest raw weight row with ``0.05 * z_tie[s]``.
+
+    Returns ``None`` when ``candidates`` is empty, any candidate lacks valid price history up
+    to ``as_of_date``, or the template is a fixed-weight static asset-class preset where
+    cross-sectional equity ranking is not applicable.
+    """
+    cand_tuple = _as_symbol_tuple(candidates)
+    if not cand_tuple:
+        return None
+    as_of_ts = _coerce_session_date(as_of_date)
+
+    t_cls_name = type(template).__name__
+    if t_cls_name in {
+        "EqualWeightAllocation",
+        "PermanentPortfolioAllocation",
+        "AllWeatherAllocation",
+        "SixtyFortyAllocation",
+        "CustomWeightAllocation",
+    }:
+        return None
+
+    # 1. Tier 1: Native compute_composite_scores hook (MS7)
+    if hasattr(template, "compute_composite_scores") and callable(template.compute_composite_scores):
+        try:
+            raw_comp = template.compute_composite_scores(dict(universe), dict(params))
+            comp_df = raw_comp[0] if isinstance(raw_comp, tuple) else raw_comp
+            if isinstance(comp_df, pd.DataFrame) and not comp_df.empty:
+                upto = comp_df.loc[comp_df.index <= as_of_ts]
+                if not upto.empty:
+                    row = upto.iloc[-1]
+                    if all(
+                        s in row.index and pd.notna(row[s]) and math.isfinite(float(row[s]))
+                        for s in cand_tuple
+                    ):
+                        return {s: float(row[s]) for s in cand_tuple}
+        except Exception:
+            pass
+
+    # Build continuous tie-break feature z_tie[s] from daily Close up to as_of_ts
+    mom_raw: Dict[str, float] = {}
+    dev_raw: Dict[str, float] = {}
+    for sym in cand_tuple:
+        df = universe.get(sym)
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty or "Close" not in df.columns:
+            return None
+        sub = df.loc[df.index <= as_of_ts]
+        close = pd.to_numeric(sub["Close"], errors="coerce").dropna()
+        if len(close) < 5:
+            return None
+        last_c = float(close.iloc[-1])
+        if not math.isfinite(last_c) or last_c <= 0.0:
+            return None
+        ret = close.pct_change().dropna()
+        vol20 = float(ret.iloc[-20:].std(ddof=1)) if len(ret) >= 2 else 0.0
+        vol_floor = max(vol20, 1e-4) if math.isfinite(vol20) else 1e-2
+        idx20 = max(0, len(close) - 1 - min(20, len(close) - 1))
+        idx60 = max(0, len(close) - 1 - min(60, len(close) - 1))
+        c20 = float(close.iloc[idx20])
+        c60 = float(close.iloc[idx60])
+        r20 = (last_c / c20 - 1.0) if c20 > 0 else 0.0
+        r60 = (last_c / c60 - 1.0) if c60 > 0 else 0.0
+        mom_raw[sym] = 0.6 * (r20 / vol_floor) + 0.4 * (r60 / vol_floor)
+        sma20 = float(close.iloc[-min(20, len(close)) :].mean())
+        dev_raw[sym] = -(last_c / sma20 - 1.0) if sma20 > 0 else 0.0
+
+    z_mom = _zscore_map(mom_raw)
+    z_dev = _zscore_map(dev_raw)
+    z_tie = _zscore_map({s: 0.7 * z_mom[s] + 0.3 * z_dev[s] for s in cand_tuple})
+
+    # 2. Tier 2: BaseBlendAllocationStrategy via get_sub_strategies
+    raw_base: Dict[str, float] = {s: 0.0 for s in cand_tuple}
+    if hasattr(template, "get_sub_strategies") and callable(template.get_sub_strategies):
+        try:
+            sub_strats = template.get_sub_strategies(dict(universe), dict(params))
+            sleeve_items = _extract_sleeve_items(sub_strats)
+            if sleeve_items:
+                sleeve_vectors: List[Dict[str, float]] = []
+                for _sname, s_strat in sleeve_items:
+                    w_sp = s_strat.generate_weights(dict(universe), dict(params))
+                    if isinstance(w_sp, pd.DataFrame) and not w_sp.empty:
+                        w_upto = w_sp.loc[w_sp.index <= as_of_ts].dropna(how="all")
+                        if not w_upto.empty:
+                            last_row = w_upto.iloc[-1]
+                            vec = {
+                                s: (
+                                    float(last_row[s])
+                                    if (
+                                        s in last_row.index
+                                        and pd.notna(last_row[s])
+                                        and math.isfinite(float(last_row[s]))
+                                    )
+                                    else 0.0
+                                )
+                                for s in cand_tuple
+                            }
+                            sleeve_vectors.append(vec)
+                if sleeve_vectors:
+                    n_sl = float(len(sleeve_vectors))
+                    raw_base = {
+                        s: sum(v[s] for v in sleeve_vectors) / n_sl for s in cand_tuple
+                    }
+        except Exception:
+            pass
+    elif hasattr(template, "generate_weights") and callable(template.generate_weights):
+        try:
+            w_sp = template.generate_weights(dict(universe), dict(params))
+            if isinstance(w_sp, pd.DataFrame) and not w_sp.empty:
+                w_upto = w_sp.loc[w_sp.index <= as_of_ts].dropna(how="all")
+                if not w_upto.empty:
+                    last_row = w_upto.iloc[-1]
+                    raw_base = {
+                        s: (
+                            float(last_row[s])
+                            if (
+                                s in last_row.index
+                                and pd.notna(last_row[s])
+                                and math.isfinite(float(last_row[s]))
+                            )
+                            else 0.0
+                        )
+                        for s in cand_tuple
+                    }
+        except Exception:
+            pass
+
+    scores = {s: float(raw_base[s] + 0.05 * z_tie[s]) for s in cand_tuple}
+    if not all(math.isfinite(v) for v in scores.values()):
+        return None
+    return scores
