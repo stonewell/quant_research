@@ -263,6 +263,34 @@ available in the current shell.
       blocker.
     - When genuine non-parity is unavoidable (e.g. a live-only data source), record the gap, the
       measured direction of the bias, and the pending task that closes it.
+12. **Immediate Reporting on Task Failures, Stalls, or Restarts**:
+    - Anytime a background command, backtest/ablation run, data sync, test suite, or worker task
+      fails (exception, non-zero exit, timeout), stalls, or requires a restart/relaunch, the agent
+      **must report it immediately** rather than silently retrying, recovering in the background,
+      or waiting until asked for status.
+    - Every failure/restart report must include:
+      1. The exact task/command identifier and failure mode or root cause (error message, failing
+         stage/fold/test, or stall evidence).
+      2. The concrete fix or recovery action taken (or why it is blocked).
+      3. Whether the task was restarted (new task ID, checkpoint/resume point) and the updated
+         status/ETA.
+    - In multi-agent/swarm workflows, workers must immediately post an alert to `@coordinator`
+      (e.g., `@coordinator [alert] ...`) upon any failure, stall, or restart, and the coordinator
+      must immediately relay it to the user before continuing background execution.
+13. **End-to-End Dry-Run / Smoke Verification Before Long-Running Temporary Scripts**:
+    - Before launching any newly generated or modified temporary/scratch script expected to run
+      for more than a few minutes (e.g., multi-arm ablations, walkforward folds, ERS loops, or
+      batch data syncs), the agent **must first execute a fast end-to-end smoke run on a small
+      data slice** (e.g., 1–2 arms, 1–2 folds including edge folds such as Fold 1 with pre-IPO
+      missing symbols, `n_random=2` for ERS, and full report serialization + downstream checker
+      invocation).
+    - The smoke run must exercise **every stage and code path** of the script — data loading,
+      all evaluation arms, fold slicing, ERS/statistical gates, checkpoint save/load, JSON/MD
+      rendering, and CLI post-checks — so signature mismatches, key errors, or serialization bugs
+      fail in seconds rather than after long compute runs.
+    - Multi-stage or long-running scripts must also persist **incremental atomic checkpoints**
+      (e.g., per-stage and per-batch fold caches) before entering later stages so completed
+      compute is never lost on a late failure.
 
 
 

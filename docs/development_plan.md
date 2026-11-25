@@ -870,6 +870,13 @@ flowchart TD
 >   `core_satellite_200k_stocks.txt`（`N=100`）双轨 18 折只读消融与 6 门禁审计判定 🔴 NO-GO，以负结果
 >   闭环勾选 `[x]`（零生产代码改动、零版本轴变动）。本文件任务行总数 **120** 不变（`[x]` **89 → 90**，
 >   `[ ]` **31 → 30**，三式互洽：90 + 30 = 120；`§2.26` Track MS 全轨道合计 **28 行 = 28 `[x]` + 0 `[ ]`**）。
+> - **（2026-11-24 追加 `§2.28` `WU1`–`WU3` 计数补记）**：新增独立子表 `§2.28` 登记 `WU1`、`WU2`、`WU3` 共
+>   **3** 行（全部 `[ ]` 未开工，零代码改动、零版本轴变动）。本文件任务行净变化 **120 → 123**（`[x]` **90**
+>   不变，`[ ]` **30 → 33**，三式互洽：90 + 33 = 123；`§2.28` 合计 **3 行 = 0 `[x]` + 3 `[ ]`**）。
+> - **（2026-11-24 `WU3` 完成闭环与 `WU2` 后置复跑联动补记）**：`§2.28` `WU3` 已完成严格只读 Rule 10 重裁（`26/26` 臂
+>   全部 `ADJUDICATED`、`0` `UNADJUDICATED_ZERO_DELTA`，零生产代码改动、零版本轴变动）并勾选 `[x]`；同步在 `WU2`
+>   中补充“修复落地后须重跑 `WU3`（`CF1` / `CF5` 联动复验）”准出联动要求。本文件任务行总数 **123** 不变（`[x]`
+>   **90 → 91**，`[ ]` **33 → 32**，三式互洽：91 + 32 = 123；`§2.28` 合计 **3 行 = 1 `[x]` + 2 `[ ]`**）。
 
 ### 2.3 《SuperTrend 自适应趋势跟踪与切面止损体系方案》原子任务表（`S1.1`–`S4.2`，共 7 个任务）（当前优先级：**Tier P5 孵化池**，不影响现有系统）
 
@@ -3284,6 +3291,21 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 报告场景复核仍为 `{nav_effective: 198739.52, cash: 69033.52}` → `cash 69033.52`，
 `source = "authoritative_run"`。
 
+### 2.28 2026-11-24 CFSB 宽截面（N=100）适配、A 股 VAA 进攻金丝雀与 Rule 10 未裁决反事实复验批次（`WU1`–`WU3`，共 3 项 = 1 `[x]` + 2 `[ ]`）
+
+> **编号与 Rule 8 交叉对照说明（2026-11-24 登记，只追加、零生产代码改动）**：
+> 本独立子表基于 2026-11-23 `CFSB v1.8.0 [base: v2.3.0]` 在 `core_satellite_200k_stocks.txt`（`N=100`）
+> 上的只读白盒深度审计结论登记，编号取新族 `WU1`–`WU3`（`WU` = Wide Universe adaptation），与既有
+> `L2.*`、`M*`、`MS*`、`NV*`、`LV*`、`AT*`、`HY*`、`W*`、`S*`、`D*`、`R*`、`C*` 族**零碰撞、不重编号**。
+> 经交叉核对 `docs/development_plan.md`、`docs/development_plan_archive.md` 与 `docs/version.md`，
+> 三项均为净新增任务、零重复，且严格继承已证伪红线（`L2.52`、`LV20`、`MS28` 及 `CF2`/`CF3`/`CF4` 结论）。
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`WU1`** | `[ ]` | 修复 `ChanVaaCompoundStrategy` `DEFAULT_VAA_OFFENSIVE` 均为美股 ETF 导致 A 股永久防御态上限 `30%` 缺陷 | `pipeline/research_strategy/rs/chan_advanced_strategies.py`（`ChanVaaCompoundStrategy.generate_weights`, `L1490–1588`）<br>`pipeline/research_strategy/rs/config.py`（`DEFAULT_VAA_OFFENSIVE` `L51`, `chan_vaa_offensive_universe` `L404`）<br>`pipeline/research/blend/chan_four_state_blend.py`（`L174`）及其他 5 个 Blend 调用方<br>`scripts/run_live_strategy.py` | 1. **Rule 8 交叉对照**：排查 `docs/development_plan.md`、`docs/development_plan_archive.md` 与 `docs/version.md` 无 `DEFAULT_VAA_OFFENSIVE` / `13612W` A 股适配记录（`LV8` `[x]` 仅观测过腿重 `0.05~0.06`），属净新增缺陷；<br>2. **根因与架构设计**：A 股标的池与美股 ETF `["SPY","QQQ","EFA","EEM"]` 交集为空，`L1508–1519` 100% 锁死 `"defensive"`，将 `chan_vaa_compound`（占 CFSB 30% 基础权重）折半并封顶 `30%`（`N=100` 下叠加内部 `2%` 惰性后均权和仅 `3.5%`、`>=5%` 占比 `0.0%`）；且 `L1511` 要求全员 `13612W > 0`，须设计小篮子 A 股市场金丝雀（如 3–4 只宽基指数/ETF `000300.SH`/`000905.SH`/`399006.SZ`/`000016.SH` 或可配置广度比例门槛），并满足 Rule 11 回测/实盘默认同源传参；<br>3. **准出门禁（Rule 9/10/11 + Rule 7）**：须先经 `WU3` 确认非零差分，再于 `N=20` 与 `N=100` 通过 `backtest-deep-review` 6 项门禁（Option B、单次 ERS、2× 成本、真实 LOO、Rule 10 探针），获批落地时同步升版并更新 `--dump-strategies` 与 `docs/version.md`。 | `pipeline/research_strategy/tests/test_chan_advanced_strategies.py`<br>`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` | **M** | `WU3` |
+| **`WU2`** | `[ ]` | 修复 `1/K` 权重稀释撞上固定 `5%` 入场清零门禁 — 子策略或 `post_ortho` 后 Top-K（`K <= 8–12`）截面精选集中研究与修复 | `pipeline/research/blend/blend_base.py`（`L1844`, `L1870`, `post_ortho`, `PortfolioSequencer`）<br>`pipeline/research_strategy/rs/strategy.py`（`ChanThreeTypeStrategy` `L872–885`）<br>`pipeline/research_strategy/rs/chan_advanced_strategies.py`（`ChanFourStateExecutionStrategy` `L1804–1812`, `ChanVaaCompoundStrategy` `L1574–1607`）<br>`pipeline/research_strategy/rs/config.py` | 1. **Rule 8 交叉对照与已证伪反例**：全库无宽池 `1/K` 稀释或 `post_ortho` Top-K 任务（净新增）；严格遵守 `L2.52` `[x]`（禁抬高 `entry_threshold`）、`docs/version.md` §2866/§3550（维持实盘 `5%` 入场下限与回测齐平）、`MS28` `[x]` 🔴 NO-GO（禁融合 `MS7` 入 `CFSB`）与 `LV20` `[x]`（禁引入 `reversal` 腿）；且 2026-11-23 审计 `CF2`/`CF3` 已证伪“简单将 `entry_thresh` 降至 `2%` / 子策略惰性降至 `1%`”（200k Sharpe `0.8759 → 0.8417 / 0.7346`），`CF4` 已证实外层生命周期不可拆除（`0.8759 → 0.6552`）；<br>2. **研究与修复方案**：针对 `N=100` 下 `chan_three_type`（`K=33.6`, 中位 `2.44%`, 仅 `2.9% >= 5%`）与 `chan_vaa_compound`（`0.0% >= 5%`）在 `blend_base.py:1844` 被硬清零 `19,107` 格信号（日均 `-33.30%` 权重，交付仓位跌至 `27.05%` / 闲置现金 `72.95%`）的主瓶颈，对比消融在子策略输出侧或 `post_ortho` 之后引入 **Top-K（`K <= 8–12`）截面精选集中与重归一**，使入选单票自然落入 **`8%–15%`**（同时跨过 `5%` 入场/惰性门禁与 20 万 100 股整手门槛）；<br>3. **准出门禁**：未过门禁零生产改动；须在 `N=20` 维持零退化并在 `N=100`（200k RMB）通过 `backtest-deep-review` 6 项门禁与整手截断审计后，再按 Rule 7 升版落地。<br>4. **修复后必跑 `WU3` 联动复验**：2026-11-24 初轮 `WU3` 已实证在未解除 `1/K` 稀释前，即使解锁 VAA 多头，standalone VAA 单票 `>=5%` 仅 `1.64%–2.89%`、`CFSB N=100` `AvgExp` 仍卡死 `~27%`；故 **`WU2` 修复落地或进入验收时，必须重跑 `WU3`（联动复验 `CF1` 全量 `G=13` 行业表与 `CF5` VAA 金丝雀在解除 `5%` 稀释瓶颈后的真实增益、18 折 Option B、单次 ERS 与 Rule 10 探针）**，再基于重跑结果裁决 `WU1` 与全量行业表是否合入。 | `pipeline/research_strategy/tests/test_blend_strategy_versioning.py`<br>新增宽截面 Top-K 离线单测 | **L** | WU3（初轮已结案；WU2 修复后须重跑 WU3 联动复验） |
+| **`WU3`** | `[x]` | 复验 `CFSB N=100` 两项 Rule 10 未裁决反事实（`CF1` 全量 `G=13` 行业表与 `CF5` 真正可区分的 A 股 VAA 进攻金丝雀） | 只读复验脚本（先在 scratch / `backtest-deep-review` 工具链执行，零生产改动）；<br>涉及目标机制：`pipeline/research/blend/blend_base.py`（`CHINA_EQUITY_SECTORS` `L83–106`, `_get_symbol_sector`, `max_assets_per_sector=2`）<br>`pipeline/research_strategy/rs/chan_advanced_strategies.py`（`L1491`, `L1511–1522`） | 1. **问题背景（Rule 10 `UNADJUDICATED_ZERO_DELTA`）**：2026-11-23 `CFSB N=100` 深度审计中 `CF1` 与 `CF5` 均返回 `n_changed_weight_cells = 0`，严格依 Rule 10 判为未裁决而非“无效”：(a) `CF1` 因脚本在 `exec` 复制命名空间之后才 monkey-patch `_get_symbol_sector`，闭包仍绑定旧 15/100 映射（`thrust_sec_blocks` 仍为 `1,674`）；(b) `CF5` 将 100 只 A 股全量传入 `chan_vaa_offensive_universe`，触发 `L1511` 全员 `13612W > 0` 严苛条件（每日至少 1 股 `<= 0` 或未上市），导致 VAA 100% 锁死防御态（`vaa_mean_sum` 仍 `3.5%`）；<br>2. **只读复验方案**：(a) 修复 `CF1` 命名空间注入点，以全量 `G=13` 行业映射替换 15/100 硬编码表，实证裁决解除 85/100 股坍缩进 `sec_60/00/30/68` 后对 `thrust_sec_blocks`、权重差分与 200k Sharpe/CAGR/MaxDD 的净影响；(b) 修复 `CF5` 复验口径，改用 3–4 只 A 股宽基指数（如 `000300.SH`/`000905.SH`/`399006.SZ`）或小篮子龙头金丝雀，实证检验 `vaa_regime_series` 牛市占比 > 0、`chan_vaa_compound` 权和突破 `30%` 时的净效应；<br>3. **验收标准**：两臂均经 `deep_review_toolkit.py --check-rule10` 判定为 `ADJUDICATED`（`n_changed_weight_cells > 0` 且内部探针变化，零 `UNADJUDICATED_ZERO_DELTA`），并输出裁决结论指导 `WU1` 与全量行业表接入。<br>4. **2026-11-24 初轮只读复验结案**：`deep_review_toolkit.py --check-rule10` 退出 `0`（`26/26` 臂 `ADJUDICATED`、`0` `UNADJUDICATED_ZERO_DELTA`），零漂移与因果误差 `0.00e+00`，受保护 DuckDB MD5 未改：(a) `CF1`（`G=13` 行业表）`cells=172`（`thrust_sec_blocks 1685→2135`），但 `N=100` 100k/200k 与 18 折因果 `ΔSR=+0.0000`（`0/18`, `t=0.00`, FAIL）→ 初轮负向收口；(b) `CF5`（A 股 VAA 金丝雀）`chan_unlock` 显著优于 `topk_offensive`（全线退化 `0.746–0.855`），`CF5a_idx3_all_unlock` 在 `N=100` 200k SR `0.912→1.068`（2xCost `0.704→0.864`、MDD `7.23%→6.07%`、单次 ERS `96th pct trusted`）、`N=20` 200k SR `0.957→1.091`（`CF5c_40_unlock` `1.176`, ERS `100th pct trusted`），但全部臂未过 18 折因果 Option B（最强 `+0.0508`, `12/18`, `t=0.56`）且 `N=100` `AvgExp` 仍卡在 `~27%`、`2S-Turn ~14.8x`（standalone VAA `>=5%` 仅 `1.64%–2.89%`）；(c) 已暂停 `WU1`，待 `WU2` 修复 `1/K` 稀释主瓶颈后按 `WU2` 联动条款重跑 `WU3`。 | 研究阶段零生产改动；`deep_review_toolkit.py --check-rule10` 校验通过 | **S** | 无（可直接开展只读复验） |
+
 ---
 
 ## 三、 六级主优先级执行路线图与并行波次编排（`Tier P0` $\to$ `Tier P5`）
@@ -3505,6 +3527,11 @@ flowchart TD
 > （3）`§2.26.6` 续登待办 `MS28` `[ ]`（`MS7` 独立多头因子提纯与宽截面 `N=50–100` 抗空头幻觉研究，
 > 零代码改动；同步在 `§2.26.4` 留痕 `MS7+CFSB` 融合 25 臂 🔴 NO-GO 负结果，`§三` Mermaid 图不加节点）。
 > **（2026-11-23 补记，只追加）**：`§2.26.6` `MS28` 已完成 `N=20` 与 `N=100` 双轨 18 折只读消融与 6 门禁审计并判定 🔴 NO-GO，以负结果闭环勾选 `[x]`（零生产代码改动；`§2.26` Track MS 全轨道 **28/28 `[x]`、0 `[ ]`**，`MS7 v1.2.0` 维持 opt-in、`CFSB v1.8.0` 维持生产基线）。
+> **（2026-11-24 补记，只追加）**：新增独立子表 `§2.28`（`WU1`–`WU3`，3 项 `[ ]`，零生产代码改动、`§三` Mermaid 图不加节点）：建议按 **`WU3`（只读复验 `CF1` 全量 `G=13` 行业表与 `CF5` A 股 VAA 金丝雀）→ `WU1`（A 股 VAA 进攻金丝雀适配）与 `WU2`（子策略/`post_ortho` Top-K 集中修复 `1/K` 稀释）** 顺序推进。
+> **（2026-11-24 补记之二，只追加）**：`§2.28` `WU3` 已完成初轮只读重裁并勾选 `[x]`（`CF1` 零增益负向收口；
+> `CF5a_idx3_all_unlock` 全周期 SR `0.912→1.068` 但 18 折 Option B 未过且 `AvgExp` 仍受 `1/K` 稀释卡死在 `~27%`），
+> 已暂停 `WU1`；调整执行序列为 **优先攻克 `WU2`（Top-K 集中修复 `1/K` 稀释）→ `WU2` 修复后重跑 `WU3`（`CF1`/`CF5`
+> 联动复验）→ 再裁决 `WU1`**。
 
 ### 优先级排序依据与阶段准出标准 (Priority Rationale & Exit Criteria)
 
