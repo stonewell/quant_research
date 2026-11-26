@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union, TYPE_CHECKING
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 import warnings
 
 import duckdb
@@ -2397,6 +2397,70 @@ class DuckDBCache:
             return False
 
         return True
+
+    def get_universe_max_bar_date(
+        self,
+        symbols: Sequence[str],
+        provider: Optional[str] = None,
+        interval: str = "1d",
+    ) -> Optional[datetime.date]:
+        """Return the maximum date across the given symbols in cache.
+
+        Queries ohlcv_bars for daily (interval='1d') or intraday_ohlcv_bars for intraday.
+        Returns None if symbols is empty or no bars are found.
+        """
+        if not symbols:
+            return None
+        is_intra = interval is not None and is_intraday_interval(interval)
+        table = "intraday_ohlcv_bars" if is_intra else "ohlcv_bars"
+        col = "CAST(MAX(ts) AS DATE)" if is_intra else "MAX(date)"
+
+        placeholders = ",".join(["?"] * len(symbols))
+        con = self._get_connection(read_only=True)
+        try:
+            row = None
+            if provider:
+                resolved_provider = self.resolve_provider_key(provider)
+                # 1. Try resolved provider match (and interval if intraday)
+                if is_intra:
+                    sql = f"SELECT {col} FROM {table} WHERE symbol IN ({placeholders}) AND provider = ? AND interval = ?"
+                    params = list(symbols) + [resolved_provider, interval]
+                else:
+                    sql = f"SELECT {col} FROM {table} WHERE symbol IN ({placeholders}) AND provider = ?"
+                    params = list(symbols) + [resolved_provider]
+                row = con.execute(sql, params).fetchone()
+
+                if (not row or row[0] is None) and resolved_provider != provider:
+                    if is_intra:
+                        sql = f"SELECT {col} FROM {table} WHERE symbol IN ({placeholders}) AND provider = ? AND interval = ?"
+                        params = list(symbols) + [provider, interval]
+                    else:
+                        sql = f"SELECT {col} FROM {table} WHERE symbol IN ({placeholders}) AND provider = ?"
+                        params = list(symbols) + [provider]
+                    row = con.execute(sql, params).fetchone()
+
+            # 2. If no result with exact provider, query across any provider for the symbols
+            if not row or row[0] is None:
+                if is_intra:
+                    sql = f"SELECT {col} FROM {table} WHERE symbol IN ({placeholders}) AND interval = ?"
+                    params = list(symbols) + [interval]
+                else:
+                    sql = f"SELECT {col} FROM {table} WHERE symbol IN ({placeholders})"
+                    params = list(symbols)
+                row = con.execute(sql, params).fetchone()
+
+            if row and row[0] is not None:
+                val = row[0]
+                if isinstance(val, (pd.Timestamp, datetime.datetime)):
+                    return val.date()
+                if isinstance(val, datetime.date):
+                    return val
+                if isinstance(val, str):
+                    return pd.Timestamp(val).date()
+            return None
+        finally:
+            if not self.is_memory:
+                con.close()
 
     def store_intraday_bars(
         self,

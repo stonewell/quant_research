@@ -179,7 +179,9 @@ def load_universe_with_banner(symbols, start, end, interval: str = "1d", *,
                                require_nonempty: bool = True,
                                loading_msg: Optional[str] = None,
                                expected_last_session: Optional[dt.date] = None,
-                               include_turn: bool = True) -> dict:
+                               include_turn: bool = True,
+                               cache_read_only: bool = False,
+                               telemetry_out: Optional[Dict[str, Any]] = None) -> dict:
     """`common.data.load_universe` wrapped with the standard console banner
     ('Loading N symbols ...' / 'Loaded M/N symbols (see warnings above for any
     skipped).') and, when `require_nonempty`, a ValueError if every symbol
@@ -196,6 +198,8 @@ def load_universe_with_banner(symbols, start, end, interval: str = "1d", *,
     universe = load_universe(symbols, start, end, interval, use_cache=use_cache,
                               cache_dir=cache_dir, expected_last_session=expected_last_session,
                               include_turn=include_turn,
+                              cache_read_only=cache_read_only,
+                              telemetry_out=telemetry_out,
                               **data_kwargs)
     print(f"Loaded {len(universe)}/{len(symbols)} symbols (see warnings above for any skipped).")
     if require_nonempty and not universe:

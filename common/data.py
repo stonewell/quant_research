@@ -862,6 +862,7 @@ class CachedDataProvider(BaseDataProvider):
         self.inner_provider = inner_provider
         self.cache_dir = cache_dir
         self.cache_read_only = bool(cache_read_only)
+        self.last_load_telemetry: Dict[str, Any] = {}
         self.is_synthetic = is_synthetic_provider(inner_provider)
         if not self.is_synthetic and self.cache_dir:
             # `read_only=True` propagates to `DuckDBCache`, whose constructor raises
@@ -1242,6 +1243,17 @@ class CachedDataProvider(BaseDataProvider):
             )
         # Provider-served symbols never enter the cache, so they cannot shadow a cache read.
         result.update(fetched)
+        cache_hits = len(covered_symbols)
+        upstream_fetches = len(fetched)
+        fetched_rows = sum(len(df) for df in fetched.values() if df is not None and not df.empty)
+        self.last_load_telemetry = {
+            "cache_read_only": True,
+            "cache_hits": cache_hits,
+            "upstream_fetches": upstream_fetches,
+            "fetched_rows": fetched_rows,
+            "cache_writes": 0,
+            "cache_written_rows": 0,
+        }
         return result
 
     def fetch_universe(
@@ -1295,8 +1307,18 @@ class CachedDataProvider(BaseDataProvider):
         needs one run (and one fix list), not six sequential runs that each stop at the next bad
         symbol. The first failure is chained as `__cause__`.
         """
+        self.last_load_telemetry = {}
         if self.is_synthetic or not self.cache_dir or self.duckdb_cache is None:
-            return super().fetch_universe(symbols, start, end, interval, columns=columns)
+            result = super().fetch_universe(symbols, start, end, interval, columns=columns)
+            self.last_load_telemetry = {
+                "cache_read_only": False,
+                "cache_hits": 0,
+                "upstream_fetches": len(symbols),
+                "fetched_rows": sum(len(df) for df in result.values() if df is not None and not df.empty),
+                "cache_writes": 0,
+                "cache_written_rows": 0,
+            }
+            return result
 
         provider_name = type(self.inner_provider).__name__
 
@@ -1314,6 +1336,9 @@ class CachedDataProvider(BaseDataProvider):
             )
 
         covered_symbols = []
+        written_symbols: List[str] = []
+        cache_hits_count = 0
+        upstream_fetches_count = 0
         #: Refused-rewrite reports, kept apart from `covered_symbols` so they can hard-fail
         #: instead of being skipped (see docstring).
         refused: List[str] = []
@@ -1342,13 +1367,16 @@ class CachedDataProvider(BaseDataProvider):
                     expected_last_session=expected_last_session,
                 ):
                     covered_symbols.append(symbol)
+                    cache_hits_count += 1
                 else:
+                    upstream_fetches_count += 1
                     self.fetch_ohlcv(
                         symbol, start, end, interval=interval,
                         expected_last_session=expected_last_session,
                         adjust=adjust,
                     )
                     covered_symbols.append(symbol)
+                    written_symbols.append(symbol)
             except basis_failures as exc:
                 # ORDER MATTERS: checked BEFORE the generic branch. These used to be downgraded to
                 # a `warnings.warn` + skipped symbol, i.e. a smaller universe that downstream
@@ -1404,7 +1432,7 @@ class CachedDataProvider(BaseDataProvider):
         for symbol in covered_symbols:
             self._guard_direct_mode_derivation(provider_name, symbol, interval, adjust)
 
-        return self.duckdb_cache.query_universe(
+        result = self.duckdb_cache.query_universe(
             provider_name,
             covered_symbols,
             start=start,
@@ -1414,6 +1442,18 @@ class CachedDataProvider(BaseDataProvider):
             columns=columns,
             allow_legacy_basis=allow_legacy_basis,
         )
+        written_rows = sum(
+            len(result[s]) for s in written_symbols if s in result and result[s] is not None and not result[s].empty
+        )
+        self.last_load_telemetry = {
+            "cache_read_only": False,
+            "cache_hits": cache_hits_count,
+            "upstream_fetches": upstream_fetches_count,
+            "fetched_rows": written_rows,
+            "cache_writes": len(written_symbols),
+            "cache_written_rows": written_rows,
+        }
+        return result
 
     def rebase_corporate_action(
         self,
@@ -1681,6 +1721,7 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
                   expected_last_session=None, columns: Optional[Union[str, Sequence[str]]] = "all",
                   cache_read_only: bool = False,
                   include_turn: bool = True,
+                  telemetry_out: Optional[Dict[str, Any]] = None,
                   **kwargs) -> dict:
     """Load OHLCV for each symbol; skips (with a warning) any that fail.
     Maintains backward compatibility with original load_universe function signature.
@@ -1743,6 +1784,18 @@ def load_universe(symbols: list, start: str, end: str, interval: str = "1d", use
             s: (df.drop(columns=["Turn"]) if isinstance(df, pd.DataFrame) and "Turn" in df.columns else df)
             for s, df in universe.items()
         }
+    if telemetry_out is not None:
+        if isinstance(prov, CachedDataProvider):
+            telemetry_out.update(getattr(prov, "last_load_telemetry", {}))
+        else:
+            telemetry_out.update({
+                "cache_read_only": bool(cache_read_only),
+                "cache_hits": 0,
+                "upstream_fetches": len(symbols),
+                "fetched_rows": sum(len(df) for df in universe.values() if df is not None and not df.empty),
+                "cache_writes": 0,
+                "cache_written_rows": 0,
+            })
     return universe
 
 

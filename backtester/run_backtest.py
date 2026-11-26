@@ -43,7 +43,7 @@ REPO_ROOT = _REPO_ROOT
 from common.allocation_backtester import REBALANCE_REPORT_COLUMNS, run_allocation_backtest
 from common.allocation_search import optimize_template
 from common.allocation_templates import ALLOCATION_TEMPLATES
-from common.duckdb_cache import is_synthetic_provider
+from common.duckdb_cache import DuckDBCache, is_synthetic_provider
 from common.cli_utils import (
     add_data_provider_cli_args,
     add_market_cli_arg,
@@ -79,6 +79,32 @@ from common.universe import add_universe_cli_args, resolve_universe_from_args
 
 RESULTS_DIR = default_results_dir(__file__)
 DATA_DIR = shared_data_dir()
+
+
+# --------------------------------------------------------------------------- #
+# (CL1) CLI End-Date Truncation Guard & Cache Read-Only Constants
+# --------------------------------------------------------------------------- #
+DEFAULT_BACKTEST_END = "2024-12-31"
+
+
+class DefaultEndDateTruncationError(ValueError):
+    """Raised when omitted --end defaults to 2024-12-31 but DuckDB cache contains newer bars."""
+    pass
+
+
+def normalize_end_date_flag(args):
+    """Ensure args.end is populated and track whether it came from default.
+
+    When --end is omitted (None), sets args.end = DEFAULT_BACKTEST_END and
+    args.end_source = "default". When explicitly provided, sets args.end_source = "explicit".
+    """
+    raw_end = getattr(args, "end", None)
+    if raw_end is None:
+        args.end = DEFAULT_BACKTEST_END
+        args.end_source = "default"
+    elif not hasattr(args, "end_source"):
+        args.end_source = "explicit"
+    return args
 
 
 # --------------------------------------------------------------------------- #
@@ -156,7 +182,10 @@ class _PositionLifecycleArgumentParser(argparse.ArgumentParser):
     """
 
     def parse_args(self, args=None, namespace=None):
-        return normalize_position_lifecycle_flag(super().parse_args(args, namespace))
+        parsed = super().parse_args(args, namespace)
+        normalize_position_lifecycle_flag(parsed)
+        normalize_end_date_flag(parsed)
+        return parsed
 
 
 def _normalise_day_keys(values) -> set:
@@ -220,7 +249,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_market_cli_arg(p)
     add_vaa_canary_cli_args(p)
     p.add_argument("--start", default="2015-01-01")
-    p.add_argument("--end", default="2024-12-31")
+    p.add_argument(
+        "--end",
+        default=None,
+        help="Backtest end date YYYY-MM-DD. When omitted, defaults to 2024-12-31, but will refuse "
+             "to run if the DuckDB cache contains bars newer than 2024-12-31 unless --end is explicitly specified.",
+    )
+    p.add_argument(
+        "--allow-cache-write",
+        action="store_true",
+        default=False,
+        help="Allow writing newly fetched bars into the DuckDB cache. Default is False (read-only "
+             "cache mode, preventing accidental cache mutations during backtests).",
+    )
     p.add_argument("--interval", default="1d")
     p.add_argument("--mode", choices=["standard", "walkforward"], default="standard")
     p.add_argument("--window-years", type=float, default=1.0, help="Size of the rolling window in walkforward mode")
@@ -1476,7 +1517,7 @@ def _resolve_baseline_params(template, baseline_params_json: str = None) -> dict
     return {k: v[0] for k, v in template.param_grid.items()}
 
 
-def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
+def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None, cache_read_only: bool = False, telemetry_out: dict | None = None):
     """Loads --baseline-symbol and runs it through the same run_standard/
     run_walkforward path as the main strategy, using --baseline-template (a
     static template only -- no pattern_spec) and --baseline-params (or that
@@ -1508,6 +1549,8 @@ def _run_baseline(args, cache_dir, data_kwargs, aligned_index=None):
         data_kwargs=data_kwargs, require_nonempty=True,
         expected_last_session=backtest_expected_last_session(),
         include_turn=bool(getattr(args, "include_turn", True)),
+        cache_read_only=cache_read_only,
+        telemetry_out=telemetry_out,
     )
 
     if aligned_index is not None:
@@ -1870,6 +1913,7 @@ def _dump_run_manifest(
     position_lifecycle_config: dict | None = None,
     include_turn: bool = True,
     enable_vaa_external_canary: bool = True,
+    data_load_telemetry: dict | None = None,
 ) -> str:
     """Phase 1: persist the reproducibility fingerprint skeleton *before* the
     backtest runs, so a mid-run crash still leaves an auditable run_manifest.json behind."""
@@ -1925,6 +1969,11 @@ def _dump_run_manifest(
         manifest["include_turn"] = False
     if not enable_vaa_external_canary:
         manifest["enable_vaa_external_canary"] = False
+    if data_load_telemetry is not None:
+        manifest["data_load_telemetry"] = data_load_telemetry
+        manifest["end_source"] = data_load_telemetry.get("end_source")
+        manifest["requested_end"] = data_load_telemetry.get("requested_end")
+        manifest["effective_end_date"] = data_load_telemetry.get("effective_end_date")
     manifest_path = os.path.join(results_dir, "run_manifest.json")
     write_json_report(manifest, manifest_path)
     return manifest_path
@@ -1937,6 +1986,7 @@ def _finalize_run_manifest(
     artifacts: list[dict] | None = None,
     enable_position_lifecycle: bool | None = None,
     position_lifecycle_config: dict | None = None,
+    data_load_telemetry: dict | None = None,
 ) -> str:
     """Phase 2: re-open the Phase-1 skeleton and fill in the post-run facts.
 
@@ -1967,6 +2017,11 @@ def _finalize_run_manifest(
         manifest["enable_position_lifecycle"] = bool(enable_position_lifecycle)
     if position_lifecycle_config is not None and "position_lifecycle_config" not in manifest:
         manifest["position_lifecycle_config"] = position_lifecycle_config
+    if data_load_telemetry is not None:
+        manifest["data_load_telemetry"] = data_load_telemetry
+        manifest["end_source"] = data_load_telemetry.get("end_source")
+        manifest["requested_end"] = data_load_telemetry.get("requested_end")
+        manifest["effective_end_date"] = data_load_telemetry.get("effective_end_date")
     manifest["metrics"] = metrics if metrics is not None else dict(_NULL_METRICS)
     manifest["artifacts"] = artifacts if artifacts is not None else []
     write_json_report(manifest, path)
@@ -2057,6 +2112,51 @@ def main():
     if resolved_market is None:
         resolved_market = resolve_strategy_market(params, None, universe_symbols)
 
+    allow_cache_write = bool(getattr(args, "allow_cache_write", False))
+    effective_use_cache = not getattr(args, "no_cache", False)
+    effective_cache_read_only = not allow_cache_write
+    db_path = str(cache_dir) if str(cache_dir).endswith(".duckdb") else os.path.join(cache_dir, "cache.duckdb")
+
+    if effective_use_cache and not is_synthetic_provider(args.data_provider) and not allow_cache_write and not os.path.exists(db_path):
+        warnings.warn(
+            f"[WARN][CL1] Cache file '{db_path}' does not exist and --allow-cache-write is False; "
+            "fetching in-memory without creating cache file.",
+            UserWarning,
+            stacklevel=2,
+        )
+        print(f"[WARN][CL1] Cache file '{db_path}' does not exist and --allow-cache-write is False; fetching in-memory.")
+        effective_use_cache = False
+
+    db_used = (not is_synthetic_provider(args.data_provider)) and effective_use_cache
+
+    if getattr(args, "end_source", "explicit") == "default":
+        warnings.warn(
+            f"[WARN][CL1] --end was not specified; using legacy default '{DEFAULT_BACKTEST_END}'. "
+            "If your cache has newer data, specify --end YYYY-MM-DD explicitly.",
+            UserWarning,
+            stacklevel=2,
+        )
+        print(f"[WARN][CL1] --end was not specified; using legacy default '{DEFAULT_BACKTEST_END}'.")
+        if effective_use_cache and os.path.exists(db_path) and not is_synthetic_provider(args.data_provider):
+            try:
+                cache = DuckDBCache(db_path, read_only=True)
+                cached_max = cache.get_universe_max_bar_date(
+                    universe_symbols, provider=args.data_provider, interval=args.interval
+                )
+            except Exception as exc:
+                cached_max = None
+                print(f"[WARN][CL1] Could not probe max cached bar date: {exc}")
+            if cached_max is not None and cached_max > pd.Timestamp(args.end).date():
+                raise DefaultEndDateTruncationError(
+                    f"Omitted --end defaulted to {DEFAULT_BACKTEST_END}, but DuckDB cache at {db_path} "
+                    f"contains bars through {cached_max} for universe {universe_symbols}. "
+                    f"Explicitly pass --end {cached_max} (or your desired cutoff) to prevent silent data truncation."
+                )
+
+    main_telemetry: dict = {}
+    canary_telemetry: dict = {}
+    baseline_telemetry: dict = {}
+
     warmup_template = get_template(
         template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec
     )
@@ -2069,10 +2169,12 @@ def main():
 
     include_turn = bool(getattr(args, "include_turn", True))
     universe = load_universe_with_banner(universe_symbols, fetch_start, args.end, args.interval,
-                                          use_cache=not args.no_cache, cache_dir=cache_dir,
+                                          use_cache=effective_use_cache, cache_dir=cache_dir,
                                           data_kwargs=data_kwargs, require_nonempty=True,
                                           expected_last_session=backtest_expected_last_session(),
-                                          include_turn=include_turn)
+                                          include_turn=include_turn,
+                                          cache_read_only=effective_cache_read_only,
+                                          telemetry_out=main_telemetry)
 
     vaa_canary_bars = None
     if getattr(args, "enable_vaa_external_canary", True) and template_needs_vaa_canary(warmup_template, template_name):
@@ -2088,12 +2190,14 @@ def main():
                         fetch_start,
                         args.end,
                         args.interval,
-                        use_cache=not args.no_cache,
+                        use_cache=effective_use_cache,
                         cache_dir=cache_dir,
                         data_kwargs=data_kwargs,
                         require_nonempty=False,
                         expected_last_session=backtest_expected_last_session(),
                         include_turn=False,
+                        cache_read_only=effective_cache_read_only,
+                        telemetry_out=canary_telemetry,
                     )
                     if loaded:
                         vaa_canary_bars.update(loaded)
@@ -2101,6 +2205,33 @@ def main():
                     print(f"[WARN] Failed to load external VAA canary bars in backtester: {exc}")
             if not vaa_canary_bars:
                 vaa_canary_bars = None
+
+    effective_end_date = max(
+        (df.index[-1].strftime("%Y-%m-%d") for df in universe.values() if df is not None and len(df) > 0),
+        default=str(args.end),
+    )
+
+    def _aggregate_telemetry(*telems):
+        active = [t for t in telems if t]
+        return {
+            "cache_read_only": effective_cache_read_only,
+            "cache_hits": sum(t.get("cache_hits", 0) for t in active),
+            "upstream_fetches": sum(t.get("upstream_fetches", 0) for t in active),
+            "fetched_rows": sum(t.get("fetched_rows", 0) for t in active),
+            "cache_writes": sum(t.get("cache_writes", 0) for t in active),
+            "cache_written_rows": sum(t.get("cache_written_rows", 0) for t in active),
+            "end_source": getattr(args, "end_source", "explicit"),
+            "requested_end": str(args.end),
+            "effective_end_date": effective_end_date,
+        }
+
+    initial_telemetry = _aggregate_telemetry(main_telemetry, canary_telemetry)
+    print(
+        f"[DATA PROVENANCE] cache_read_only={initial_telemetry['cache_read_only']} | "
+        f"cache_hits={initial_telemetry['cache_hits']} | "
+        f"upstream_fetches={initial_telemetry['upstream_fetches']} (rows: {initial_telemetry['fetched_rows']}) | "
+        f"cache_writes={initial_telemetry['cache_writes']} (rows: {initial_telemetry['cache_written_rows']})"
+    )
 
     intraday_5m_universe = None
     if bool(getattr(args, "enable_intraday_5m", False)):
@@ -2224,16 +2355,7 @@ def main():
             reused_result = original_result
         print(f"Saved optimize report to {optimize_report_path}")
 
-    candidate_db = os.path.join(cache_dir, "cache.duckdb")
-    db_path = candidate_db if os.path.exists(candidate_db) else os.path.join(DATA_DIR, "cache.duckdb")
-    # `db_path` is only the *configured* cache location (a `stat`, never an open). Whether
-    # this run actually read/wrote it is a separate fact, and the two must not be conflated:
-    # a synthetic provider never constructs `DuckDBCache` at all
-    # (`CachedDataProvider.__init__` -> `is_synthetic_provider`), and `--no-cache`
-    # (`use_cache=not args.no_cache` at every load call) disables it too. Without this flag
-    # a synthetic run would record a 300MB+ production `cache.duckdb` it never opened --
-    # a pure provenance lie (docs/backtest_research_impl.md §1).
-    db_used = (not is_synthetic_provider(args.data_provider)) and not args.no_cache
+    # `db_path` and `db_used` were resolved at the start of main() respecting isolation and effective_use_cache
 
     dump_path = _dump_effective_strategy_def(
         strategy_def,
@@ -2269,6 +2391,7 @@ def main():
         position_lifecycle_config=pl_cfg_dict,
         include_turn=include_turn,
         enable_vaa_external_canary=getattr(args, "enable_vaa_external_canary", True),
+        data_load_telemetry=initial_telemetry,
     )
 
     wf_summary: dict | None = None
@@ -2355,7 +2478,8 @@ def main():
         if args.baseline_symbol:
             main_calendar, _ = _resolve_master_calendar(universe, args.start, args.end, min_coverage=0.20)
             baseline_result, baseline_params = _run_baseline(
-                args, cache_dir, data_kwargs, aligned_index=main_calendar
+                args, cache_dir, data_kwargs, aligned_index=main_calendar,
+                cache_read_only=effective_cache_read_only, telemetry_out=baseline_telemetry,
             )
             comparison = _compute_standard_comparison(result, baseline_result)
 
@@ -2454,7 +2578,8 @@ def main():
         if args.baseline_symbol:
             main_calendar, _ = _resolve_master_calendar(universe, args.start, args.end, min_coverage=0.20)
             baseline_folds, baseline_params = _run_baseline(
-                args, cache_dir, data_kwargs, aligned_index=main_calendar
+                args, cache_dir, data_kwargs, aligned_index=main_calendar,
+                cache_read_only=effective_cache_read_only, telemetry_out=baseline_telemetry,
             )
             baseline_folds_df = pd.DataFrame(baseline_folds)
             folds_df, baseline_calendar_mismatch = _merge_baseline_folds(folds_df, baseline_folds_df)
@@ -2525,6 +2650,11 @@ def main():
                   f"fit); a shortfall this large usually means the loaded universe's actual data "
                   f"didn't reach --end -- check for warnings above and the OHLCV cache under {cache_dir}.")
         summary_path = os.path.join(results_dir, "walkforward_summary.json")
+        final_telemetry = _aggregate_telemetry(main_telemetry, canary_telemetry, baseline_telemetry)
+        summary["data_load_telemetry"] = final_telemetry
+        summary["end_source"] = final_telemetry.get("end_source")
+        summary["requested_end"] = final_telemetry.get("requested_end")
+        summary["effective_end_date"] = final_telemetry.get("effective_end_date")
         write_json_report(summary, summary_path)
         print(f"Saved walkforward summary to {summary_path}")
 
@@ -2612,12 +2742,14 @@ def main():
                 ab_df.to_csv(ab_path, index=False)
                 print(f"Saved lifecycle A/B comparison to {ab_path}")
 
+    final_telemetry = _aggregate_telemetry(main_telemetry, canary_telemetry, baseline_telemetry)
     _finalize_run_manifest(
         manifest_path,
         metrics=_extract_walkforward_metrics(wf_summary) if args.mode == "walkforward" else None,
         artifacts=_artifact_sizes(results_dir),
         enable_position_lifecycle=enable_pl,
         position_lifecycle_config=pl_cfg_dict,
+        data_load_telemetry=final_telemetry,
     )
 
 

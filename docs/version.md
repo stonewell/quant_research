@@ -8328,3 +8328,57 @@ lookback 缓冲内，而是**直接落在成交折里**；4 只「短历史」sy
 3. `common/tests/test_duckdb_cache.py`：103 条单测 100% 通过（涵盖中国法定节假日周末回退覆盖用例）；
 4. `common/tests/test_structural_factors.py` 与 `test_strategy_versioning.py`：32 条单测 100% 通过；
 5. `pipeline/research_strategy/tests/`：`test_blend_strategy_versioning.py`、`test_blend_track_c.py`、`test_track_c_suite_regression.py`、`test_chan_advanced_strategies.py` 全数通过。
+
+
+---
+
+## 64. 回测运行期契约与缓存完整性：消除 CLI `--end` 缺省静默截断与缓存只读默认（`CL1 完整落地`，2026-11-26）
+
+- **改动文件**：
+  - `backtester/run_backtest.py`（`DEFAULT_BACKTEST_END`、`DefaultEndDateTruncationError`、`normalize_end_date_flag`、`--allow-cache-write`、`[DATA PROVENANCE]` 遥测落盘、严格 `--cache-dir` 隔离防生产回落、缺缓存只读自动降级内存）
+  - `backtester/tests/test_run_backtest.py`（测试适配 `--allow-cache-write`）
+  - `common/duckdb_cache.py`（`get_universe_max_bar_date` 跨标的/多 provider 缓存最大日期探测与 `resolve_provider_key` 规范化）
+  - `common/data.py`（`CachedDataProvider` 记录 `last_load_telemetry`，`fetch_universe` 失败标的不计入写库，`load_universe` 透传 `telemetry_out`）
+  - `common/cli_utils.py`（`load_universe_with_banner` 透传 `cache_read_only` 与 `telemetry_out`）
+  - `pipeline/tests/test_backtest_cl1_contract.py`（新增 5 项全离线合约单测）
+  - `docs/development_plan.md`（§2.34 结项 `[x]`）
+  - `docs/version.md`（新增 §64 留痕）
+
+### 64.1 事故背景与根因（CL1）
+
+1. **`--end` 缺省静默截断**：
+   `run_backtest.py` 原在 parser 中将 `--end` 默认值硬编码为字面量 `"2024-12-31"`。当本地 DuckDB 缓存已同步了 2025/2026 年最新行情时，若运行回测未显式提供 `--end`，回测器静默截断在 2024-12-31；或者在判定「未覆盖」时静默触发上游受限回补，导致回测折数无感知坍缩（例如 19 折坍塌为 12 折），全程无任何警告。
+2. **回测只读意图下的意外缓存写入**：
+   回测本应为只读评估过程，但 `CachedDataProvider` 在请求未覆盖时默认触发上游拉取并调用 `store_bars`，修改了底层 `cache.duckdb`。
+
+### 64.2 核心交付与机制改进
+
+1. **静默截断防御与显式门禁**：
+   - 将 `build_arg_parser()` 中的 `--end` 默认值设为 `None`，并由 `_PositionLifecycleArgumentParser` / `normalize_end_date_flag` 规范化为 `DEFAULT_BACKTEST_END = "2024-12-31"`，打上 `end_source = "default"` 标记；
+   - 当 `end_source == "default"` 时，统一发出 `[WARN][CL1] --end was not specified; using legacy default '2024-12-31'` 告警；
+   - 若当前使用 DuckDB 缓存（非 synthetic provider 且缓存文件存在），调用 `DuckDBCache.get_universe_max_bar_date` 探测缓存中当前标的池的最新 bar 日期；若缓存包含晚于 2024-12-31 的行情，**立即抛出 `DefaultEndDateTruncationError` 阻断回测**，拒绝静默截断，提示操作者显式传入 `--end <max_date>` 或所需截止日；
+   - 显式传入 `--end 2025-06-30` 或显式 `--end 2024-12-31` 时均正常执行，操作者意图得到精确尊重。
+2. **回测缓存默认只读（Cache Read-Only Default）**：
+   - CLI 新增 `--allow-cache-write` 开关（默认 `False`）；
+   - 回测中 `cache_read_only = not allow_cache_write`，默认强约束为只读模式；
+   - 保证回测运行前后 `cache.duckdb` 的 MD5 校验和逐字节一致（bit-identical invariance）。
+3. **数据加载链路端到端遥测（Observability Telemetry）**：
+   - `CachedDataProvider` / `load_universe` / `load_universe_with_banner` 采集 `last_load_telemetry`，度量：
+     `cache_read_only`、`cache_hits`、`upstream_fetches`、`fetched_rows`、`cache_writes`、`cache_written_rows`；
+   - 控制台启动时输出 `[DATA PROVENANCE]` 信息横幅；
+   - 遥测字典持久化写入 `run_manifest.json`（骨架 Phase 1 与完备 Phase 2 均完整保留）与 `walkforward_summary.json`。
+
+### 64.3 版本轴说明（Rule 7）
+
+本项改动属于回测 CLI 契约、数据层读写守卫与实验审计可观测性增强，**不涉及任何策略信号逻辑、参数默认值或子策略编排**，亦不改动 `BaseBlendAllocationStrategy` 算法内核。根据 `AGENTS.md` §7 规定，不触发 `BASE_VERSION` 与策略 `version` 递增。
+
+### 64.4 离线单测验证（Rule 10 探针）
+
+1. `pipeline/tests/test_backtest_cl1_contract.py`（5 条单测 100% 通过）：
+   - `test_cl1_default_end_refuses_silent_truncation_against_newer_cache`：Rule 10 可判别探针。缓存含 2025-06-30 K 线时，缺省 `--end` 100% 触发 `DefaultEndDateTruncationError` 阻断；显式传入 `--end 2025-06-30` 或显式 `--end 2024-12-31` 100% 正常执行，且显式新老两臂断言 `len(eq_new) > len(eq_legacy)`、`eq_new.index[-1] > eq_legacy.index[-1]`，且 `end_source == "explicit"`、`cache_writes == 0`。
+   - `test_cl1_backtest_default_is_cache_read_only_md5_invariant`：断言默认模式下 `cache_writes == 0`，`cache.duckdb` 的 MD5 在回测前后完全一致。
+   - `test_cl1_allow_cache_write_opt_in_persists_uncovered_symbol`：断言在 `--allow-cache-write` 显式开启时 `cache_writes > 0` 且新标的持久化至 DuckDB。
+   - `test_cl1_default_end_warns_on_synthetic_provider_without_breaking`：断言合成 provider 下触发告警但不阻断。
+   - `test_cl1_absent_cache_read_only_does_not_crash_or_create_file`：断言当指定的 `--cache-dir` 下 `cache.duckdb` 不存在且未开启 `--allow-cache-write` 时，自动发出告警并降级为纯内存拉取，既不崩溃也不生成新的 `cache.duckdb` 文件。
+2. `backtester/tests/test_run_backtest.py`：78 条用例全数通过。
+3. `backtester/tests/test_backtest_freshness_guard.py`、`common/tests/test_duckdb_cache.py`、`common/tests/test_data.py`：169 条用例全数通过。

@@ -643,6 +643,7 @@ def test_main_results_dir_and_cache_dir_overrides(tmp_path, monkeypatch):
         "--data-provider", "divergent_calendar_test_provider",
         "--results-dir", str(results_dir),
         "--cache-dir", str(cache_dir),
+        "--allow-cache-write",
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
