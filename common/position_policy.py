@@ -168,6 +168,8 @@ __all__ = [
     "GATE5_BREADTH_CONFLUENCE_REASON",
     "GATE5_SUPER_VOLUME_REASON",
     "is_liquidation_event",
+    "RequestSemantics",
+    "coerce_request_semantics",
     "PolicyAction",
     "AssetState",
     "PolicyContext",
@@ -346,6 +348,42 @@ def is_liquidation_event(action: Any, blocking_reason: Any = None) -> bool:
     return str(action or "").strip().upper() == "SELL"
 
 
+class RequestSemantics(str, Enum):
+    """Semantics of a strategy model's raw target weight request.
+
+    Discloses the intent behind an explicit 0.0 or near-zero request so Gate 6
+    can distinguish model-driven veto/liquidation exits from non-exit zero requests
+    (such as Day-1 entry latency confirmation or sub-threshold allocations).
+    """
+
+    ENTRY_PENDING = "ENTRY_PENDING"
+    SUB_THRESHOLD = "SUB_THRESHOLD"
+    VETO = "VETO"
+    LIQUIDATION = "LIQUIDATION"
+    HOLD = "HOLD"
+
+
+def coerce_request_semantics(value: Any) -> Optional[RequestSemantics]:
+    """Coerce string/enum or None to RequestSemantics."""
+    if value is None or isinstance(value, RequestSemantics):
+        return value
+    if isinstance(value, str):
+        v = value.strip().upper()
+        try:
+            return RequestSemantics(v)
+        except ValueError:
+            return None
+    return None
+
+
+_NON_EXIT_ZERO_SEMANTICS = frozenset(
+    {
+        RequestSemantics.ENTRY_PENDING,
+        RequestSemantics.SUB_THRESHOLD,
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # Action vocabulary
 # ---------------------------------------------------------------------------
@@ -496,6 +534,10 @@ class PolicyContext:
     vwap20: Optional[float] = None
     vol_ma20: Optional[float] = None
     val: Optional[float] = None
+    # ---- ZR1 additive metadata (request semantics, pre-gate weight, veto reason)
+    request_semantics: Optional[RequestSemantics] = None
+    pre_gate_weight: Optional[float] = None
+    veto_reason: Optional[str] = None
 
 
 @dataclass
@@ -669,6 +711,7 @@ def _decision(
     state: AssetState,
     blocking_reason: BlockingReason = BlockingReason.NONE,
     detail: Optional[Dict[str, Any]] = None,
+    ctx: Optional[PolicyContext] = None,
 ) -> Decision:
     """Build a `Decision` carrying the updated state snapshot.
 
@@ -678,6 +721,16 @@ def _decision(
     the caller's object.
     """
     payload: Dict[str, Any] = dict(detail or {})
+    if ctx is not None:
+        if ctx.request_semantics is not None:
+            req_sem = ctx.request_semantics
+            payload["request_semantics"] = (
+                req_sem.value if hasattr(req_sem, "value") else str(req_sem)
+            )
+        if ctx.pre_gate_weight is not None:
+            payload["pre_gate_weight"] = float(ctx.pre_gate_weight)
+        if ctx.veto_reason is not None:
+            payload["veto_reason"] = str(ctx.veto_reason)
     payload["state_before"] = (
         state_before.value if isinstance(state_before, PositionState) else str(state_before)
     )
@@ -986,6 +1039,12 @@ class AssetPolicy:
         """
         st = replace(state)  # private copy: invariant 3 (no caller mutation)
         state_before = st.state
+
+        _module_decision = globals()["_decision"]
+
+        def _decision(*args: Any, **kwargs: Any) -> Decision:
+            kwargs.setdefault("ctx", ctx)
+            return _module_decision(*args, **kwargs)
 
         # ---- gate 1: market-closed freeze ---------------------------------
         if not ctx.is_market_open:
@@ -1381,6 +1440,37 @@ class AssetPolicy:
 
         # ---- gate 6: exit-confirmation streak (raw request is exactly zero) --
         if _is_zero_request(raw_target_weight):
+            req_sem = coerce_request_semantics(ctx.request_semantics)
+            if req_sem in _NON_EXIT_ZERO_SEMANTICS:
+                st.exit_streak = 0
+                if st.held_bars >= cfg.min_holding_bars:
+                    st.state = PositionState.HELD_ACTIVE
+                elif st.state == PositionState.PENDING_EXIT:
+                    st.state = PositionState.HELD_GESTATION
+                blocking_reason = (
+                    BlockingReason.PENDING_ENTRY_CONFIRM
+                    if req_sem == RequestSemantics.ENTRY_PENDING
+                    else BlockingReason.MIN_ENTRY_THRESHOLD
+                )
+                reason = (
+                    f"模型待入场确认/建仓门槛信号保持当前持仓 (请求语义: {req_sem.value if hasattr(req_sem, 'value') else req_sem})"
+                )
+                detail = {
+                    "exit_streak": st.exit_streak,
+                    "held_bars": st.held_bars,
+                    "min_holding_bars": cfg.min_holding_bars,
+                    "raw_target_weight": raw_target_weight,
+                }
+                return _decision(
+                    PolicyAction.HOLD_FILTERED,
+                    float(st.current_weight),
+                    reason,
+                    state_before=state_before,
+                    state=st,
+                    blocking_reason=blocking_reason,
+                    detail=detail,
+                )
+
             if can_sell:
                 st.exit_streak += 1
                 if st.exit_streak >= cfg.guard_latency_bars:
@@ -1714,6 +1804,7 @@ class AssetPolicy:
                 state_before=state_before,
                 state=st,
                 detail=detail,
+                ctx=ctx,
             )
 
         return _decision(
@@ -1725,6 +1816,7 @@ class AssetPolicy:
             state=st,
             blocking_reason=BlockingReason.EXIT_CONFIRMING,
             detail=detail,
+            ctx=ctx,
         )
 
     def _reentry_gate_block(
@@ -1848,6 +1940,7 @@ class AssetPolicy:
             state=st,
             blocking_reason=BlockingReason.REENTRY_GATED,
             detail=detail,
+            ctx=ctx,
         )
 
 

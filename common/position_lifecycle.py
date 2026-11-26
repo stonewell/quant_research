@@ -141,8 +141,10 @@ from common.position_policy import (  # noqa: E402  (re-export, not a new use)
     PolicyContext,
     PositionPolicyConfig,
     PositionState,
+    RequestSemantics,
     blocking_reason_label,
     coerce_blocking_reason,
+    coerce_request_semantics,
     is_liquidation_event,
 )
 
@@ -593,6 +595,9 @@ def _kernel_policy_context(
     vwap20: Optional[float] = None,
     vol_ma20: Optional[float] = None,
     val: Optional[float] = None,
+    request_semantics: Optional[RequestSemantics] = None,
+    pre_gate_weight: Optional[float] = None,
+    veto_reason: Optional[str] = None,
 ) -> PolicyContext:
     """Fill `PolicyContext` from the arguments `step_position_lifecycle` carries.
 
@@ -632,6 +637,9 @@ def _kernel_policy_context(
         ma20_close=ma20_close,
         vwap20=vwap20,
         val=val,
+        request_semantics=request_semantics,
+        pre_gate_weight=pre_gate_weight,
+        veto_reason=veto_reason,
     )
 
 
@@ -727,6 +735,7 @@ def step_position_lifecycle(
     vol_ma20: Optional[float] = None,
     val: Optional[float] = None,
     forced_exits: Optional[Set[str]] = None,
+    request_meta: Optional[Dict[str, Any]] = None,
 ) -> LifecycleDecision:
     """Transitions an asset's position lifecycle state for a single bar.
 
@@ -799,6 +808,14 @@ def step_position_lifecycle(
     # The kernel is pure and does NOT mutate `state`; `_decision_to_lifecycle`
     # writes `detail["state_after"]` back so this function keeps its documented
     # in-place mutation contract.
+    req_sem = None
+    pre_w = None
+    v_reason = None
+    if isinstance(request_meta, dict):
+        req_sem = request_meta.get("request_semantics")
+        pre_w = request_meta.get("pre_gate_weight")
+        v_reason = request_meta.get("veto_reason")
+
     kernel_decision = AssetPolicy().step(
         _kernel_asset_state(state),
         float(raw_target_weight),
@@ -816,6 +833,9 @@ def step_position_lifecycle(
             is_market_open=is_market_open,
             is_emergency_halt=is_emergency_halt,
             is_portfolio_deleverage=is_portfolio_deleverage,
+            request_semantics=req_sem,
+            pre_gate_weight=pre_w,
+            veto_reason=v_reason,
         ),
         position_policy_config_from_lifecycle(cfg),
         # Membership, not equality: the caller's per-bar container is handed
@@ -1540,6 +1560,7 @@ def simulate_position_lifecycle(
     market_breadths: Optional[pd.Series] = None,
     atrs: Optional[pd.DataFrame] = None,
     forced_exits: Optional[Union[Dict[Any, Set[str]], pd.Series]] = None,
+    request_meta: Optional[Dict[Any, Dict[str, Dict[str, Any]]]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """Pure causal simulation of position lifecycle state machine across time.
 
@@ -1701,9 +1722,21 @@ def simulate_position_lifecycle(
         decisions: Dict[str, LifecycleDecision] = {}
         # OPT-IN forced-exit channel: this bar's set, or `None` (strict no-op).
         bar_forced_exits = _forced_exits_for_bar(forced_exits, t)
+        bar_request_meta = None
+        if isinstance(request_meta, dict):
+            bar_request_meta = request_meta.get(t)
+            if bar_request_meta is None:
+                try:
+                    bar_request_meta = request_meta.get(pd.Timestamp(t))
+                except Exception:
+                    bar_request_meta = None
         for sym in risky_symbols:
             st = states[sym]
             tgt_w = float(raw_targets.loc[t, sym]) if (t in raw_targets.index and sym in raw_targets.columns) else 0.0
+
+            sym_request_meta = None
+            if isinstance(bar_request_meta, dict):
+                sym_request_meta = bar_request_meta.get(sym)
 
             # Resolve price
             p_series = closes.get(sym)
@@ -1781,6 +1814,7 @@ def simulate_position_lifecycle(
                 vol_ma20=ctx_values["vol_ma20"],
                 val=ctx_values["val"],
                 forced_exits=bar_forced_exits,
+                request_meta=sym_request_meta,
             )
             decisions[sym] = dec
 

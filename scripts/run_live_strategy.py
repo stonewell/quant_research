@@ -7099,6 +7099,15 @@ def main(cli_args: Optional[List[str]] = None):
         except Exception:  # pragma: no cover - defensive: never fail a live run on this
             live_forced_exits = None
 
+    # (2026-11-26, `BASE_VERSION 2.5.0`) ZR1 zero-request semantics side channel
+    _last_request_meta = getattr(template, "_last_request_meta", None)
+    live_request_meta = None
+    if _last_request_meta:
+        try:
+            live_request_meta = _last_request_meta.get(rebalances.index[-1]) or None
+        except Exception:  # pragma: no cover - defensive: never fail a live run on this
+            live_request_meta = None
+
     # ------------------------------------------------------------------ #
     # (`R6`, rule r6.3) OVERNIGHT DE-RISKING -- decided here, applied here
     # ------------------------------------------------------------------ #
@@ -8103,6 +8112,8 @@ def main(cli_args: Optional[List[str]] = None):
                 # OPT-IN forced-exit channel (`None` for every non-blend strategy
                 # and for a blend with the rule off -- a strict no-op).
                 forced_exits=live_forced_exits,
+                # (2026-11-26, `BASE_VERSION 2.5.0`) ZR1 request semantics metadata
+                request_meta=(live_request_meta.get(sym) if isinstance(live_request_meta, dict) else None),
             )
 
             action = decision.action

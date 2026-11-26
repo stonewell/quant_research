@@ -8382,3 +8382,88 @@ lookback 缓冲内，而是**直接落在成交折里**；4 只「短历史」sy
    - `test_cl1_absent_cache_read_only_does_not_crash_or_create_file`：断言当指定的 `--cache-dir` 下 `cache.duckdb` 不存在且未开启 `--allow-cache-write` 时，自动发出告警并降级为纯内存拉取，既不崩溃也不生成新的 `cache.duckdb` 文件。
 2. `backtester/tests/test_run_backtest.py`：78 条用例全数通过。
 3. `backtester/tests/test_backtest_freshness_guard.py`、`common/tests/test_duckdb_cache.py`、`common/tests/test_data.py`：169 条用例全数通过。
+
+
+---
+
+## 65. 零请求语义与可观测性：分离非离场零与风控平仓，全链路插桩前置权重与 Parity 对齐（`ZR1 完整落地`，`BASE_VERSION 2.5.0`，2026-11-26）
+
+- **改动文件**：
+  - `common/position_policy.py`（引入 `RequestSemantics` 枚举，`PolicyContext` 与 `Decision.detail` 增设 `request_semantics` / `pre_gate_weight` / `veto_reason`，Gate 6 阻断非离场零的 `exit_streak` 虚增并保持 `st.current_weight`）
+  - `common/position_lifecycle.py`（重导出 `RequestSemantics`，`_kernel_policy_context` / `step_position_lifecycle` / `simulate_position_lifecycle` 贯通 `request_meta`）
+  - `pipeline/research/blend/blend_base.py`（`BASE_VERSION 2.4.0 -> 2.5.0`，增加 `self._last_request_meta` 侧通道，插桩 10 处模型零目标生产点）
+  - `scripts/run_live_strategy.py`（实盘订单引擎解析 `_last_request_meta` 并向下透传至 `step_position_lifecycle`）
+  - `backtester/run_backtest.py`（回测内核在单次运行与 Walkforward 各 fold 中向下透传 `request_meta` 与 `forced_exits` 到 `simulate_position_lifecycle`）
+  - `common/tests/test_position_policy.py`（新增非离场零 exit_streak 不累加、VETO 下 pre_gate_weight 保留与 legacy None 回退单测）
+  - `common/tests/test_strategy_versioning.py`、`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、`pipeline/research_strategy/tests/test_blend_policy_kernel.py`（同步 `BASE_VERSION 2.5.0` 断言）
+  - `pipeline/tests/test_zr1_parity.py`（新增 Rule 10 / Rule 11 侧通道插桩与实盘/回测 parity 单测）
+  - `pipeline/research_strategy/results/strategy_dumps/*.json`（`--dump-strategies` 同步更新 59 份策略快照至 `base_version: 2.5.0`）
+  - `docs/development_plan.md`（§2.30 结项 `[x]`）
+  - `docs/version.md`（新增 §65 留痕）
+
+### 65.1 事故背景与根因（ZR1）
+
+1. **Gate 6 零请求混淆（语义丢失）**：
+   在 `common/position_policy.py` 的 Gate 6 退出决策中，仅依靠 `_is_zero_request(raw_target_weight)` 判断目标权重是否为零。但并非所有零权重都代表退出意图：
+   - 某些标的因未满足首发入场确认周期（如 `min_entry_bars` 尚在 Day-1 状态，即 `ENTRY_PENDING`），或者目标权重低于开仓门限（`0 < target_w < entry_thresh`，即 `SUB_THRESHOLD`），模型给出的目标为 0.0；
+   - 对已有持仓标的，上述非离场零请求会导致 Gate 6 误将 `exit_streak` 从 0 累加至 1，一旦达到 `min_exit_streak` 门限即错误触发全平离场，破坏了持仓稳定性。
+2. **前置信号在门禁处就地抹杀（可观测性断崖）**：
+   在事故样本（如 `600362.SH @ 2026-11-25`）中，模型内部计算出的原始合成前置权重为 `0.13819947`，但因触发 CYQ 质量门禁被强制截断为 `0.0`，底层决策日志仅能观测到 `raw_target_weight = 0.0`，无法得知究竟是模型未选中、还是选中有权重但被哪道风控门禁拦截，且真实前置期望暴露完全丢失。
+3. **回测与实盘 Parity 缺口（Rule 11）**：
+   回测中的 `simulate_position_lifecycle` 调用未向下透传 `request_meta` 与 `forced_exits` 侧通道，使得回测期与实盘阶段在状态机流转上存在潜在非对齐隐患。
+
+### 65.2 核心机制与架构交付
+
+1. **显式零请求语义分类（`RequestSemantics`）**：
+   - 在 `common/position_policy.py` 定义严格字符串枚举 `RequestSemantics`：
+     - `HOLD`：模型无意图选中（天然零或保持）；
+     - `ENTRY_PENDING`：建仓等待期，未达入场确认根数；
+     - `SUB_THRESHOLD`：模型有正权重但未达起步门槛；
+     - `VETO`：硬风控或质量门禁一票否决（CYQ、筹码、趋势、冷冻期等）；
+     - `LIQUIDATION`：多级回撤熔断或重大强平。
+   - 定义 `_NON_EXIT_ZERO_SEMANTICS = frozenset({RequestSemantics.ENTRY_PENDING, RequestSemantics.SUB_THRESHOLD})`。
+2. **Gate 6 退出门禁语义拦截**：
+   - 在 Gate 6 判断持仓状态（`HELD_GESTATION`, `HELD_ACTIVE`, `PENDING_EXIT`）时：
+     - 若 `raw_target_weight == 0.0` 且 `req_sem in _NON_EXIT_ZERO_SEMANTICS`，执行**拦截保护**：重置 `exit_streak = 0`，若 `held_bars >= min_holding_bars` 恢复为 `HELD_ACTIVE`，并直接返回 `HOLD_FILTERED` 继续持有 `st.current_weight`，绝对不落入 Gate 7 卖出分支；
+     - 仅当真正为风控退出（`VETO`, `LIQUIDATION`）或模型天然零（`HOLD`）时，才推进 `exit_streak` 并按规则退出。
+3. **元数据无损透传与决策详情保留**：
+   - `PolicyContext` 增设 `request_semantics: Optional[RequestSemantics] = None`、`pre_gate_weight: Optional[float] = None`、`veto_reason: Optional[str] = None`；
+   - `_decision` 辅助构造器在非 None 时无损透传进 `Decision.detail`（包括 `SELL` 与 `HOLD` 分支），而 legacy 调用（传 None）完全保持历史逐字节兼容。
+4. **模型层 10 处零权重生产点全量插桩（Producer Instrumentation）**：
+   - 在 `BaseBlendAllocationStrategy` 增设 `self._last_request_meta` 字典（`(date, sym) -> dict`）并在 `generate_weights` 开头重置；
+   - 封装 `_record_zero_meta(sym, semantics, pre_w, reason=None)` 写入辅助函数，遵循**首写胜出（First-Write-Wins）**与 `pre_w <= 0.0` 忽略守卫；
+   - 对策略内核 10 处零赋值点逐一精确插桩：
+     1. 多级回撤熔断清仓（`deleverage_scale == 0.0`）：`LIQUIDATION`, `reason="circuit_breaker"`；
+     2. 既有仓位重新资格审核淘汰：`VETO`, `reason="incumbent"`；
+     3. 资产趋势门禁（`require_asset_trend`）：`VETO`, `reason="require_asset_trend"`；
+     4. CYQ 胜率质量门禁（`cyq_winner_ratio`）：`VETO`, `reason="cyq"`；
+     5. 筹码集中度/价值区重叠度门禁（`consolidation_density`）：`VETO`, `reason="consolidation"`；
+     6. 标的止损冷冻期（`asset_cooldown_until`）：`VETO`, `reason="cooldown"`；
+     7. Day-1 建仓确认中（`min_entry_bars > 1` 且刚首根）：`ENTRY_PENDING`；
+     8. Spring 顶背离硬否决（`min_entry_bars > 1` 分支）：`VETO`, `reason="spring_top_divergence"`；
+     9. 权重低于开仓起步门槛（`0 < target_w < entry_thresh`）：`SUB_THRESHOLD`；
+     10. Spring 顶背离硬否决（`min_entry_bars <= 1` 分支）：`VETO`, `reason="spring_top_divergence"`。
+5. **回测与实盘 Parity 完整闭环（Rule 11）**：
+   - `common/position_lifecycle.py`：`step_position_lifecycle` 与 `simulate_position_lifecycle` 全面接收 `request_meta`；
+   - `scripts/run_live_strategy.py`：从模板策略中提取 `_last_request_meta`，按标的透传至单步生命周期状态机；
+   - `backtester/run_backtest.py`：在单跑回测与 Walkforward 各折中，均提取 `_last_request_meta` 与 `_last_forced_exits` 传递至回测生命周期模拟器。
+
+### 65.3 版本轴说明（Rule 7, M5）
+
+- **基类版本升级**：`BaseBlendAllocationStrategy.BASE_VERSION` 由 `2.4.0` 升级至 `2.5.0`（文档与类属性严格同步）；
+- **策略配置持久化更新**：执行 `cd pipeline && uv run python research_strategy/run_research_strategy.py --dump-strategies`，更新全部 59 份策略快照至 `base_version: 2.5.0`；
+- **配置防漂移守卫**：验证核对 `chan_four_state_blend_strategy.json` 仍严格保留 `blend_weighting_mode="regime_ic_ir_hybrid"` 部署形态（AGENTS.md 强制例外）。
+
+### 65.4 离线单测与 Rule 10 探针验证结果
+
+1. **`common/tests/test_position_policy.py`**（3 条新增单测全绿）：
+   - `test_entry_pending_zero_does_not_advance_exit_streak`：Rule 10 探针。验证持仓标的遭遇 `ENTRY_PENDING` 零请求时，`exit_streak` 保持 0，输出 `HOLD_FILTERED`，持仓权重精确保持 `current_weight`，未被错误平仓；
+   - `test_sub_threshold_zero_does_not_advance_exit_streak`：验证持仓标的遭遇 `SUB_THRESHOLD` 零请求时，同样阻断 `exit_streak` 累加；
+   - `test_pre_gate_weight_preserved_on_veto_sell_and_legacy_none_advances_streak`：Rule 10 探针。验证 `VETO` 下 `SELL` 决策详情中完整保留 `pre_gate_weight=0.13819947` 与 `veto_reason="cyq"`；而在 legacy `request_semantics=None` 调用下，维持历史行为正常推进 `exit_streak` 并输出 `SELL`（逐位兼容）。
+2. **`pipeline/tests/test_zr1_parity.py`**（2 条新增端到端单测全绿）：
+   - `test_blend_side_channel_records_zero_request_metadata`：端到端验证 `BaseBlendAllocationStrategy` 在真实合成回测计算后，`_last_request_meta` 成功采集到 CYQ 否决条目（`semantics=RequestSemantics.VETO`, `pre_gate_weight=0.50`, `veto_reason="cyq"`）；
+   - `test_rule11_backtest_live_parity_on_zr1_semantics`：Rule 11 探针。验证回测生命周期模拟器 `simulate_position_lifecycle` 与实盘逐步生命周期 `step_position_lifecycle` 在相同的持仓、价格与 `request_meta` 输入下，产生的决策动作（`HOLD_FILTERED`）、目标权重与 `Decision.detail` 完全一致，回测/实盘无缝对齐。
+3. **全套离线测试全绿**：
+   - `common/tests/test_position_policy.py common/tests/test_position_lifecycle.py common/tests/test_strategy_versioning.py`：375 条通过；
+   - `pipeline/research_strategy/tests/test_blend_strategy_versioning.py pipeline/research_strategy/tests/test_blend_policy_kernel.py pipeline/research_strategy/tests/test_blend_track_c.py pipeline/tests/test_zr1_parity.py`：31 条通过；
+   - `pipeline/tests/test_backtest_cl1_contract.py backtester/tests/test_run_backtest.py`：83 条通过。

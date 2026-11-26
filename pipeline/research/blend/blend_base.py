@@ -236,9 +236,16 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     `BASE_VERSION 2.4.0` (2026-11-26) fixes post-warmup denominator dilution in
     `consolidation_density` (CQ2) by masking both numerator and denominator with
     `va_available`, eliminating ~19 bars of artificial dilution following warmup.
+
+    `BASE_VERSION 2.5.0` (2026-11-26) resolves zero-request semantics (`ZR1`,
+    `docs/development_plan.md` §2.30): instruments all 10 model zero-target producer sites
+    with additive metadata (`request_semantics`, `pre_gate_weight`, `veto_reason`)
+    published via `self._last_request_meta`, allowing position policy Gate 6 to distinguish
+    non-exit zero allocations (`ENTRY_PENDING`, `SUB_THRESHOLD`) from true risk exits (`VETO`,
+    `LIQUIDATION`) and prevent accidental inertia streak advancement or premature liquidation.
     """
 
-    BASE_VERSION: str = "2.4.0"
+    BASE_VERSION: str = "2.5.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -258,7 +265,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.4.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.5.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -267,6 +274,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             "volatility_targeting",
         ]
         super().__init__(name=name, param_grid={}, factor_tags=tags, version=strat_version)
+        self._last_request_meta: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
         # --- (2026-11-17, observability-only) Empty-style-bucket warning dedupe.
         # `_compute_adaptive_weights` used to emit the SAME warning on EVERY bar
         # with an incomplete style-bucket classification -- in practice on every
@@ -827,6 +835,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         # unless the flag is on, and it is a SEPARATE attribute -- the
         # `AllocationTemplate` / `composite_spec` return contract is untouched.
         self._last_forced_exits: Dict[pd.Timestamp, Set[str]] = {}
+        # (2026-11-26, `BASE_VERSION 2.5.0`) Side channel for zero-request semantics
+        # metadata (`ZR1`). Reset on EVERY call so an earlier run cannot leak.
+        self._last_request_meta: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
+        request_meta_by_date: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
 
         # Core parameters with institutional defaults
         cash_proxy = self.resolve_param(p, "cash_proxy", getattr(cfg, "cash_proxy", "BIL"), str)
@@ -1204,6 +1216,21 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
 
         for t in range(len(master_index)):
             date = master_index[t]
+            bar_request_meta: Dict[str, Dict[str, Any]] = {}
+
+            def _record_zero_meta(sym: str, semantics: str, pre_w: float, reason: Optional[str] = None) -> None:
+                if pre_w <= 0.0 or not np.isfinite(pre_w):
+                    return
+                # First-write-wins per (date, sym): earlier VETO is never overwritten by later SUB_THRESHOLD
+                if sym in bar_request_meta:
+                    return
+                meta: Dict[str, Any] = {
+                    "request_semantics": semantics,
+                    "pre_gate_weight": float(pre_w),
+                }
+                if reason is not None:
+                    meta["veto_reason"] = str(reason)
+                bar_request_meta[sym] = meta
 
             # Update NAV based on positions held from previous day
             if t > 0:
@@ -1410,6 +1437,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     is_emergency = not thrust_active
                     deleverage_scale = 1.0
                 else:
+                    for _s in risky_symbols:
+                        _pw = float(raw_blend[_s]) if _s in raw_blend.index else 0.0
+                        if _pw > 0.0:
+                            _record_zero_meta(_s, "LIQUIDATION", _pw, reason="circuit_breaker")
                     raw_w = pd.Series(0.0, index=symbols)
                     if cash_proxy in symbols:
                         raw_w[cash_proxy] = 1.0
@@ -1474,6 +1505,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         if not _blend_only:
                             continue
                         if float(consec_below.iloc[t][_s]) >= incumbent_exit_bars:
+                            _record_zero_meta(_s, "VETO", float(raw_w[_s]), reason="incumbent")
                             raw_w[_s] = 0.0
                             asset_emergency_df.loc[date, _s] = True
                             # Forced-exit channel (Rule 3 still holds: `raw_w[_s]`
@@ -1490,6 +1522,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                         prev_w_s = float(desired_weights.loc[prev_date, s])
                         if prev_w_s <= 1e-4 and float(raw_w[s]) > 0.01:
                             if float(row_trend50[s]) < 0.5 and float(row_slope[s]) < 0.5 and float(row_roc60[s]) < roc60_median:
+                                _record_zero_meta(s, "VETO", float(raw_w[s]), reason="require_asset_trend")
                                 raw_w[s] = 0.0
 
                 # Track C Anchor 2: CYQ Quality Gate & Consolidation Density Gate
@@ -1521,6 +1554,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                             if pd.notna(w_sp) and pd.notna(e_curv) and float(w_sp) >= 1.25 and float(e_curv) >= 1.5:
                                                 is_exempt = True
                                         if not is_exempt:
+                                            _record_zero_meta(s, "VETO", float(raw_w[s]), reason="cyq")
                                             raw_w[s] = 0.0
 
                                 if float(raw_w[s]) > 0.01 and "consolidation_density" in cols:
@@ -1544,6 +1578,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     # (warm-up), so `pd.notna` means "insufficient
                                     # history -> do not veto". A genuine 0.0 still vetoes.
                                     if pd.notna(c_dens) and float(c_dens) < min_consolidation_density:
+                                        _record_zero_meta(s, "VETO", float(raw_w[s]), reason="consolidation")
                                         raw_w[s] = 0.0
 
             # Dynamic cash deployment & pre-emptive thrust cash deployment
@@ -1840,6 +1875,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             # Enforce cooldown and single-position caps
             for s in risky_symbols:
                 if t < asset_cooldown_until[s]:
+                    if float(raw_w[s]) > 0.0:
+                        _record_zero_meta(s, "VETO", float(raw_w[s]), reason="cooldown")
                     raw_w[s] = 0.0
                 elif raw_w[s] > effective_cap:
                     raw_w[s] = effective_cap
@@ -1883,6 +1920,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                         if pd.notna(w_sp) and pd.notna(e_curv) and float(w_sp) >= 1.25 and float(e_curv) >= 1.5:
                                             entry_signal_bars[s] = min_entry_bars  # Track C Anchor 4: Wyckoff Spring Day 1 fast-track entry bypass
                                 if entry_signal_bars[s] < min_entry_bars:
+                                    _record_zero_meta(s, "ENTRY_PENDING", target_w, reason=None)
                                     raw_w[s] = 0.0  # Pending confirmation on Day 1; do NOT enter!
 
                             # Track C Anchor 4: Extreme kinetic top divergence veto
@@ -1893,10 +1931,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     poc_val = df_u.loc[date, "POC"]
                                     curr_p_s = float(df_u.loc[date, "Close"]) if "Close" in df_u.columns else 0.0
                                     if pd.notna(s_div) and pd.notna(poc_val) and float(s_div) < -1.2 and curr_p_s < float(poc_val):
+                                        _record_zero_meta(s, "VETO", float(raw_w[s]), reason="spring_top_divergence")
                                         raw_w[s] = 0.0
                                         entry_signal_bars[s] = 0
                         else:
                             entry_signal_bars[s] = 0
+                            if target_w > 0.0:
+                                _record_zero_meta(s, "SUB_THRESHOLD", target_w, reason=None)
                             raw_w[s] = 0.0
 
                     # 2. Incremental expansion filter on existing positions:
@@ -1933,6 +1974,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                             poc_val = df_u.loc[date, "POC"]
                             curr_p_s = float(df_u.loc[date, "Close"]) if "Close" in df_u.columns else 0.0
                             if pd.notna(s_div) and pd.notna(poc_val) and float(s_div) < -1.2 and curr_p_s < float(poc_val):
+                                _record_zero_meta(s, "VETO", float(raw_w[s]), reason="spring_top_divergence")
                                 raw_w[s] = 0.0
 
             tot_risky = float(raw_w[risky_symbols].sum())
@@ -2017,6 +2059,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             # (2026-10-22 incident, Fix 4) Persist this bar's hysteresis-adjusted
             # thrust flag for the next iteration's enter/exit boundary decision.
             prev_state["thrust_active"] = thrust_active
+            if bar_request_meta:
+                request_meta_by_date[pd.Timestamp(date)] = bar_request_meta
 
         daily_weights = _fill_out_columns(daily_weights, symbols)
         # M4.2 phase 2 (commit 1a): the sparse compression step now goes through
@@ -2041,6 +2085,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                 for date, row in incumbent_forced_exit_df.iterrows()
                 if bool(row.any())
             }
+        # (2026-11-26, `BASE_VERSION 2.5.0`) Publish zero-request semantics metadata
+        self._last_request_meta = request_meta_by_date
         # (2026-11-17, observability-only) End-of-computation summary for the
         # empty-style-bucket guard. Logged AFTER the weights exist so the log path
         # can never influence them (it is also exception-guarded).

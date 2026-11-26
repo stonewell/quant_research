@@ -86,6 +86,7 @@ from common.position_policy import (
     PortfolioSequencer,
     PositionPolicyConfig,
     PositionState,
+    RequestSemantics,
     SparseProjector,
     blocking_reason_label,
     is_liquidation_event,
@@ -2600,3 +2601,119 @@ def test_gate5_labels_are_distinct():
     assert GATE5_BREADTH_CONFLUENCE_FAST_PATH == "BREADTH_CONFLUENCE"
     assert GATE5_SUPER_VOLUME_FAST_PATH == "SUPER_VOLUME"
     assert GATE5_LEGACY_VOLUME_BREAKOUT_FAST_PATH == "VOLUME_BREAKOUT"
+
+
+def test_entry_pending_zero_does_not_advance_exit_streak():
+    """ZR1: ENTRY_PENDING zero-request must reset exit streak on held positions and hold weight."""
+    st = AssetState(
+        symbol="600362.SH",
+        state=PositionState.PENDING_EXIT,
+        held_bars=3,
+        entry_streak=0,
+        exit_streak=1,
+        cooldown_remaining=0,
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.15,
+        broker_weight=0.15,
+    )
+    ctx = PolicyContext(
+        price=10.2,
+        request_semantics=RequestSemantics.ENTRY_PENDING,
+        pre_gate_weight=0.12,
+    )
+    cfg = PositionPolicyConfig(guard_latency_bars=2, min_holding_bars=2)
+    dec = AssetPolicy().step(st, 0.0, ctx, cfg)
+
+    assert dec.action == PolicyAction.HOLD_FILTERED
+    assert dec.target_weight == pytest.approx(0.15)
+    assert dec.blocking_reason == BlockingReason.PENDING_ENTRY_CONFIRM
+    assert dec.next_state is PositionState.HELD_ACTIVE
+    assert dec.detail["exit_streak"] == 0
+    assert dec.detail["request_semantics"] == "ENTRY_PENDING"
+    assert dec.detail["pre_gate_weight"] == pytest.approx(0.12)
+
+
+def test_sub_threshold_zero_does_not_advance_exit_streak():
+    """ZR1: SUB_THRESHOLD zero-request must reset exit streak on held positions and hold weight."""
+    st = AssetState(
+        symbol="600362.SH",
+        state=PositionState.HELD_ACTIVE,
+        held_bars=4,
+        entry_streak=0,
+        exit_streak=0,
+        cooldown_remaining=0,
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.10,
+        broker_weight=0.10,
+    )
+    ctx = PolicyContext(
+        price=10.2,
+        request_semantics=RequestSemantics.SUB_THRESHOLD,
+        pre_gate_weight=0.03,
+    )
+    cfg = PositionPolicyConfig(guard_latency_bars=2, min_holding_bars=2)
+    dec = AssetPolicy().step(st, 0.0, ctx, cfg)
+
+    assert dec.action == PolicyAction.HOLD_FILTERED
+    assert dec.target_weight == pytest.approx(0.10)
+    assert dec.blocking_reason == BlockingReason.MIN_ENTRY_THRESHOLD
+    assert dec.next_state is PositionState.HELD_ACTIVE
+    assert dec.detail["exit_streak"] == 0
+    assert dec.detail["request_semantics"] == "SUB_THRESHOLD"
+    assert dec.detail["pre_gate_weight"] == pytest.approx(0.03)
+
+
+def test_pre_gate_weight_preserved_on_veto_sell_and_legacy_none_advances_streak():
+    """ZR1 Rule 10 probe: VETO advances streak to SELL and preserves metadata; legacy None is byte-identical."""
+    cfg = PositionPolicyConfig(guard_latency_bars=2, min_holding_bars=2)
+
+    # 1. VETO branch
+    st_veto = AssetState(
+        symbol="600362.SH",
+        state=PositionState.PENDING_EXIT,
+        held_bars=5,
+        entry_streak=0,
+        exit_streak=1,
+        cooldown_remaining=0,
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.13819947,
+        broker_weight=0.13819947,
+    )
+    ctx_veto = PolicyContext(
+        price=10.2,
+        request_semantics=RequestSemantics.VETO,
+        pre_gate_weight=0.13819947,
+        veto_reason="cyq",
+    )
+    dec_veto = AssetPolicy().step(st_veto, 0.0, ctx_veto, cfg)
+    assert dec_veto.action == PolicyAction.SELL
+    assert dec_veto.target_weight == 0.0
+    assert dec_veto.next_state is PositionState.COOLDOWN
+    assert dec_veto.detail["request_semantics"] == "VETO"
+    assert dec_veto.detail["pre_gate_weight"] == pytest.approx(0.13819947)
+    assert dec_veto.detail["veto_reason"] == "cyq"
+
+    # 2. Legacy None branch (byte-identical)
+    st_legacy = AssetState(
+        symbol="600362.SH",
+        state=PositionState.PENDING_EXIT,
+        held_bars=5,
+        entry_streak=0,
+        exit_streak=1,
+        cooldown_remaining=0,
+        entry_price=10.0,
+        peak_price=10.5,
+        current_weight=0.13819947,
+        broker_weight=0.13819947,
+    )
+    ctx_legacy = PolicyContext(price=10.2)
+    dec_legacy = AssetPolicy().step(st_legacy, 0.0, ctx_legacy, cfg)
+    assert dec_legacy.action == PolicyAction.SELL
+    assert dec_legacy.target_weight == 0.0
+    assert dec_legacy.next_state is PositionState.COOLDOWN
+    assert "request_semantics" not in dec_legacy.detail
+    assert "pre_gate_weight" not in dec_legacy.detail
+    assert "veto_reason" not in dec_legacy.detail

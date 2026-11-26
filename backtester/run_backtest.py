@@ -801,6 +801,8 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                         market=market_type,
                         cash_proxy=resolved_cash_proxy,
                         market_breadths=market_breadths,
+                        forced_exits=getattr(template, "_last_forced_exits", None),
+                        request_meta=getattr(template, "_last_request_meta", None),
                     )
                     eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
                     seed_row = (
@@ -1232,6 +1234,8 @@ def run_standard(
             market=market_type,
             cash_proxy=resolved_cash_proxy,
             market_breadths=market_breadths,
+            forced_exits=getattr(template, "_last_forced_exits", None),
+            request_meta=getattr(template, "_last_request_meta", None),
         )
         if has_warmup:
             eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
