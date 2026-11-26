@@ -3380,7 +3380,7 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 
 ---
 
-### 2.31 2026-11-25 CYQ 质量硬门禁的边际价值实证与替换方案（`CQ1`，共 1 项 = 0 `[x]` + 1 `[ ]`）
+### 2.31 2026-11-25 CYQ 质量硬门禁的边际价值实证与替换方案（`CQ1`，共 1 项 = 0 `[x]` + 1 `[ ]`）**（2026-11-25 负结果结案补记）**：`CQ1` 阶段 1 双池实测已完成并按负结果结案（`[ ]` → `[x]`），本表现行 **1 项 = 1 `[x]` + 0 `[ ]`**；标题中的「0 `[x]` + 1 `[ ]`」为登记时点留痕、不回改。
 
 > **编号与 Rule 8 交叉对照说明（2026-11-25 登记，只追加、零生产代码改动）**：编号取新族 `CQ`（`CQ` = CyQ gate），
 > 与既有 `L2.*`、`M*`、`MS*`、`NV*`、`LV*`、`AT*`、`HY*`、`W*`、`S*`、`D*`、`R*`、`C*`、`WU*`、`WV*`、`ZR*` 族
@@ -3395,9 +3395,106 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 > + 阈值网格），阶段 2 依实测裁决真实解方向；两者均严格受 `docs/development_plan.md:2869`（禁向存量策略注入
 > 新硬门槛）与 `:2870`（硬否决会误杀占 91% 时间的动量龙头）约束。
 
+> **负结果结案补记（2026-11-25，`CQ1` 阶段 1；零生产代码改动、生产默认值维持不变）**
+>
+> **一、测量口径**：`chan_four_state_blend` v1.8.0 / base v2.3.0，`--initial-capital 200000`、
+> `--min-shares 100`、`--cash-sweep-rate 0.015`、`QUANT_REBASE_ADJUST_FACTORS=1`（活性实证
+> `DuckDBCache._rebase_adjust_factors = True`）、**19 折**（`2021-11-22..2026-10-30`，
+> `0.25y/0.25y`；此前台账写 18 折是缓存末端更早时点的计数）。N=20 池：`universe_20_stocks.txt`；
+> N=100 池：`docs/universe/china/core_satellite_200k_stocks.txt`。
+>
+> **二、N=20 结果（8 臂）**：`base`（现网 ratio 0.20 + density 0.45）**1.326**（σ 1.831, SE 0.420）；
+> `no_cyq` 1.512（Δ **+0.186**, SE(Δ) 0.226, t 0.82, 胜折 13/19）；`ratio_only_010` 1.540
+> （Δ **+0.214**, 0.144, t 1.48, 12/19）；`dens_off` 1.420（+0.094, t 0.59）；`dens_only` 1.412；
+> `ratio_only_030` 1.321；`ratio_only_050` 1.211；`ratio_knifeedge_099` **0.443**（Δ −0.883,
+> t **−2.71**）。比例腿**单调伤钱**（0.10→0.99 对应 1.540→0.443）；密度腿经济影响仅 **+0.094</br>（0.6 SE）**，
+> 与其 81.8% 的否决占比形成反差。**仅两端越过 1 SE**，其余臂落在噪声内、按 Rule 10 不予排序。
+>
+> **三、N=100 复现（3 臂）**：`base` **0.783**、`no_cyq` 0.493（Δ **−0.290**, SE(Δ) 0.316,
+> t **−0.917**, 胜折 10/19）、`ratio_only_010` 0.710（Δ −0.073, t −0.314, 7/19）。
+> **点估计整体翻号**（N=20 为「关门更好」，N=100 为「关门更差」），两侧均 < 1 SE(Δ) → **统计平局**。
+>
+> **四、裁决**：**未证实正价值**。按 Rule 9，生产默认值**维持不变**
+> （`enable_cyq_quality_gate=true`、`min_cyq_winner_ratio=0.20`、0.45）；阶段 2 的四个候选方案
+> （有界记忆 / 真换手 / 分位阈值 / 降级为连续特征）**不获证据支持**，不在噪声上做手术。未跑 Option B /
+> 单次 ERS / 2× 成本 / 真实 LOO：前者用已有逐折 Sharpe 已可算得 t 值、结论为不过门；LOO 在 N=100 穷举需
+> **≈87 h 串行**，而它检验的是同一个小效应，性价比不成立。
+>
+> **五、Rule 10 探针（两池均 ADJUDICATED，无零差分臂）**：N=20 各臂变动 **31%–39%** 权重格
+> （7,478–9,283 / 23,940）；N=100 两臂 `no_cyq` **7.34%**（8,772 / 119,511）、`ratio_only_010` **6.87%**
+> （8,215）；具体差异格可点查（`688041.SH@2024-02-06(F9) 0.1904→0`、`300394.SZ@2024-02-02(F9) 0.1811→0`）。
+>
+> **六、顺带确认的瓶颈转移**：N=100 下闲置现金 **65.1%–66.2%**（N=20 `base` 仅 38.6%），换手 53.9/48.6；
+> 平均敞口仅 34.9%/33.8%。**宽池的绑定约束是敞口坍缩（`1/K` 稀释撞 5% 入场门槛），不是 CYQ 闸门**，
+> 该项已由 `WU2` 在册。密度腿的语义缺陷另案 `CQ2`（§2.33）。
+>
+> **七、方法学留痕（可复用）**：(a) **CYQ 为路径依赖特征**——同一折在不同加载跨度下取值不同
+> （冒烟 F10 `base` 1.268 vs 全跨度 0.67），故**禁止按折拆进程并行**，只能单进程 + 折级 checkpoint；
+> (b) 单臂耗时 N=20 ≈ 246 s、N=100 ≈ **17.4 min**（50 s/折），首版预估低估 2.5×；
+> (c) N=100 全程读 `/tmp` 冻结副本（md5 `b2604857…`，103 只票含 3 只金丝雀、152,036 行），
+> `data/cache.duckdb` 未被打开；N=20 首跑曾因回测器 upsert 写脏缓存（+448 行），该运行期缺陷已登记 `CL1`
+> （§2.34）；(d) `fuyao` 返回空 `Turn`，因 `use_real_turn=False` 默认不影响结果。
+
 | 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
 | :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
-| **`CQ1`** | `[ ]` | 实证 CYQ 质量硬门禁的边际价值，并以经验证的机制替换（默认 6/6 Blend 全开、从未经回测验证的硬否决） | `pipeline/research/blend/blend_base.py:1492-1520`（CYQ 门；`enable_cyq_quality_gate` 默认 `True` `:928`、`min_cyq_winner_ratio` 默认 `0.20` `:929`；spring 豁免 `:1513-1518`）<br>`common/structural_factors.py:726-977`（`_run_cyq_recurrence`）<br>`common/structural_factors.py:771-778`（τ 代理裁剪 `clip(lower=0.002, upper=0.50)`）<br>`common/structural_factors.py:1137`（`enrich_universe_with_structural_features` 的 `use_real_turn=False` 默认）<br>`docs/backtest_research.md:504,523`（`no_cyq` 消融臂规格） | 1. **阶段 1（纯测量，零生产改动）**：执行已设计的 `no_cyq` 臂（`blend_enable_cyq_quality_gate=false`）与阈值网格 `0.10/0.15/0.20/0.25`，在 `N=20` 与 `N=100`、200k、18 折 Option B、单次 ERS、2× 成本、真实 LOO 上跑，报告 on/off 的 ΔSharpe/ΔCAGR/ΔMDD/ΔTurnover。<br>**预注册期望（已实测，不重推）**：600362@2026-11-25 的 `cyq_winner_ratio=0.002204901055`（`< 0.20`、`is_exempt=False`）触发 `:1520` 否决，前置 `raw_blend`=0.13819947 被就地清零；τ（体积代理）min/median/max=0.004335/0.017542/0.095723 → 半衰期 39.17 交易日、5% 存活 169.27 日；筹码质量按年龄 >250 bars 0.838%、>500 bars 0.002%、>1000 bars 0%；0.0022 完全由 <1% 的旧残余承载（250-bar 截断 → 恰为 0.0）；门禁纯比率通过率 pooled 83.13%（qfq）/80.25%（raw），600362 为 78.10%、末次通过 2026-09-23（距决策 39 交易日）；截面 Spearman vs close/max=0.8586、vs 60d return=0.8797、vs 250d return=0.2602。<br>2. **阶段 2（裁决方向，须实测支持）**：四个候选修复——(a) 有界记忆 / 抬高 0.002 地板；(b) blend 路径改真换手 `use_real_turn=True` 替换体积代理；(c) 百分位归一阈值以消除上市年龄偏差；(d) 硬否决降级为连续特征（与 `:2869` 最一致）。其中 **(a)/(b) 改变指标量级，(c)/(d) 属重标定**；方向须由阶段 1 实测裁决，不得先验定案。<br>3. **必须记录的风险**：0.0022 量级值依赖 <1% 旧残余（250-bar 截断 → 恰为 0.0），**近阈值读数数值不可靠**；门禁为 ~60d 价格位置代理（Spearman vs 60d return=0.8797）与 ROC60/thrust 功能重叠；spring 豁免结构性不可达；无 reversal 腿且 `LV8`/`LV20` 禁新增（故「放行下跌票」**不是**可选答案）。<br>4. **准出门禁**：Rule 8（已交叉对照，见 `docs/backtest_research.md:3`）；Rule 9（正向/非退化证据，或显式 opt-in 默认关闭）；Rule 10（探针必须可判别——gate 开/关必须改变权重格或交易计数，**零增量 = UNADJUDICATED，绝不当 closure**）；Rule 11（任何阈值或路径变更须回测/实盘 parity）；Rule 7（`BASE_VERSION`/`version` 升版 + `--dump-strategies` + `docs/version.md` 中文变更记录）。 | `pipeline/research_strategy/tests/` 新增：`test_cyq_gate_no_cyq_arm_parity`（`no_cyq` 臂与基线在合成夹具上权重格可判别）、`test_cyq_threshold_grid`（0.10/0.15/0.20/0.25 逐档断言否决次数单调）、`test_cyq_use_real_turn_path`（`use_real_turn=True` vs 代理路径输出可判别）；<br>复用 `common/tests/test_structural_factors.py` 既有 CYQ 夹具 | **L** | 无硬前置；阶段 2 依赖阶段 1 实测；与 `ZR1`（`§2.30`）不重复——`ZR1` 修语义/前置值暴露（可观测性），`CQ1` 修门禁本身 |
+| **`CQ1`** | `[x]` | 实证 CYQ 质量硬门禁的边际价值，并以经验证的机制替换（默认 6/6 Blend 全开、从未经回测验证的硬否决） | `pipeline/research/blend/blend_base.py:1492-1520`（CYQ 门；`enable_cyq_quality_gate` 默认 `True` `:928`、`min_cyq_winner_ratio` 默认 `0.20` `:929`；spring 豁免 `:1513-1518`）<br>`common/structural_factors.py:726-977`（`_run_cyq_recurrence`）<br>`common/structural_factors.py:771-778`（τ 代理裁剪 `clip(lower=0.002, upper=0.50)`）<br>`common/structural_factors.py:1137`（`enrich_universe_with_structural_features` 的 `use_real_turn=False` 默认）<br>`docs/backtest_research.md:504,523`（`no_cyq` 消融臂规格） | 1. **阶段 1（纯测量，零生产改动）**：执行已设计的 `no_cyq` 臂（`blend_enable_cyq_quality_gate=false`）与阈值网格 `0.10/0.15/0.20/0.25`，在 `N=20` 与 `N=100`、200k、18 折 Option B、单次 ERS、2× 成本、真实 LOO 上跑，报告 on/off 的 ΔSharpe/ΔCAGR/ΔMDD/ΔTurnover。<br>**预注册期望（已实测，不重推）**：600362@2026-11-25 的 `cyq_winner_ratio=0.002204901055`（`< 0.20`、`is_exempt=False`）触发 `:1520` 否决，前置 `raw_blend`=0.13819947 被就地清零；τ（体积代理）min/median/max=0.004335/0.017542/0.095723 → 半衰期 39.17 交易日、5% 存活 169.27 日；筹码质量按年龄 >250 bars 0.838%、>500 bars 0.002%、>1000 bars 0%；0.0022 完全由 <1% 的旧残余承载（250-bar 截断 → 恰为 0.0）；门禁纯比率通过率 pooled 83.13%（qfq）/80.25%（raw），600362 为 78.10%、末次通过 2026-09-23（距决策 39 交易日）；截面 Spearman vs close/max=0.8586、vs 60d return=0.8797、vs 250d return=0.2602。<br>2. **阶段 2（裁决方向，须实测支持）**：四个候选修复——(a) 有界记忆 / 抬高 0.002 地板；(b) blend 路径改真换手 `use_real_turn=True` 替换体积代理；(c) 百分位归一阈值以消除上市年龄偏差；(d) 硬否决降级为连续特征（与 `:2869` 最一致）。其中 **(a)/(b) 改变指标量级，(c)/(d) 属重标定**；方向须由阶段 1 实测裁决，不得先验定案。<br>3. **必须记录的风险**：0.0022 量级值依赖 <1% 旧残余（250-bar 截断 → 恰为 0.0），**近阈值读数数值不可靠**；门禁为 ~60d 价格位置代理（Spearman vs 60d return=0.8797）与 ROC60/thrust 功能重叠；spring 豁免结构性不可达；无 reversal 腿且 `LV8`/`LV20` 禁新增（故「放行下跌票」**不是**可选答案）。<br>4. **准出门禁**：Rule 8（已交叉对照，见 `docs/backtest_research.md:3`）；Rule 9（正向/非退化证据，或显式 opt-in 默认关闭）；Rule 10（探针必须可判别——gate 开/关必须改变权重格或交易计数，**零增量 = UNADJUDICATED，绝不当 closure**）；Rule 11（任何阈值或路径变更须回测/实盘 parity）；Rule 7（`BASE_VERSION`/`version` 升版 + `--dump-strategies` + `docs/version.md` 中文变更记录）。 | `pipeline/research_strategy/tests/` 新增：`test_cyq_gate_no_cyq_arm_parity`（`no_cyq` 臂与基线在合成夹具上权重格可判别）、`test_cyq_threshold_grid`（0.10/0.15/0.20/0.25 逐档断言否决次数单调）、`test_cyq_use_real_turn_path`（`use_real_turn=True` vs 代理路径输出可判别）；<br>复用 `common/tests/test_structural_factors.py` 既有 CYQ 夹具 | **L** | 无硬前置；阶段 2 依赖阶段 1 实测；与 `ZR1`（`§2.30`）不重复——`ZR1` 修语义/前置值暴露（可观测性），`CQ1` 修门禁本身 |
+
+---
+
+### 2.32 跨来源复权因子读数层重定基与周末覆盖判定缺陷修复（`AF1`，共 1 项 = 0 `[x]` + 1 `[ ]`）
+
+> **编号与 Rule 8 交叉对照说明（2026-11-25 登记，只追加、零生产代码改动）**：编号取新族 `AF`
+> （`AF` = Adjust-Factor plumbing），与既有 `L2.*`、`M*`、`MS*`、`NV*`、`LV*`、`AT*`、`HY*`、`W*`、
+> `S*`、`D*`、`R*`、`C*`、`WU*`、`WV*`、`ZR*`、`CQ*` 族**零碰撞、不重编号**。登记前已执行
+> `grep -n -E 'AF[0-9]' docs/development_plan.md docs/development_plan_archive.md docs/version.md`,
+> 返回空结果（三份文档均无任何 `AF` 族任务编号）。
+> 交叉核对的唯一命中为两处 `cross-source adjust-factor` 散文（`docs/development_plan.md:1497`、
+> `docs/version.md:5061`），指向的是**写侧** `store_adjust_factors(allow_cross_source=False)` 的
+> 整批拒绝护栏（`[REFUSED] cross-source adjust-factor write`），并非任务族，也不是本条的**读侧**
+> 重定基；两者互补、不重复。已交叉核对 `docs/development_plan.md`、`docs/development_plan_archive.md`、
+> `docs/version.md` 全部 `[x]` 任务与负结果闭环，确认本条为净新增：无任何已交付条目覆盖读数层的
+> 跨来源原点混用，也无任何条目覆盖 `_bar_layer_reaches_end` 的周末覆盖判定。
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`AF1`** | `[ ]` | 修复跨来源复权因子混用（读数层重定基 + 周末覆盖判定缺陷），并翻转默认开关 | `common/duckdb_cache.py`（`get_latest_factor_hfq`、`_apply_factors_to_df`、`_rebase_source_scales`、`_bar_layer_reaches_end`、`_assert_plausible_adjust_factors`）<br>`common/tests/test_cross_source_adjust_factors.py`<br>`common/tests/test_duckdb_cache.py` | 1. **缺陷与实测误差**：`get_latest_factor_hfq()` 以 `ORDER BY date DESC LIMIT 1` 取 qfq 除数且**无 source 过滤**；`adjust_factors` 同时存两个不同原点的来源 —— BaoStock 自上市累计（`000157.SZ` 上市 2000-10-12 为 `1.0`，2023-07-21 为 `63.0955`）、Fuyao 锚定近端（2024–2026 仅 `1.332` → `1.528`）。跨两来源的读窗口同时施加两个原点，误差 = `f_BaoStock(prefix end)/f_Fuyao(latest)`。实测 legacy 接缝比值（off）→ rebased（on）：`600362.SH` `1.2655` → `1.0`（26% 价格误差）、`600584.SH` `3.6157` → `1.0`、`601398.SH` `1.5564` → `1.0`、`000157.SZ` `47.50` → `1.0`（其全历史读取同时不再 fail-closed）；另四只此前静默混用者 `601872.SH`/`601288.SH`/`601225.SH`/`601919.SH` 为 `1.176134`/`1.357884`/`1.028654`/`1.043051` → 全部 `1.000000000`。<br>2. **修复机制与锚点规则**：读数层重定基 `f_rebase(t) = f(t) * scales[source(t)]`，在接缝处链式（较早来源的最后一行 × 较晚来源在该日或之后的第一行），再归一化使**拥有该 symbol 最新行的来源恰为 `1.0`**。`(symbol, date)` 是主键，故共享日期不可能存在 —— 「最新共同日期」锚点在结构上无法成立，可观测的接缝重叠才是锚点。开关 `QUANT_REBASE_ADJUST_FACTORS`（环境变量，默认 `False` = legacy），在 `__init__` 读一次；不可锚定的接缝抛 `AdjustFactorRebaseRefused`，**fail closed**。合法性区间（`IMPLAUSIBLE_ADJUST_FACTOR_RATIO = 4.0`、`MIN_RATIO = 0.25`）改为**逐来源**在重定基后的片段上对各自参考值评估；开关关闭时维持原有 pooled median 口径。<br>3. **零漂移判据**：单来源 symbol 时 `_rebase_source_scales` 返回 `None`，**不执行任何算术** → 位级一致。实测最大相对价差恰为 `0.0`（`df.equals` 为 True），覆盖 `600941.SH` 与两个合成单来源夹具。接缝断言比对的是**重定基后**的值、`rtol = 1e-6`，它验证的是管道接通而**非**数据质量；其判别力由 legacy 路径对 `601398.SH` 产出 `1.5564` 证明。<br>4. **周末缺陷与最小修法**：`_bar_layer_reaches_end` 原先把任意周末 `end` 判为「已覆盖」（只要存在任一 bar 早于它），故结束于周日 2023-12-31 的请求在数据滞后 18 个月时仍被接受 —— 这正是 2023 年始终未被回补的原因。现要求 `max_bar_date >=` 该周周五（`friday = req_end - timedelta(days=req_end.dayofweek - 4)`；周六 −1、周日 −2）。修复后已对 16 个 symbol 回补 Fuyao `2022-01-04..2023-12-29`：`ohlcv_bars` `158,657` → `164,528`、`adjust_factors` `14,217` → `21,916`，备份位于 `data/repair_backups/20261126_014355Z_pre_fuyao_2022_2023_backfill/`。残余风险仅限**两套累计序列均未反映**的公司行为；接缝比值本身是累计量，区间内的公司行为按构造被吸收。<br>5. **准出门禁**：Rule 9 以**零漂移验证**适用（非正向价值基准，单来源路径须字节级零漂移）；Rule 11 回测/实盘 parity 须同源落地；**翻转 `QUANT_REBASE_ADJUST_FACTORS` 默认值前必须通过 6-Gate** —— 18 折 Option B（paired-t 与正折数）、单次 ERS（Rule 4，仅对胜者一次）、2× 成本压力、真实 Leave-One-Out 脆弱性、Rule 10 可判别探针（零增量 = UNADJUDICATED，不得当闭环）；并注明 `valuation.py::compute_nav` 因 `factor_mark` / `factor_anchor` 同源而**免疫**本缺陷，无需改动。 | `common/tests/test_cross_source_adjust_factors.py`（新增 10 条：接缝重定基、`000157.SZ` 全历史、四只静默混用者归一到 `1.0`、单来源 `None` 短路与 `df.equals` 零漂移、`AdjustFactorRebaseRefused`、逐来源合法性区间）<br>`common/tests/test_duckdb_cache.py`（新增 1 条负向周末覆盖用例）<br>全量：`pytest common/tests -q` → **1 failed, 1684 passed, 1 skipped**（唯一失败在干净 HEAD 上即已存在：`test_intraday_features.py::test_l2_15_5m_symbol_5m_symbol_sync_does_not_assert_intraday_earliest_known`，为 `scripts/sync_china_5m_and_indices.py:1886` 的 BaoStock `keep_logged_in` 契约断言） | `M` | 无代码前置；**翻转默认值**依赖 `CQ1`（§2.31）阶段 1 与关联网格在 `QUANT_REBASE_ADJUST_FACTORS=1` 下的结果一致性 |
+
+---
+
+### 2.33 2026-11-25 `consolidation_density` 预热期输出 `0.0` 冒充「无盘整」，致密度腿把「数据不足」判成否决（`CQ2`，共 1 项 = 0 `[x]` + 1 `[ ]`）
+
+> **编号与 Rule 8 交叉对照说明（2026-11-25 登记，只追加、零生产代码改动）**：编号取既有 `CQ` 族的下一号
+> `CQ2` —— `CQ` 族已由 §2.31 的 `CQ1` 建立，本条在同一族内顺序续编，不新开族、不与任何既有编号重号。
+> 登记前已执行 `grep -n -E '\bCQ[0-9]|\bCL[0-9]' docs/development_plan.md docs/development_plan_archive.md docs/version.md`，
+> 命中 2 行且全部来自同一份文档：`docs/development_plan.md:3383`（§2.31 标题）、`docs/development_plan.md:3400`
+> （`CQ1` 任务行）；`docs/development_plan_archive.md` 与 `docs/version.md` 对该正则**零命中**，故 `CQ2` 为净新增编号。
+> 已交叉核对 `docs/development_plan.md`、`docs/development_plan_archive.md`、`docs/version.md` 全部 `[x]` 任务与
+> 负结果闭环，确认本条为净新增：无任何已交付条目覆盖 `consolidation_density` 的预热期 `0.0` 与「数据不足」
+> 混淆，也无任何条目覆盖该门的**命名错配**（被称作「CYQ 质量门 / anchor 2」，实际绑定腿却是 Volume-Profile
+> 价值区重叠度，真正的 CYQ 量 `cyq_cost_concentration` 并不在门内）。与 `CQ1` 互补不重复：`CQ1` 测的是 CYQ
+> 门禁的边际价值，本条修的是密度腿的语义与可观测性。
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`CQ2`** | `[ ]` | `consolidation_density` 预热期输出 `0.0` 冒充「无盘整」，导致 anchor-2 密度腿把「数据不足」当作否决（并纠正该门的命名与指标绑定） | `common/structural_factors.py:193-195`、`:203`（`compute_rolling_poc_series` 前 `lookback-1 = 59` 根 VAL/VAH 为 NaN）<br>`common/structural_factors.py:637-639`、`:648-662`（`consolidation_density` 把 NaN 有效区判为 `False`，`overlap_ratio` 留 `0.0`；`min_periods=1` 使其从第 0 根就出值）<br>`common/structural_factors.py:1249-1256`（blend 侧 `zd`/`zg` 回落到 `VAL`/`VAH`，而非缠论中枢）<br>`pipeline/research/blend/blend_base.py:1522-1531`（`pd.notna(c_dens) and c_dens < 0.45` —— `pd.notna(0.0)` 为真，预热行被当作「盘整度不足」否决）<br>`pipeline/research/blend/blend_base.py:928-936`（`enable_cyq_quality_gate` / `min_cyq_winner_ratio=0.20` / `0.45` 默认） | 1. **事实与量级**：窗口内 `density == 0.0` 的行中 **81.8%** 落在「距加载帧起点 < 60 根」；`index < 60` 的行 **98.4% 为零**（`VAL` 的 NaN 占比在 `index < 60` 为 98.33%、`index >= 60` 为 0.00%）。剔除预热后：`== 0.0` **7.47%**、`< 0.45` **45.28%**、中位数 **0.513**。<br>2. **阈值从未校准**：`0.45` 原为裸字面量 `0.40`（`docs/version.md` §24 / `C6.1` 仅作参数化对齐），而方案书因子语义表写的是「≥0.50 HVN / <0.30 空心」，`0.45` 卡在两者中间、无分布依据。<br>3. **命名缺陷**：该门被称作「CYQ 质量门 / anchor 2」，但其绑定腿是 Volume-Profile 价值区重叠度；真正的 CYQ 量 `cyq_cost_concentration`（`common/structural_factors.py:960-964`）**不在门内**。文档与代码注释须同步纠正，避免后续把两条腿混为一谈。<br>4. **交付**：让预热期输出 `NaN`（或在门禁侧把 `density == 0.0 且 index < lookback` 识别为「数据不足」并放行），使 `pd.notna` 守卫真正生效；随后重测密度腿的**真实**否决率与阈值分布；并同步修正命名/文档表述。改 `blend_base.py` 判据属 `BaseBlendAllocationStrategy` 变更，须升 `BASE_VERSION`，并按 Rule 7 更新 `pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、`common/tests/test_strategy_versioning.py`、`--dump-strategies` 与 `docs/version.md`。<br>5. **准出门禁**：Rule 9 —— 非预热行必须**零漂移**（逐字节），预热行按设计发生变化且须量化；Rule 10 —— 探针必须是「预热行的 gate 判定从否决变为放行」的**可观测计数**，零差分则 `UNADJUDICATED`，不得当闭环；Rule 11 —— 回测/实盘同源。并参考 `CQ1` 已有结论：N=20 十九折下密度腿经济影响仅 **+0.094（0.6 SE）**，与其 81.8% 的否决占比形成鲜明反差，故本条**不是**为了提升 Sharpe，而是纠正语义与可观测性。 | `common/tests/test_structural_factors.py` 新增「前 `lookback-1` 根为 `NaN` 而非 `0.0`」用例<br>`pipeline/research_strategy/tests/` 新增门禁预热放行用例<br>`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` 同步版本断言 | `M` | 无硬前置；与 `CQ1`（§2.31）结论互补（`CQ1` 测价值，本条修语义），不重复 |
+
+---
+
+### 2.34 2026-11-25 `run_backtest.py` 的 `--end` 缺省静默截断实验 + 回测器在只读意图下 upsert 缓存（`CL1`，共 1 项 = 0 `[x]` + 1 `[ ]`）
+
+> **编号与 Rule 8 交叉对照说明（2026-11-25 登记，只追加、零生产代码改动）**：编号取新族 `CL`（`CL` =
+> Cache / CLI contract），与既有全部任务族**零碰撞、不重编号**。登记前已执行
+> `grep -n -E '\bCQ[0-9]|\bCL[0-9]' docs/development_plan.md docs/development_plan_archive.md docs/version.md`，
+> 同一正则对 `CL` 族在三份文档中**返回空结果**（无任何 `CL1` 及 `CL` 编号），故 `CL1` 为净新增；该次 grep 亦
+> 确认 `CQ` 族仅有 `CQ1`（§2.31），`CQ2` 为同族续编、已登记于紧邻的 §2.33。已交叉核对
+> `docs/development_plan.md`、`docs/development_plan_archive.md`、`docs/version.md` 全部 `[x]` 任务与负结果闭环，
+> 确认本条为净新增：无任何已交付条目覆盖 `--end` 缺省值引发的静默缩表，也无任何条目约束回测路径对缓存的
+> 写权限。与 `AF1`（§2.32）相邻但独立：`AF1` 修的是读数基准（跨来源复权原点）与周末覆盖判定，本条修的是
+> **运行期契约**（缺省参数与写权限）。
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`CL1`** | `[ ]` | `run_backtest.py` 的 `--end` 缺省值静默截断实验 + 回测器在只读意图下 upsert 缓存（数据完整性） | `backtester/run_backtest.py:223`（`p.add_argument("--end", default="2024-12-31")` —— **经 grep 校正**：缺省是固定字面量，并非「取今天」）<br>`common/duckdb_cache.py:2134`（`is_range_covered` 双层覆盖契约）、`:1483`（`_bar_layer_reaches_end`，与 `AF1` 修复的周末分支相邻）、`:2600`（`store_bars`）<br>回测器取数路径上的 provider upsert（`CachedDataProvider` → `store_bars`） | 1. **事故复现与量级（2026-11-26 实测）**：`--end` 缺省（`:223` 的固定字面量 `2024-12-31`，与缓存/上游实际末端无关）→ 请求区间被判「未覆盖」→ 静默重取 → 上游只回 **1023 根**（2020-10-19..2024-11）→ 实验从 **19 折** 悄悄塌成 **12 折**（末折止于 2024-11）；显式 `--end 2026-11-25` 后恢复正常。**全程无警告**。<br>2. **同批事故**：回测器在「只读」意图下仍 upsert 缓存，`ohlcv_bars` 164,528 → **164,976（+448 行）**，12 只票的 Fuyao 序列被推到 2020-10-19；`adjust_factors` 因写侧跨源守卫全部 `[REFUSED]` 而未变。处置是 kill + 冻结副本（`/tmp/opencode/cq1_stage1/cachedir/`，md5 `7eaa0479…`），**非修复**。<br>3. **交付**：`--end` 缺省时**显式警告并拒绝静默缩表**（或直接报错要求显式给出），且回测路径对缓存的写操作默认关闭（`read_only` 或显式 `--allow-cache-write` 开关），并在报表里记录「本次运行是否取数、取了多少行、是否写库」。<br>4. **准出门禁**：Rule 13 —— 长跑脚本先做端到端小切片冒烟，并在报表里断言折数与跨度；Rule 12 —— 静默截断必须转为可见告警；Rule 10 —— 探针为「缺省 `--end` 与显式 `--end` 两臂的折数/末尾日期差异」，必须可见，零差分则 `UNADJUDICATED`；Rule 9 —— 属 bugfix，验收为「同一配置下折数/权重与显式 `--end` 逐一致」。 | `pipeline/tests/` 新增「`--end` 缺省值（`2024-12-31`）与缓存实际末端不一致时必须告警/报错、不得静默缩表」用例<br>新增「回测路径不写库」用例（跑一次小切片后断言缓存 md5 不变） | `S` | 无（与 `AF1` 相邻但独立：`AF1` 修读数基准，本条修运行期契约） |
 
 ---
 

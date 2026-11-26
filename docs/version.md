@@ -8087,3 +8087,81 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
 
 - `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies`（59 份重导完成，`chan_four_state_blend` 严格维持 `regime_ic_ir_hybrid`）。
 - `pipeline/.venv/bin/python -m pytest common/tests/test_strategy_versioning.py common/tests/test_market_clock.py common/tests/test_market_cli_and_vaa_parity.py pipeline/research_strategy/tests/test_chan_advanced_strategies.py pipeline/research_strategy/tests/test_blend_strategy_versioning.py pipeline/tests/test_live_market_clock_wiring.py pipeline/tests/test_config_wiring.py backtester/tests/test_backtest_freshness_guard.py backtester/tests/test_run_backtest.py -q --import-mode=importlib` → **360 passed, 53 warnings**。
+
+## 61. 数据层：跨来源复权因子读数重定基（`QUANT_REBASE_ADJUST_FACTORS`，默认关闭）
+
+> **本节编号**：落笔前实测现有最高节号为 **60**，故本节取 **61**，只追加在文件末尾；§1–§60 一字未改。
+> 对应台账见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md)
+> §2.32（`AF1` `[ ]`，默认值翻转仍待 6-Gate 通过）。
+> **版本轴**：本条**不涉及** `BASE_VERSION`（该属性只存在于 `BaseBlendAllocationStrategy`），
+> 也不改动任何策略/模板类的 `version` —— `common/` 的数据管道修复按 Rule 7 的第三类
+> （同步更新义务）记账，仅为可追溯性追加本节。
+
+### 61.1 缺陷：读侧用一个来源的除数为另一个来源的原点做除法
+
+`common/duckdb_cache.py` 的 `get_latest_factor_hfq()` 以 `ORDER BY date DESC LIMIT 1` 取 qfq 除数，
+**不带 source 过滤**；而 `adjust_factors` 表里同时存在两套不同原点的累计序列：
+
+- **BaoStock**：自上市累计。`000157.SZ` 在其上市日 2000-10-12 为 `1.0`，到 2023-07-21 已达 `63.0955`。
+- **Fuyao**：锚定近端。2024–2026 区间仅在 `1.332` → `1.528` 之间。
+
+只要读窗口同时覆盖两个来源，读数就会同时施加两个原点，价格误差为
+`f_BaoStock(prefix end) / f_Fuyao(latest)`。实测 legacy 接缝比值与重定基后的对照如下：
+
+| 标的 | legacy（off） | rebased（on） | 说明 |
+| :--- | ---: | ---: | :--- |
+| `600362.SH` | 1.2655 | 1.0 | 26% 价格误差 |
+| `600584.SH` | 3.6157 | 1.0 | 跨来源混用 |
+| `601398.SH` | 1.5564 | 1.0 | 跨来源混用 |
+| `000157.SZ` | 47.50 | 1.0 | 同时解除全历史读取的 fail-closed |
+| `601872.SH` | 1.176134 | 1.000000000 | 此前静默混用 |
+| `601288.SH` | 1.357884 | 1.000000000 | 此前静默混用 |
+| `601225.SH` | 1.028654 | 1.000000000 | 此前静默混用 |
+| `601919.SH` | 1.043051 | 1.000000000 | 此前静默混用 |
+
+### 61.2 机制与锚点规则
+
+- **读数层重定基**：`f_rebase(t) = f(t) * scales[source(t)]`，`scales` 由 `_rebase_source_scales` 计算。
+- **接缝链式**：相邻两来源之间以「较早来源的最后一行 × 较晚来源在该日或之后的第一行」构链，
+  再整体归一化，使**拥有该 symbol 最新行的来源恰为 `1.0`**。
+- **为什么没有「共同日期锚点」**：`(symbol, date)` 是该表主键，同一 symbol 不可能存在两行同日，
+  因此「取最新共同日期做对照」在结构上不可能实现；真正可观测的重叠就是接缝本身。
+- **fail closed**：接缝无法锚定时抛 `AdjustFactorRebaseRefused`，而不是静默回退到 legacy 数值。
+- **合法性区间**：`IMPLAUSIBLE_ADJUST_FACTOR_RATIO = 4.0` 与 `MIN_RATIO = 0.25` 改为**逐来源**
+  在该来源重定基后的片段上、对各自参考值评估；开关关闭时维持原有的 pooled median 口径不变。
+- **残余风险（诚实披露）**：只有当某个公司行为在**两套累计序列中都没有体现**时才会漏过重定基；
+  接缝比值本身是累计量，落在缺口语区间内的公司行为按构造被吸收。
+
+### 61.3 单来源零漂移、周末覆盖缺陷与开关语义
+
+1. **单来源 symbol 位级零漂移**：只有一个来源时 `_rebase_source_scales` 返回 `None`，调用方
+   **不执行任何算术**，因此输出与 legacy 逐字节相同。实测最大相对价差恰为 `0.0`（`df.equals` 为 True），
+   覆盖 `600941.SH` 与两个合成单来源夹具。
+2. **接缝断言的定位**：断言比对的是**重定基后**的值、容差 `rtol = 1e-6`，它验证的是管道接通，
+   **不是**数据质量。其判别力由 legacy 路径对 `601398.SH` 产出 `1.5564` 来证明 —— 关闭开关时该断言必然失败。
+3. **周末覆盖判定缺陷**：`_bar_layer_reaches_end` 原先把任意周末 `end` 判为「已覆盖」，条件仅为
+   「存在任一 bar 早于它」，于是结束于周日 2023-12-31 的请求在数据已滞后 18 个月时仍被接受 ——
+   这正是 2023 年始终未被回补的根因。最小修法：要求 `max_bar_date >=` 该周周五，
+   即 `friday = req_end - timedelta(days=req_end.dayofweek - 4)`（周六 −1、周日 −2）。
+4. **开关**：`QUANT_REBASE_ADJUST_FACTORS` 为环境变量，默认 **`False`**（沿用 legacy），
+   在 `__init__` 中只读一次。默认保持关闭的原因：本条是 Rule 9 的**零漂移验证**类改动，
+   尚非正向价值基准；翻转默认值属于独立决策，须先通过 6-Gate。
+5. **数据补记**：周末修复后对 16 个 symbol 回补了 Fuyao `2022-01-04..2023-12-29` ——
+   `ohlcv_bars` `158,657` → `164,528`、`adjust_factors` `14,217` → `21,916`；
+   回补前备份位于 `data/repair_backups/20261126_014355Z_pre_fuyao_2022_2023_backfill/`。
+
+### 61.4 离线验证状态与准出义务
+
+- **全量**：`pytest common/tests -q` → **1 failed, 1684 passed, 1 skipped**。该唯一失败在干净 HEAD 上
+  即已存在，与本次无关：`test_intraday_features.py::test_l2_15_5m_symbol_5m_symbol_sync_does_not_assert_intraday_earliest_known`，
+  是 `scripts/sync_china_5m_and_indices.py:1886` 的 BaoStock `keep_logged_in` 契约断言。
+- **新增**：`common/tests/test_cross_source_adjust_factors.py`（10 条）＋ `common/tests/test_duckdb_cache.py`
+  中 1 条负向周末用例。
+- **义务一（Rule 9）**：本条的验收形态是**零漂移验证**，不是正向价值基准 —— 单来源路径必须
+  位级不变（`df.equals` 为 True、最大相对价差 `0.0`），其余路径只有开关打开时才改变数值。
+- **义务二（Rule 11）**：回测与实盘共用 `common/duckdb_cache.py` 的同一读数路径，两侧必须同时生效；
+  `valuation.py::compute_nav` 因 `factor_mark` 与 `factor_anchor` **同源**而免疫本缺陷，无需改动。
+- **义务三（翻转默认值）**：`QUANT_REBASE_ADJUST_FACTORS` 默认值翻转为 `True` 前必须通过 6-Gate ——
+  18 折 Option B（paired-t 与正折数）、单次 ERS（Rule 4，仅对胜者一次）、2× 成本压力、
+  真实 Leave-One-Out 脆弱性、Rule 10 可判别探针（零增量 = UNADJUDICATED，不得当闭环）。
+  在 6-Gate 通过并翻转默认值之前，本任务在 `docs/development_plan.md` §2.32 保持 `[ ]`。
