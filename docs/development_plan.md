@@ -3461,7 +3461,7 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 
 ---
 
-### 2.33 2026-11-25 `consolidation_density` 预热期输出 `0.0` 冒充「无盘整」，致密度腿把「数据不足」判成否决（`CQ2`，共 1 项 = 0 `[x]` + 1 `[ ]`）
+### 2.33 2026-11-25 `consolidation_density` 预热期输出 `0.0` 冒充「无盘整」，致密度腿把「数据不足」判成否决（`CQ2`，共 1 项 = 0 `[x]` + 1 `[ ]`）**（2026-11-25 闭环补记）**：`CQ2` 已交付并闭环（`[ ]` → `[x]`），本表现行 **1 项 = 1 `[x]` + 0 `[ ]`**；标题中的「0 `[x]` + 1 `[ ]`」为登记时点留痕、不回改。
 
 > **编号与 Rule 8 交叉对照说明（2026-11-25 登记，只追加、零生产代码改动）**：编号取既有 `CQ` 族的下一号
 > `CQ2` —— `CQ` 族已由 §2.31 的 `CQ1` 建立，本条在同一族内顺序续编，不新开族、不与任何既有编号重号。
@@ -3474,9 +3474,44 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 > 价值区重叠度，真正的 CYQ 量 `cyq_cost_concentration` 并不在门内）。与 `CQ1` 互补不重复：`CQ1` 测的是 CYQ
 > 门禁的边际价值，本条修的是密度腿的语义与可观测性。
 
+> **闭环补记（2026-11-25；语义修复已交付，经济影响在本池本窗口不可判别）**
+>
+> **一、修法（option a，仅特征层）**：`consolidation_density` 新增 `va_available = ~isnan(ZD) & ~isnan(ZG)`，
+> 输出改为 `density.where(va_available, np.nan)`。滚动聚合（window 20 / `min_periods=1` / 量加权 /
+> `clip(0,1)` / 列名）**一字未动**；掩码键选 `va_available` 而非 `valid_z`，故退化中枢（`ZG<=ZD`）保留历史
+> `0.0`，既有 `d_invalid` 契约不破。门禁 `blend_base.py:1530` 的 `pd.notna(c_dens) and ...` **逻辑字节未改**，
+> 因此 **无 `BASE_VERSION` 变更、无类 `version` 变更、无需 `--dump-strategies`**；仅在 `:1522-1542` 增注释，
+> 说明该腿是 Volume-Profile 价值区重叠度（blend 侧 `zd/zg` = `VAL/VAH`），**不是** CYQ 量，
+> 门的名称只覆盖 `:1499` 的 `cyq_winner_ratio` 腿；参数名 `enable_cyq_quality_gate` 不改（改名属破坏性配置变更）。
+>
+> **二、源头证据（100 只票、`QUANT_REBASE_ADJUST_FACTORS=1`、读冻结副本 `b2604857…`，两份缓存 md5 前后未变）**：
+> `0.0 → NaN` 翻转 **5,900** 行；仍为真实 `0.0` 的 **6,255** 行（修复前零值 12,155，预热占 **48.54%**）；
+> 已知价值区行**逐值对照 140,711 行、0 行差异、0 只票**——即**非预热行零漂移**。
+>
+> **三、折内暴露（此处必须精确，不得模糊）**：折内翻转行为 **177 行，不是 0**：`F1=32, F2=53, F3=45, F4=47`，
+> `F5–F19 = 0`。全部来自 3 只次新股的 60 根预热落在交易折内（`600938.SH` / `600941.SH` / `688041.SH` 各 59 行），
+> 且都落在真实调仓日上。根因是**次新股没有可丢弃的回看缓冲**，而非折切片假设错误。
+>
+> **四、经济影响：`UNADJUDICATED`（不是"无影响"）**：对 F1–F4 用修复后重算、F5–F19 直接取 `CQ1` 的逐折 pickle，
+> 逐折 replay 结果 **0 / 25,011 权重格变化**，`sharpe_ratio`/`cagr`/`max_drawdown`/`total_turnover`/`total_rebalances`
+> **逐位相同**——因为这 177 行上 `raw_w > 0.01` 从未成立（该标的当时未成候选）。按 Rule 10，
+> **零差分臂只证明实验看不见该变化，不得据此宣称"无害"或"无效"**；本条的证据由源头 5,900 行翻转与三条单测承载，
+> 经济层记为未裁决。
+>
+> **五、测试**：`pytest common/tests -q` → **1 failed, 1687 passed, 1 skipped**（唯一失败
+> `test_intraday_features.py::test_l2_15_5m_symbol_sync…` 在干净 HEAD 上同样失败，与本次无关）；
+> `pytest pipeline/research_strategy/tests -q --import-mode=importlib` → **654 passed, 1 xfailed**。
+> 新增 3 条 `common/tests/test_structural_factors.py` 用例（预热 NaN、真实零保留含一字板、非预热段逐值等同内联旧实现）；
+> `test_track_c_suite_regression.py:515-516` 的旧契约断言（全 NaN `zd/zg` ⇒ `== 0.0 and not isna()`）已翻为 `isna().all()`
+> 并注明旧契约即缺陷本身。
+>
+> **六、条目的性质（防止后人误读为提分项）**：本条是**语义与可观测性修复**，在本池本窗口**不产生可测的经济增益**；
+> 其价值在于次新股、短历史切片与未来数据回补场景下不再把"数据不足"当作"无盘整"否决。变更后行为记录见
+> `docs/version.md` §62。
+
 | 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
 | :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
-| **`CQ2`** | `[ ]` | `consolidation_density` 预热期输出 `0.0` 冒充「无盘整」，导致 anchor-2 密度腿把「数据不足」当作否决（并纠正该门的命名与指标绑定） | `common/structural_factors.py:193-195`、`:203`（`compute_rolling_poc_series` 前 `lookback-1 = 59` 根 VAL/VAH 为 NaN）<br>`common/structural_factors.py:637-639`、`:648-662`（`consolidation_density` 把 NaN 有效区判为 `False`，`overlap_ratio` 留 `0.0`；`min_periods=1` 使其从第 0 根就出值）<br>`common/structural_factors.py:1249-1256`（blend 侧 `zd`/`zg` 回落到 `VAL`/`VAH`，而非缠论中枢）<br>`pipeline/research/blend/blend_base.py:1522-1531`（`pd.notna(c_dens) and c_dens < 0.45` —— `pd.notna(0.0)` 为真，预热行被当作「盘整度不足」否决）<br>`pipeline/research/blend/blend_base.py:928-936`（`enable_cyq_quality_gate` / `min_cyq_winner_ratio=0.20` / `0.45` 默认） | 1. **事实与量级**：窗口内 `density == 0.0` 的行中 **81.8%** 落在「距加载帧起点 < 60 根」；`index < 60` 的行 **98.4% 为零**（`VAL` 的 NaN 占比在 `index < 60` 为 98.33%、`index >= 60` 为 0.00%）。剔除预热后：`== 0.0` **7.47%**、`< 0.45` **45.28%**、中位数 **0.513**。<br>2. **阈值从未校准**：`0.45` 原为裸字面量 `0.40`（`docs/version.md` §24 / `C6.1` 仅作参数化对齐），而方案书因子语义表写的是「≥0.50 HVN / <0.30 空心」，`0.45` 卡在两者中间、无分布依据。<br>3. **命名缺陷**：该门被称作「CYQ 质量门 / anchor 2」，但其绑定腿是 Volume-Profile 价值区重叠度；真正的 CYQ 量 `cyq_cost_concentration`（`common/structural_factors.py:960-964`）**不在门内**。文档与代码注释须同步纠正，避免后续把两条腿混为一谈。<br>4. **交付**：让预热期输出 `NaN`（或在门禁侧把 `density == 0.0 且 index < lookback` 识别为「数据不足」并放行），使 `pd.notna` 守卫真正生效；随后重测密度腿的**真实**否决率与阈值分布；并同步修正命名/文档表述。改 `blend_base.py` 判据属 `BaseBlendAllocationStrategy` 变更，须升 `BASE_VERSION`，并按 Rule 7 更新 `pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、`common/tests/test_strategy_versioning.py`、`--dump-strategies` 与 `docs/version.md`。<br>5. **准出门禁**：Rule 9 —— 非预热行必须**零漂移**（逐字节），预热行按设计发生变化且须量化；Rule 10 —— 探针必须是「预热行的 gate 判定从否决变为放行」的**可观测计数**，零差分则 `UNADJUDICATED`，不得当闭环；Rule 11 —— 回测/实盘同源。并参考 `CQ1` 已有结论：N=20 十九折下密度腿经济影响仅 **+0.094（0.6 SE）**，与其 81.8% 的否决占比形成鲜明反差，故本条**不是**为了提升 Sharpe，而是纠正语义与可观测性。 | `common/tests/test_structural_factors.py` 新增「前 `lookback-1` 根为 `NaN` 而非 `0.0`」用例<br>`pipeline/research_strategy/tests/` 新增门禁预热放行用例<br>`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` 同步版本断言 | `M` | 无硬前置；与 `CQ1`（§2.31）结论互补（`CQ1` 测价值，本条修语义），不重复 |
+| **`CQ2`** | `[x]` | `consolidation_density` 预热期输出 `0.0` 冒充「无盘整」，导致 anchor-2 密度腿把「数据不足」当作否决（并纠正该门的命名与指标绑定） | `common/structural_factors.py:193-195`、`:203`（`compute_rolling_poc_series` 前 `lookback-1 = 59` 根 VAL/VAH 为 NaN）<br>`common/structural_factors.py:637-639`、`:648-662`（`consolidation_density` 把 NaN 有效区判为 `False`，`overlap_ratio` 留 `0.0`；`min_periods=1` 使其从第 0 根就出值）<br>`common/structural_factors.py:1249-1256`（blend 侧 `zd`/`zg` 回落到 `VAL`/`VAH`，而非缠论中枢）<br>`pipeline/research/blend/blend_base.py:1522-1531`（`pd.notna(c_dens) and c_dens < 0.45` —— `pd.notna(0.0)` 为真，预热行被当作「盘整度不足」否决）<br>`pipeline/research/blend/blend_base.py:928-936`（`enable_cyq_quality_gate` / `min_cyq_winner_ratio=0.20` / `0.45` 默认） | 1. **事实与量级**：窗口内 `density == 0.0` 的行中 **81.8%** 落在「距加载帧起点 < 60 根」；`index < 60` 的行 **98.4% 为零**（`VAL` 的 NaN 占比在 `index < 60` 为 98.33%、`index >= 60` 为 0.00%）。剔除预热后：`== 0.0` **7.47%**、`< 0.45` **45.28%**、中位数 **0.513**。<br>2. **阈值从未校准**：`0.45` 原为裸字面量 `0.40`（`docs/version.md` §24 / `C6.1` 仅作参数化对齐），而方案书因子语义表写的是「≥0.50 HVN / <0.30 空心」，`0.45` 卡在两者中间、无分布依据。<br>3. **命名缺陷**：该门被称作「CYQ 质量门 / anchor 2」，但其绑定腿是 Volume-Profile 价值区重叠度；真正的 CYQ 量 `cyq_cost_concentration`（`common/structural_factors.py:960-964`）**不在门内**。文档与代码注释须同步纠正，避免后续把两条腿混为一谈。<br>4. **交付**：让预热期输出 `NaN`（或在门禁侧把 `density == 0.0 且 index < lookback` 识别为「数据不足」并放行），使 `pd.notna` 守卫真正生效；随后重测密度腿的**真实**否决率与阈值分布；并同步修正命名/文档表述。改 `blend_base.py` 判据属 `BaseBlendAllocationStrategy` 变更，须升 `BASE_VERSION`，并按 Rule 7 更新 `pipeline/research_strategy/tests/test_blend_strategy_versioning.py`、`common/tests/test_strategy_versioning.py`、`--dump-strategies` 与 `docs/version.md`。<br>5. **准出门禁**：Rule 9 —— 非预热行必须**零漂移**（逐字节），预热行按设计发生变化且须量化；Rule 10 —— 探针必须是「预热行的 gate 判定从否决变为放行」的**可观测计数**，零差分则 `UNADJUDICATED`，不得当闭环；Rule 11 —— 回测/实盘同源。并参考 `CQ1` 已有结论：N=20 十九折下密度腿经济影响仅 **+0.094（0.6 SE）**，与其 81.8% 的否决占比形成鲜明反差，故本条**不是**为了提升 Sharpe，而是纠正语义与可观测性。 | `common/tests/test_structural_factors.py` 新增「前 `lookback-1` 根为 `NaN` 而非 `0.0`」用例<br>`pipeline/research_strategy/tests/` 新增门禁预热放行用例<br>`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` 同步版本断言 | `M` | 无硬前置；与 `CQ1`（§2.31）结论互补（`CQ1` 测价值，本条修语义），不重复 |
 
 ---
 
