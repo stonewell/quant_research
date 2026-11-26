@@ -623,7 +623,7 @@
         state.activeSubLedgers = null;
         if (el.cardFriction) el.cardFriction.style.display = "none";
 
-        el.tbodyOrders.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无调仓指令</td></tr>';
+        el.tbodyOrders.innerHTML = '<tr><td colspan="13" class="text-center text-muted">暂无调仓指令</td></tr>';
         el.ticketSummaryText.textContent = reason || (state.mode === "multi" ? "尚未生成多策略净额调仓指令。请点击上方「2. 净额调仓」按最新行情计算。" : "尚未生成调仓指令。请点击上方「2. 生成指令」按最新行情计算。");
         el.btnDownloadCsv.disabled = true;
     }
@@ -2882,10 +2882,43 @@
         return { key: "HOLD", cls: "badge badge-hold", text: "⚪ HOLD (维持)" };
     }
 
+    // -------------------------------------------------------------------------
+    // WV1 -- weight cells are PASSED THROUGH, never recomputed.
+    //
+    // The ticket artifact already carries three target coordinates per row:
+    // `target_weight` (the delivered/ticket coordinate the engine trades),
+    // `target_weight_model` (the sub-strategy blend's own final target, frozen
+    // before inertia / entry-confirmation-band filtering) and
+    // `target_weight_effective` (the target after those filters). The page only
+    // formats them; it must never re-derive one from another.
+    //
+    // An ABSENT key and a genuine `0.0` are different facts and must look
+    // different: a run that never produced a model coordinate has nothing to
+    // show (`--`), whereas `target_weight_model == 0.0` is the decisive evidence
+    // that the model itself wanted the name gone (the 2026-11-25 `600362.SH`
+    // case -- three positive sleeve shares, yet the blend's final target is 0).
+    function formatWeightPct(value) {
+        if (value === null || value === undefined || value === "") return "--";
+        const num = Number(value);
+        if (!Number.isFinite(num)) return "--";
+        return `${(num * 100).toFixed(1)}%`;
+    }
+
+    function buildWeightPctCell(value, label, extraClass) {
+        const td = document.createElement("td");
+        td.className = "text-right font-mono";
+        if (extraClass) td.classList.add(extraClass);
+        td.setAttribute("data-label", label);
+        const text = formatWeightPct(value);
+        td.textContent = text;
+        if (text === "--") td.classList.add("text-muted");
+        return td;
+    }
+
     function renderTradingTicket(ticketRows) {
         el.tbodyOrders.innerHTML = "";
         if (!ticketRows || ticketRows.length === 0) {
-            el.tbodyOrders.innerHTML = '<tr><td colspan="11" class="text-center text-muted">今日无需执行任何调仓指令</td></tr>';
+            el.tbodyOrders.innerHTML = '<tr><td colspan="13" class="text-center text-muted">今日无需执行任何调仓指令</td></tr>';
             el.ticketSummaryText.textContent = "今日无需调仓 (No trades required).";
             return;
         }
@@ -2942,6 +2975,12 @@
             tdTgtW.className = "text-right font-mono";
             tdTgtW.setAttribute("data-label", "目标仓位");
             tdTgtW.textContent = `${((r.target_weight || 0) * 100).toFixed(1)}%`;
+
+            // WV1: model target (post-blend) then delivered target (post-inertia /
+            // confirmation band), rendered straight from the artifact so the four
+            // weight columns read current -> model -> delivered -> delta.
+            const tdTgtModelW = buildWeightPctCell(r.target_weight_model, "模型目标", "col-weight-model");
+            const tdTgtEffW = buildWeightPctCell(r.target_weight_effective, "交付目标", "col-weight-effective");
 
             const tdDeltaW = document.createElement("td");
             tdDeltaW.className = "text-right font-mono";
@@ -3002,6 +3041,8 @@
             tr.appendChild(tdPrice);
             tr.appendChild(tdCurW);
             tr.appendChild(tdTgtW);
+            tr.appendChild(tdTgtModelW);
+            tr.appendChild(tdTgtEffW);
             tr.appendChild(tdDeltaW);
             tr.appendChild(tdShares);
             tr.appendChild(tdCrossed);
@@ -3390,6 +3431,40 @@
     // -------------------------------------------------------------------------
     // Order Detail & Multi-Dimensional Reason Modal
     // -------------------------------------------------------------------------
+    // WV1 -- the dimension-signal block renders sub-strategy SHARES of the held
+    // book, not direction scores and not cross-sectional ranking. The bare table
+    // (header `模型输出权重`) read as a directional verdict, which is exactly how
+    // the 2026-11-25 `600362.SH` row got misread: three positive shares
+    // (0.2 / 0.1667 / 0.1429) next to a final model target of 0.0.
+    // The caption is display copy only -- every number still comes from
+    // `detail_reason.dimension_signals` untouched.
+    function buildDimensionSignalsHtml(dr) {
+        const dims = (dr || {}).dimension_signals || {};
+        const dimEntries = Object.entries(dims);
+        if (dimEntries.length === 0) {
+            return '<span class="text-muted">单策略单一维度信号</span>';
+        }
+        let dTable = '<div class="dimension-signals-caption">权重份额，非方向信号</div>'
+            + '<div class="dimension-signals-note text-muted">下表百分比是子策略 / 因子维度在这一已持仓组合内部的权重份额（合计 ≈ 100%），不是方向判断，也不是候选池排序分数。</div>'
+            + '<table class="order-detail-table"><thead><tr><th>子策略 / 因子维度</th><th>模型输出权重</th><th>信号倾向</th></tr></thead><tbody>';
+        dimEntries.forEach(([dName, dWeight]) => {
+            const wVal = parseFloat(dWeight) || 0;
+            const pct = (wVal * 100).toFixed(1);
+            if (dName === "macro_breadth_thrust") {
+                const titleHtml = `<code style="color: #38bdf8;">🚀 宏观动量冲力预部署 (Macro Breadth Thrust)</code><div class="text-muted" style="font-size: 11px; margin-top: 2px;">大盘动量冲力 ≥ 60% 时，将闲置资金自动配置于 20日 ROC 强势龙头，杜绝现金拖累。</div>`;
+                const tag = '<span class="badge badge-go">牛市冲力扫单</span>';
+                dTable += `<tr><td>${titleHtml}</td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
+            } else {
+                const tag = wVal > 0.05
+                    ? '<span class="badge badge-go">积极做多</span>'
+                    : (wVal > 0.0 ? '<span class="badge badge-sweep">轻度配置</span>' : '<span class="badge badge-hold">空仓/防守</span>');
+                dTable += `<tr><td><code style="color: #cbd5e1;">${dName}</code></td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
+            }
+        });
+        dTable += '</tbody></table>';
+        return dTable;
+    }
+
     function showOrderDetailModal(ticket) {
         if (!el.modalOrderDetail || !ticket) return;
 
@@ -3427,29 +3502,7 @@
 
         // 4. Dimension Signals
         if (el.modalDimensionSignals) {
-            const dims = dr.dimension_signals || {};
-            const dimEntries = Object.entries(dims);
-            if (dimEntries.length === 0) {
-                el.modalDimensionSignals.innerHTML = '<span class="text-muted">单策略单一维度信号</span>';
-            } else {
-                let dTable = '<table class="order-detail-table"><thead><tr><th>子策略 / 因子维度</th><th>模型输出权重</th><th>信号倾向</th></tr></thead><tbody>';
-                dimEntries.forEach(([dName, dWeight]) => {
-                    const wVal = parseFloat(dWeight) || 0;
-                    const pct = (wVal * 100).toFixed(1);
-                    if (dName === "macro_breadth_thrust") {
-                        const titleHtml = `<code style="color: #38bdf8;">🚀 宏观动量冲力预部署 (Macro Breadth Thrust)</code><div class="text-muted" style="font-size: 11px; margin-top: 2px;">大盘动量冲力 ≥ 60% 时，将闲置资金自动配置于 20日 ROC 强势龙头，杜绝现金拖累。</div>`;
-                        const tag = '<span class="badge badge-go">牛市冲力扫单</span>';
-                        dTable += `<tr><td>${titleHtml}</td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
-                    } else {
-                        const tag = wVal > 0.05
-                            ? '<span class="badge badge-go">积极做多</span>'
-                            : (wVal > 0.0 ? '<span class="badge badge-sweep">轻度配置</span>' : '<span class="badge badge-hold">空仓/防守</span>');
-                        dTable += `<tr><td><code style="color: #cbd5e1;">${dName}</code></td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
-                    }
-                });
-                dTable += '</tbody></table>';
-                el.modalDimensionSignals.innerHTML = dTable;
-            }
+            el.modalDimensionSignals.innerHTML = buildDimensionSignalsHtml(dr);
         }
 
         // 5. Risk Checks & Gating

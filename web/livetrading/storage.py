@@ -1456,7 +1456,14 @@ def parse_ticket_csv(csv_path: str) -> List[Dict[str, Any]]:
                 if is_placeholder_stock_name(name, sym):
                     name = get_stock_name(sym, sym)
                 row["name"] = name
-                for num_key in ("price", "current_weight", "target_weight", "delta_weight", "trade_value", "trade_value_rmb"):
+                for num_key in (
+                    "price", "current_weight", "target_weight", "delta_weight", "trade_value", "trade_value_rmb",
+                    # WV1: the two blend attribution coordinates are emitted next to
+                    # `target_weight` in the artifact. Without them here a CSV-primary read
+                    # (no JSON sibling) leaves them as strings, so the page would render
+                    # string concat instead of the shared percent formatter.
+                    "target_weight_model", "target_weight_effective",
+                ):
                     if num_key in row and row[num_key] != "":
                         try:
                             row[num_key] = float(row[num_key])

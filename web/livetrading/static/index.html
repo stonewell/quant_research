@@ -361,6 +361,11 @@
                                     <th>现价</th>
                                     <th>当前持仓</th>
                                     <th>目标仓位</th>
+                                    <!-- WV1: the two attribution coordinates the artifact already
+                                         carries. Reading order is current -> model target (post-blend)
+                                         -> delivered target (post-inertia/confirmation band) -> delta. -->
+                                    <th>模型目标%</th>
+                                    <th>交付目标%</th>
                                     <th>权重变动</th>
                                     <th>净交易股数</th>
                                     <th>内部对冲</th>
@@ -370,7 +375,7 @@
                             </thead>
                             <tbody id="tbody-orders">
                                 <tr>
-                                    <td colspan="11" class="text-center text-muted">暂无调仓指令</td>
+                                    <td colspan="13" class="text-center text-muted">暂无调仓指令</td>
                                 </tr>
                             </tbody>
                         </table>

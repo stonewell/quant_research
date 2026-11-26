@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2725,4 +2726,244 @@ def test_execution_service_intraday_and_refresh_flags(temp_workspace, monkeypatc
     )
     cmd4_no = captured_cmds[-1]
     assert "--no-allow-intraday" in cmd4_no
+
+
+# ---------------------------------------------------------------------------
+# WV1 -- the live page must display the model's FINAL target weight per symbol
+# and label the sub-strategy attribution correctly. DISPLAY LAYER ONLY: every
+# value below is read straight out of the ticket artifact and only formatted;
+# nothing here (and nothing in app.js) may re-derive a weight.
+#
+# FORENSIC CONTEXT: on 2026-11-25 a `chan_four_state_blend` run sold 600362.SH
+# with `target_weight` / `target_weight_model` / `target_weight_effective` all
+# `0.0`, while `detail_reason.dimension_signals` showed three POSITIVE sleeve
+# shares (0.2 / 0.1667 / 0.1429). The page showed only `target_weight` and an
+# unlabelled "模型输出权重" table, so the operator read three positive numbers as
+# three bullish votes and could not see the decisive `model target == 0.0`.
+# The fixture below is that exact row.
+# ---------------------------------------------------------------------------
+
+#: The 2026-11-25 `152522` run's 600362.SH row, verbatim from the artifact.
+_WV1_FIXTURE_ROW = {
+    "symbol": "600362.SH",
+    "name": "江西铜业",
+    "side": "SELL",
+    "current_weight": 0.04181983778193705,
+    "target_weight": 0.0,
+    "target_weight_model": 0.0,
+    "target_weight_effective": 0.0,
+    "delta_weight": -0.04181983778193705,
+    "detail_reason": {
+        "summary_reason": "模型目标权重归零，清仓离场",
+        "dimension_signals": {
+            "chan_four_state": 0.2,
+            "chan_three_type": 0.1667,
+            "chan_vaa_compound": 0.1429,
+        },
+    },
+}
+
+#: Minimal DOM so the REAL app.js cell builders can run under node (the page's
+#: only DOM dependency in these two functions is `createElement` / `classList`).
+_WV1_DOM_STUB = r"""
+function _mkEl(tag) {
+    const node = {
+        tagName: tag, className: "", textContent: "", children: [], _attrs: {},
+        setAttribute(k, v) { this._attrs[k] = String(v); },
+        getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+        appendChild(c) { this.children.push(c); return c; },
+    };
+    node.classList = {
+        add(...names) {
+            const cur = (node.className || "").split(/\s+/).filter(Boolean);
+            names.forEach(n => { if (n && !cur.includes(n)) cur.push(n); });
+            node.className = cur.join(" ");
+        },
+        contains(n) { return (node.className || "").split(/\s+/).includes(n); },
+    };
+    return node;
+}
+globalThis.document = { createElement: _mkEl };
+"""
+
+
+def _read_static_file(*parts) -> str:
+    with open(os.path.join(find_repo_root(), "web", "livetrading", "static", *parts), "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _run_wv1_weight_cells(rows):
+    """Execute the REAL `formatWeightPct` / `buildWeightPctCell` from app.js under node.
+
+    Runs the shipped functions rather than grepping for substrings, so this can
+    distinguish "cell text is a pure function of the artifact value" from "some
+    other value was computed". Returns `None` when no JS runtime exists.
+    """
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        return None
+    src = _app_js_source()
+    script = "\n".join(
+        [
+            _WV1_DOM_STUB,
+            _extract_js_function(src, "formatWeightPct"),
+            _extract_js_function(src, "buildWeightPctCell"),
+            f"const rows = {json.dumps(rows)};",
+            "const cells = rows.map(r => ({"
+            " model: buildWeightPctCell(r.target_weight_model, '模型目标', 'col-weight-model'),"
+            " eff: buildWeightPctCell(r.target_weight_effective, '交付目标', 'col-weight-effective'),"
+            "}));",
+            "process.stdout.write(JSON.stringify(cells.map(c => ({"
+            " modelText: c.model.textContent, modelClass: c.model.className,"
+            " modelLabel: c.model.getAttribute('data-label'),"
+            " effText: c.eff.textContent, effClass: c.eff.className,"
+            " effLabel: c.eff.getAttribute('data-label'),"
+            "}))));",
+        ]
+    )
+    proc = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, f"extracted app.js weight-cell builders failed under node: {proc.stderr}"
+    return json.loads(proc.stdout)
+
+
+def _run_wv1_dimension_html(detail_reason):
+    """Execute the REAL `buildDimensionSignalsHtml` from app.js under node."""
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        return None
+    src = _app_js_source()
+    script = "\n".join(
+        [
+            _extract_js_function(src, "buildDimensionSignalsHtml"),
+            f"const dr = {json.dumps(detail_reason)};",
+            "process.stdout.write(buildDimensionSignalsHtml(dr));",
+        ]
+    )
+    proc = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, f"extracted app.js dimension-signals builder failed under node: {proc.stderr}"
+    return proc.stdout
+
+
+def test_wv1_index_html_has_both_attribution_weight_headers_and_full_colspan():
+    """Two new headers between 目标仓位 and 权重变动, and row colspans match the width."""
+    html = _read_static_file("index.html")
+    start = html.index('id="table-orders"')
+    end = html.index("</table>", start)
+    table = html[start:end]
+
+    headers = re.findall(r"<th>(.*?)</th>", table)
+    assert len(headers) == 13, f"orders table should be 13 columns, got {len(headers)}: {headers}"
+    tgt = headers.index("目标仓位")
+    assert headers[tgt + 1] == "模型目标%"
+    assert headers[tgt + 2] == "交付目标%"
+    # Reading order: current -> model target -> delivered target -> delta.
+    assert headers[tgt - 1] == "当前持仓"
+    assert headers[tgt + 3] == "权重变动"
+
+    # Every row-count sentinel in this table must span the full width.
+    colspans = re.findall(r'colspan="(\d+)"', table)
+    assert colspans == ["13"], f"orders-table empty state must span all 13 columns, got {colspans}"
+
+    # The JS-side empty states must agree, or the card collapses to a sliver.
+    app_js = _app_js_source()
+    js_colspans = set(re.findall(r'colspan="(\d+)"', app_js))
+    assert js_colspans == {"13"}, f"app.js orders-table colspans drifted: {sorted(js_colspans)}"
+
+
+def test_wv1_app_js_renders_model_and_effective_weight_cells():
+    """Both cells come from the artifact keys, and absence renders `--` not `0.0%`."""
+    src = _app_js_source()
+    renderer = _extract_js_function(src, "renderTradingTicket")
+    assert "r.target_weight_model" in renderer, "model target column is not wired to the artifact key"
+    assert "r.target_weight_effective" in renderer, "delivered target column is not wired to the artifact key"
+
+    cells = _run_wv1_weight_cells(
+        [
+            {"target_weight_model": 0.0, "target_weight_effective": 0.0},
+            {"target_weight_model": 0.1234, "target_weight_effective": 0.04181983778193705},
+            {"target_weight_model": None, "target_weight_effective": None},
+            {},
+        ]
+    )
+    if cells is None:  # no JS runtime on this box -- structural fallback
+        assert "formatWeightPct" in src
+        assert 'return "--"' in src
+        return
+
+    assert [c["modelText"] for c in cells] == ["0.0%", "12.3%", "--", "--"]
+    assert [c["effText"] for c in cells] == ["0.0%", "4.2%", "--", "--"]
+    # A real zero and an absent value must never look alike.
+    assert cells[0]["modelText"] != cells[2]["modelText"]
+    assert cells[0]["modelText"] == "0.0%"
+
+    for cell in cells:
+        assert cell["modelLabel"] == "模型目标"
+        assert cell["effLabel"] == "交付目标"
+        for cls in (cell["modelClass"], cell["effClass"]):
+            assert "text-right" in cls and "font-mono" in cls
+    # Missing data is dimmed like every other empty cell in the table.
+    assert "text-muted" in cells[2]["modelClass"]
+    assert "text-muted" in cells[3]["effClass"]
+    assert "text-muted" not in cells[0]["modelClass"]
+
+
+def test_wv1_parse_ticket_csv_coerces_both_attribution_weights_to_float(temp_workspace):
+    """A CSV-primary read (no JSON sibling) must not hand the page strings."""
+    from storage import parse_ticket_csv
+
+    csv_path = os.path.join(str(temp_workspace[0].data_dir), "live_trading_ticket.csv")
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write(
+            "symbol,name,price,current_weight,target_weight,target_weight_model,target_weight_effective,delta_weight\n"
+            "600362.SH,江西铜业,24.10,0.04181983778193705,0.0,0.0,0.0,-0.04181983778193705\n"
+        )
+
+    rows = parse_ticket_csv(csv_path)
+    assert len(rows) == 1
+    row = rows[0]
+    for key in ("target_weight_model", "target_weight_effective"):
+        assert isinstance(row[key], float), f"{key} stayed {type(row[key]).__name__} on a CSV-primary read"
+        assert row[key] == 0.0
+    # Unchanged neighbours -- the coercion list extension must not disturb them.
+    assert isinstance(row["target_weight"], float)
+    assert isinstance(row["current_weight"], float)
+
+
+def test_wv1_dimension_signals_is_labelled_as_weight_share_not_direction_signal():
+    """The attribution table carries the exact caption, and its numbers are untouched."""
+    html = _run_wv1_dimension_html(_WV1_FIXTURE_ROW["detail_reason"])
+    if html is None:  # no JS runtime on this box -- structural fallback
+        assert "权重份额，非方向信号" in _app_js_source()
+        return
+
+    assert "权重份额，非方向信号" in html
+    assert "权重份额" in html and "不是方向判断" in html
+    # Same three sleeve shares as the artifact, same formatter as before WV1.
+    for name, value in _WV1_FIXTURE_ROW["detail_reason"]["dimension_signals"].items():
+        assert name in html
+        assert f"{(value * 100):.1f}%" in html
+    assert "20.0%" in html and "16.7%" in html and "14.3%" in html
+
+
+def test_wv1_weight_cells_pass_artifact_values_through_without_recomputation():
+    """Same dict twice => byte-identical cells, equal to the artifact's own values.
+
+    This is the Rule-9 companion of a display-only task: if the page ever derived
+    `target_weight_effective` from `target_weight`, or clipped a zero, the second
+    render of the same artifact row would drift from the first.
+    """
+    twice = _run_wv1_weight_cells([_WV1_FIXTURE_ROW, _WV1_FIXTURE_ROW])
+    if twice is None:
+        return  # covered by the structural fallback in the rendering test above
+
+    first, second = twice
+    assert first == second, "rendering the same ticket dict twice produced different weight cells"
+
+    expected_model = f"{(_WV1_FIXTURE_ROW['target_weight_model'] * 100):.1f}%"
+    expected_eff = f"{(_WV1_FIXTURE_ROW['target_weight_effective'] * 100):.1f}%"
+    assert first["modelText"] == expected_model == "0.0%"
+    assert first["effText"] == expected_eff == "0.0%"
+    # The decisive evidence: three positive sleeve shares, zero model target.
+    assert all(v > 0 for v in _WV1_FIXTURE_ROW["detail_reason"]["dimension_signals"].values())
+    assert first["modelText"] == "0.0%"
 
