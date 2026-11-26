@@ -348,6 +348,27 @@ def test_is_range_covered_true_on_weekend_when_bars_reach_friday(mem_cache):
     assert mem_cache.is_range_covered("IncidentProvider", "SHORT", start="2026-10-19", end="2026-10-23", now=saturday) is False
 
 
+def test_is_range_covered_false_on_weekend_when_bars_stop_before_friday(mem_cache):
+    """The weekend rule is "that week's FRIDAY", not "any bar at all".
+
+    2023-12-31 regression: a Sunday `end` used to be skipped entirely by the `weekday() < 5`
+    guard, so a cache whose newest bar was 18 months old counted as covered and the year never
+    backfilled. Bars stopping on Thursday must therefore be stale for a Saturday AND a Sunday end.
+    """
+    df = _make_sample_ohlcv("2026-10-19", periods=4)  # Mon 10-19 .. Thu 10-22
+    _store_bars(mem_cache, "IncidentProvider", "SHORTWK", df, sync_time=datetime.datetime(2026, 10, 25, 9, 0))
+
+    saturday = pd.Timestamp("2026-10-24 09:00:00")
+    sunday = pd.Timestamp("2026-10-25 09:00:00")
+    assert saturday.weekday() == 5 and sunday.weekday() == 6
+    assert mem_cache.is_range_covered("IncidentProvider", "SHORTWK", start="2026-10-19", end="2026-10-24", now=sunday) is False
+    assert mem_cache.is_range_covered("IncidentProvider", "SHORTWK", start="2026-10-19", end="2026-10-25", now=sunday) is False
+    # ...and the Friday bar itself is what satisfies both (no off-by-one into Thursday):
+    friday_df = _make_sample_ohlcv("2026-10-19", periods=5)  # .. Fri 10-23
+    _store_bars(mem_cache, "IncidentProvider", "FRIWK", friday_df, sync_time=datetime.datetime(2026, 10, 25, 9, 0))
+    assert mem_cache.is_range_covered("IncidentProvider", "FRIWK", start="2026-10-19", end="2026-10-25", now=sunday) is True
+
+
 def test_is_range_covered_is_per_symbol_not_per_provider(mem_cache):
     """One short symbol must not contaminate, nor be masked by, a complete sibling symbol
     under the same provider (the incident hit 6 of 20 symbols in one universe)."""

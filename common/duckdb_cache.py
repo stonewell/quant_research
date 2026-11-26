@@ -96,6 +96,18 @@ _HISTORY_REWRITE_RTOL = 1e-9
 IMPLAUSIBLE_ADJUST_FACTOR_RATIO = 4.0
 IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO = 0.25
 
+#: Opt-in read-time cross-source rebase (`AdjustFactorRebaseRefused` explains why it is needed).
+#: DEFAULT OFF, and that is the whole safety story of the change: with the variable unset every
+#: read path behaves exactly as before, so landing this cannot move a single existing price. Read
+#: ONCE per `DuckDBCache` instance (see `__init__`) -- a per-call `os.environ` lookup would let a
+#: process change basis mid-window and would pay a syscall on the 1.23M-bar hot path.
+REBASE_ADJUST_FACTORS_ENV = "QUANT_REBASE_ADJUST_FACTORS"
+
+#: Relative tolerance for "the two rebased segments meet at the seam". Loose enough for one
+#: IEEE double division on each side (the scale is `f_next/f_prev` and is multiplied back), tight
+#: enough that a 1.5x mis-scale -- the defect class this guards -- cannot pass: 1e-6 vs 0.5.
+_REBASE_SEAM_RTOL = 1e-6
+
 #: Intraday interval -> bar length in minutes. This is the single source of both
 #: `_INTRADAY_INTERVALS` (what counts as intraday at all) and `_intraday_bar_interval`
 #: (how much tolerance the L2.26 session-reachability check allows), so the two can
@@ -120,6 +132,101 @@ class MissingAdjustFactorsError(RuntimeError):
         super().__init__(
             msg
             or f"Missing adjustment factors for non-neutral symbol '{symbol}'. Cannot derive adjusted prices from raw bars."
+        )
+
+
+class AdjustFactorRebaseRefused(RuntimeError):
+    """Read-time cross-source rebase could not establish ONE basis for a symbol.
+
+    Raised only when `QUANT_REBASE_ADJUST_FACTORS` is on (default off = legacy behaviour) and a
+    symbol's `adjust_factors` rows come from more than one source, so `qfq`/`hfq` would otherwise
+    multiply a window by two unrelated origins.
+
+    WHY the rebase exists: the table's write path is keyed on `(symbol, date)` and holds a
+    `source` column whose two writers normalise differently (BaoStock accumulates from the IPO,
+    Fuyao anchors near its own window start). `_apply_factors_to_df` applies the as-of row
+    regardless of which source produced it, so a bar window that spans both segments applies
+    `f_BaoStock(t)/f_Fuyao(latest)` -- 37x for `000157.SZ`, 3.5x for `600584.SH`, a verified 26%
+    error for `600362.SH`. The read-time rebase rescales each source into the anchor source's
+    units so the two segments are on ONE basis.
+
+    WHY this refusal exists (fail closed, never guess): the anchor is the pair of NEAREST
+    observations across the seam (the earlier source's last row, the later source's first row at
+    or after it). A shared date cannot exist -- the primary key is `(symbol, date)`, so a date
+    can only ever carry one source -- therefore "the latest date present in both sources" means
+    the least-extrapolation junction, not an identical row. When even that junction cannot be
+    formed (an unusable, non-finite or non-positive anchor value, or a source with no finite
+    value at all), there is no basis to rebase onto, and a hard failure beats a silently
+    rescaled price: the same trade-off `ImplausibleAdjustFactorStep` already made.
+
+    The write gate (`store_adjust_factors`) and `scripts/repair_cross_source_adjust_factors.py`
+    remain the repair paths; this is a read-side guard, not a data-cleaning step.
+    """
+
+    #: Greppable prefix shared by every message (the seam-ratio variant included).
+    PREFIX = "[REFUSED] cross-source adjust-factor rebase"
+
+    #: No usable anchor pair (value missing / non-finite / <= 0).
+    RULE_NO_ANCHOR = "no-anchor"
+    #: The applied per-source multipliers do not meet at the seam (an arithmetic/plumbing bug).
+    RULE_SEAM_MISMATCH = "seam-mismatch"
+
+    def __init__(
+        self,
+        symbol: str,
+        *,
+        rule: str = RULE_NO_ANCHOR,
+        prev_source: Optional[str] = None,
+        next_source: Optional[str] = None,
+        prev_span: Optional[str] = None,
+        next_span: Optional[str] = None,
+        seam_date: Optional[str] = None,
+        prev_value: Optional[float] = None,
+        next_value: Optional[float] = None,
+        ratio: Optional[float] = None,
+    ):
+        self.symbol = symbol
+        self.rule = rule
+        self.prev_source = prev_source
+        self.next_source = next_source
+        self.prev_span = prev_span
+        self.next_span = next_span
+        self.seam_date = seam_date
+        self.prev_value = prev_value
+        self.next_value = next_value
+        self.ratio = ratio
+
+        spans = (
+            f"{prev_source!r} covers {prev_span or '?'}, {next_source!r} covers "
+            f"{next_span or '?'}"
+        )
+        if rule == self.RULE_SEAM_MISMATCH:
+            detail = (
+                f"the rebased factor values do not meet at {seam_date}: "
+                f"{prev_source!r} rebased = {prev_value!r}, {next_source!r} rebased = "
+                f"{next_value!r}, ratio = {ratio!r} (tolerance "
+                f"{_REBASE_SEAM_RTOL:g}, relative)."
+            )
+            advice = (
+                "This is an implementation/plumbing defect (a scale applied to the wrong "
+                "segment, a scale that also reached the divisor, or a one-row as-of slip), not "
+                "a corporate action: a genuine split/bonus/dividend is a single-date monotone "
+                "step inside ONE source's chain, so both rebased sides move together. Unset "
+                "QUANT_REBASE_ADJUST_FACTORS to read the legacy (unrebase) prices."
+            )
+        else:
+            detail = (
+                f"no usable anchor value at the seam between the two sources "
+                f"({spans}); there is no non-positive-or-NaN-free observation pair to scale one "
+                f"onto the other."
+            )
+            advice = (
+                "no overlapping date to anchor the rebase; re-pull one source so both segments "
+                "come from ONE origin, or pass an explicit anchor. Until then this read is "
+                "refused rather than silently rescaled."
+            )
+        super().__init__(
+            f"{self.PREFIX} for {symbol!r} ({rule}): {detail}\n  {advice}"
         )
 
 
@@ -452,6 +559,152 @@ def _source_at(fac_df: pd.DataFrame, position: int) -> Optional[str]:
     except (IndexError, KeyError):  # pragma: no cover - defensive
         return None
     return None if pd.isna(value) else str(value)
+
+
+def _rebase_source_scales(
+    fac_df: pd.DataFrame,
+    symbol: str,
+) -> Optional[Dict[str, Any]]:
+    """Per-source multipliers that put a symbol's `adjust_factors` rows on ONE basis.
+
+    Returns `None` when the symbol has at most one source -- the caller then keeps the legacy
+    path untouched, which is what makes a single-source read bit-identical (no arithmetic is
+    performed on it at all). Otherwise returns::
+
+        {"anchor_source": <source of the symbol's latest row>,
+         "scales": {source_key: multiplier},     # anchor == 1.0 exactly
+         "seams":  [{prev_source, next_source, seam_date, prev_date, next_date,
+                     prev_value, next_value, ratio}]}
+
+    `applied_factor(t) = factor_hfq(t) * scales[source(t)]`.
+
+    HOW THE ANCHOR IS CHOSEN, and why it is NOT "the latest date present in both sources": the
+    table's primary key is `(symbol, date)`, so a single date can only ever carry ONE source and
+    an identical row in both sources is structurally impossible. The observable overlap is
+    therefore the SEAM -- the earlier source's last row and the later source's first row at or
+    after it -- and the rebase is anchored there because that is the least-extrapolation pair
+    available (the design's rule). Every source is chained pairwise onto its chronological
+    successor, so 3+ sources still collapse to one basis; the chain is then renormalised so the
+    source that owns the symbol's LATEST row is exactly 1.0. That normalisation is what keeps the
+    legacy `qfq` anchor (the latest row, `get_latest_factor_hfq`) and the legacy anchor segment
+    bit-identical, and it is why a single-source symbol needs no rebase at all.
+
+    WHAT IT DOES NOT FIX: a corporate action that falls strictly BETWEEN the two seam
+    observations (e.g. a dividend in the 2021-07..2022-01 gap of `000157.SZ`) is invisible to
+    both sides, so it stays unapplied across the seam. That residual is bounded by percent-level
+    single-action sizes, versus the 37x origin error the rebase removes -- and it is the same
+    quantity the legacy path silently assumed away, only now on a consistent basis.
+
+    Raises `AdjustFactorRebaseRefused` when a seam has no usable anchor (a source whose values at
+    the seam are missing/non-finite/non-positive, or a source with no finite value at all).
+    """
+    if fac_df is None or fac_df.empty or "source" not in fac_df.columns:
+        return None
+
+    raw_sources = fac_df["source"]
+    keys = [None if pd.isna(v) else canonicalize_provider_key(v) for v in raw_sources]
+    by_source: Dict[Any, pd.DataFrame] = {}
+    for key, (_, row) in zip(keys, fac_df.iterrows()):
+        by_source.setdefault(key, []).append(row)
+    frames = {
+        k: pd.DataFrame(rows, index=pd.DatetimeIndex([r.name for r in rows])).sort_index()
+        for k, rows in by_source.items()
+    }
+    if len(frames) <= 1:
+        return None
+
+    # Chronological order by each source's FIRST row. Two spellings of one provider collapse to
+    # one key via `canonicalize_provider_key`, the module's single alias definition -- otherwise
+    # `baostock` and `BaoStockDataProvider` would be "two sources" and a same-basis update would
+    # be rebased against itself.
+    order = sorted(frames, key=lambda k: frames[k].index[0])
+
+    raw_scale: Dict[Any, float] = {order[0]: 1.0}
+    seams: List[Dict[str, Any]] = []
+    prev = order[0]
+    for key in order[1:]:
+        prev_frame = frames[prev]
+        next_frame = frames[key]
+        t_prev = prev_frame.index[-1]
+        later = next_frame.index[next_frame.index >= t_prev]
+        # `later` is empty only for a fully interleaved pair (the later source's rows all precede
+        # the earlier source's last row); then the first row is the nearest observation and the
+        # seam is still well defined, just extrapolated backwards.
+        t_next = later[0] if len(later) else next_frame.index[0]
+        f_prev = float(prev_frame["factor_hfq"].loc[t_prev])
+        f_next = float(next_frame["factor_hfq"].loc[t_next])
+        if not (np.isfinite(f_prev) and np.isfinite(f_next) and f_prev > 0 and f_next > 0):
+            raise AdjustFactorRebaseRefused(
+                symbol,
+                rule=AdjustFactorRebaseRefused.RULE_NO_ANCHOR,
+                prev_source=str(prev),
+                next_source=str(key),
+                prev_span=_span_label(prev_frame),
+                next_span=_span_label(next_frame),
+            )
+        ratio = f_prev / f_next
+        raw_scale[key] = raw_scale[prev] * ratio
+        seams.append(
+            {
+                "prev_source": prev,
+                "next_source": key,
+                "seam_date": pd.Timestamp(t_prev).date().isoformat(),
+                "prev_date": t_prev,
+                "next_date": t_next,
+                "f_prev": f_prev,
+                "f_next": f_next,
+            }
+        )
+        prev = key
+
+    # Renormalise so the source owning the LATEST row (the legacy qfq anchor) is exactly 1.0.
+    # A symbol's latest row is the divisor `_apply_factors_to_df` uses, so leaving that segment
+    # untouched is what preserves the existing qfq level and makes the single-source case exact.
+    anchor_source = keys[-1]
+    if anchor_source not in raw_scale:  # pragma: no cover - defensive
+        return None
+    anchor_scale = raw_scale[anchor_source]
+    scales = {k: raw_scale[k] / anchor_scale for k in raw_scale}
+    scales[anchor_source] = 1.0
+
+    # Seam verification. It is an identity of the construction, which is the point: it proves the
+    # multipliers ABOUT TO BE APPLIED meet, so a plumbing bug (scale on the wrong segment, scale
+    # that also reached the divisor, off-by-one as-of row) fails closed instead of rescaling a
+    # price. A genuine corporate action cannot trip it -- it is a single-date monotone step inside
+    # one source's own chain, so both rebased sides move together -- whereas a constant multiple
+    # pasted onto a whole suffix (the defect) does not meet at all.
+    checked: List[Dict[str, Any]] = []
+    for seam in seams:
+        prev_rebased = seam["f_prev"] * scales[seam["prev_source"]]
+        next_rebased = seam["f_next"] * scales[seam["next_source"]]
+        ratio = prev_rebased / next_rebased if next_rebased else float("inf")
+        if not (np.isfinite(ratio) and abs(ratio - 1.0) <= _REBASE_SEAM_RTOL):
+            raise AdjustFactorRebaseRefused(
+                symbol,
+                rule=AdjustFactorRebaseRefused.RULE_SEAM_MISMATCH,
+                prev_source=str(seam["prev_source"]),
+                next_source=str(seam["next_source"]),
+                prev_span=_span_label(frames[seam["prev_source"]]),
+                next_span=_span_label(frames[seam["next_source"]]),
+                seam_date=seam["seam_date"],
+                prev_value=float(prev_rebased),
+                next_value=float(next_rebased),
+                ratio=float(ratio),
+            )
+        checked.append({**seam, "prev_value": float(prev_rebased), "next_value": float(next_rebased), "ratio": float(ratio)})
+
+    return {"anchor_source": anchor_source, "scales": scales, "seams": checked}
+
+
+def _span_label(frame: pd.DataFrame) -> str:
+    """`first..last` of a factor frame, for the refusal messages (`?` when empty)."""
+    if frame is None or frame.empty:
+        return "?"
+    return (
+        pd.Timestamp(frame.index[0]).date().isoformat()
+        + ".."
+        + pd.Timestamp(frame.index[-1]).date().isoformat()
+    )
 
 
 def _day_keys(index: Any) -> np.ndarray:
@@ -1279,6 +1532,14 @@ def _bar_layer_reaches_end(
     if max_bar_date < req_end_date and req_end_date <= current_date:
         if req_end_date.weekday() < 5:
             return False
+        # Weekend end: the requirement is that week's FRIDAY, not "any bar at all". The old
+        # `weekday() < 5` test skipped the check entirely for a Saturday/Sunday `end`, so a
+        # request ending Sunday 2023-12-31 counted as covered while the newest bar was 18 months
+        # old -- that is why 2023 never backfilled. Friday is `weekday() - 4` days back: 1 for a
+        # Saturday, 2 for a Sunday (never `-3`, which lands on Thursday).
+        friday = req_end_date - datetime.timedelta(days=req_end_date.weekday() - 4)
+        if max_bar_date < friday:
+            return False
     if expected_session_deadline is not None and expected_last_session is not None:
         # L2.26 time-of-day rule (intraday only). Lunch break needs no state of its own: the
         # deadline is anchored to the afternoon close, so an 11:30 / 12:00 last bar is hours
@@ -1383,6 +1644,9 @@ class DuckDBCache:
     """
 
     def __init__(self, db_path: Optional[str] = None, read_only: bool = False):
+        # Read ONCE per instance (see `REBASE_ADJUST_FACTORS_ENV`): the cross-source rebase is
+        # opt-in, and with the variable unset every read path below keeps the legacy arithmetic.
+        self._rebase_adjust_factors = _truthy_env(REBASE_ADJUST_FACTORS_ENV)
         if db_path is None or db_path == ":memory:":
             if read_only:
                 raise ValueError("':memory:' caches are per-process scratch state; read_only=False only")
@@ -3307,6 +3571,8 @@ class DuckDBCache:
         divisor: float,
         mode: str,
         bar_index: pd.Index,
+        event_sources: Optional[np.ndarray] = None,
+        anchor_source: Optional[str] = None,
     ) -> None:
         """Second line of defence for D9: refuse an APPLIED factor that cannot belong to its series.
 
@@ -3331,69 +3597,114 @@ class DuckDBCache:
         signal (a monotone step per corporate action) and the defect (a value in a different
         UNIT) differ by orders of magnitude. See `IMPLAUSIBLE_ADJUST_FACTOR_RATIO` for why the
         band is 4x.
+
+        SCOPE WHEN THE CROSS-SOURCE REBASE IS ON (`event_sources` given): the sample is grouped
+        per SOURCE and each group is banded against its OWN median of rebased values. That is the
+        only scope in which 4x still means "a value in the wrong unit": the rebase has already
+        put both origins on one basis, so pooling them would re-create the very mix the band used
+        to (correctly) reject -- and would then reject the rebased read that just fixed the price.
+        Banding "relative to the latest-row anchor" instead would be wrong for the opposite
+        reason: a foreign segment legitimately sits far from that anchor in the pre-rebase units.
+        Single-source symbols pass `event_sources=None` and keep the legacy pooled median, so the
+        legacy answer is bit-identical.
         """
         # Distinct values this read applies. A dict keyed on the VALUE (not the position) makes the
         # sample a set: one factor row typically serves hundreds of bars, and duplicates would
         # bias the median towards the length of their run. Event rows win over the `-1` anchor
         # marker so a poisoned latest row is reported by its own date, not as "the anchor".
-        applied: Dict[float, int] = {}
+        # `groups[source][value] = position`; with no rebase there is exactly one `None` group.
+        groups: Dict[Any, Dict[float, int]] = {}
         for i in np.unique(pos[pos >= 0]):
-            applied.setdefault(float(event_hfq[i]), int(i))
-        if mode == "qfq" and applied and divisor > 0:
-            applied.setdefault(float(divisor), -1)
+            group = None if event_sources is None else event_sources[i]
+            groups.setdefault(group, {}).setdefault(float(event_hfq[i]), int(i))
+        if mode == "qfq" and divisor > 0:
+            group = None if event_sources is None else anchor_source
+            groups.setdefault(group, {}).setdefault(float(divisor), -1)
 
-        if not applied:  # every bar precedes the first factor row -> nothing is applied
-            return
-        values = np.asarray(sorted(applied), dtype=float)
-        sample_positions = [applied[v] for v in values]
-        positive_mask = values > 0
-        if not positive_mask.any():
-            return
-        positive = values[positive_mask]
-        median = float(np.median(positive))
-        if not np.isfinite(median) or median <= 0:
-            return
-        ratio = positive / median
-        bad = np.flatnonzero(
-            (ratio > IMPLAUSIBLE_ADJUST_FACTOR_RATIO)
-            | (ratio < IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO)
-        )
-        if bad.size == 0:
+        if not groups:  # every bar precedes the first factor row -> nothing is applied
             return
 
-        # Report the worst offender, preferring the TOO-LARGE side: the D9 signature is a foreign
-        # basis pasted in, which is always the larger number. When only the small side is out of
-        # band (the whole applied segment sits above one small foreign anchor) that is reported
-        # instead. Either way the operator gets a date they can find in the repair dry-run.
-        pos_positive = np.flatnonzero(positive_mask)
-        bad_ratios = ratio[bad]
-        worst_local = int(
-            bad[int(np.argmax(bad_ratios))] if (bad_ratios > 1).any() else bad[int(np.argmin(bad_ratios))]
-        )
-        worst = pos_positive[worst_local]
-        origin = sample_positions[worst]
+        # Per-group band. The offender reported is the one furthest outside its own group's band
+        # (largest `ratio` when the too-large side is hit, which is the D9 signature; otherwise
+        # the smallest), so a pooled read would have reported the same symbol/date anyway.
+        worst: Optional[Dict[str, Any]] = None
+        fallback: Optional[Dict[str, Any]] = None
+        for group, applied in groups.items():
+            values = np.asarray(sorted(applied), dtype=float)
+            sample_positions = [applied[v] for v in values]
+            positive_mask = values > 0
+            if not positive_mask.any():
+                continue
+            positive = values[positive_mask]
+            median = float(np.median(positive))
+            if not np.isfinite(median) or median <= 0:
+                continue
+            ratio = positive / median
+            bad = np.flatnonzero(
+                (ratio > IMPLAUSIBLE_ADJUST_FACTOR_RATIO)
+                | (ratio < IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO)
+            )
+            if bad.size == 0:
+                continue
+            pos_positive = np.flatnonzero(positive_mask)
+            bad_ratios = ratio[bad]
+            worst_local = int(
+                bad[int(np.argmax(bad_ratios))]
+                if (bad_ratios > 1).any()
+                else bad[int(np.argmin(bad_ratios))]
+            )
+            # `bad` indexes `positive`; `pos_positive` maps that back into `values`.
+            worst_offset = int(pos_positive[worst_local])
+            extreme = float(ratio[worst_local])
+            candidate = {
+                "score": extreme if extreme > 1 else 1.0 / extreme,
+                "value": float(values[worst_offset]),
+                "median": median,
+                "origin": int(sample_positions[worst_offset]),
+                "n_offending": int(bad.size),
+                "n_factors": int(positive.size),
+                "group": group,
+            }
+            if extreme > 1:
+                # The D9 signature is a foreign basis pasted in, which is always the LARGER number,
+                # so a too-large offender always wins over a too-small one -- legacy precedence,
+                # preserved across groups.
+                if worst is None or candidate["score"] > worst["score"]:
+                    worst = candidate
+            elif fallback is None or candidate["score"] > fallback["score"]:
+                fallback = candidate
+        if worst is None:
+            worst = fallback
+        if worst is None:
+            return
+
+        origin = worst["origin"]
         if origin >= 0:
             date = pd.Timestamp(fac_df.index[origin]).date().isoformat()
             source = _source_at(fac_df, origin)
         else:
-            # The anchor is the table's latest row, which may lie AFTER this window's `end`.
-            row = self._get_connection(read_only=True)
-            try:
-                latest = row.execute(
-                    "SELECT date, source FROM adjust_factors WHERE symbol = ? "
-                    "ORDER BY date DESC LIMIT 1",
-                    [symbol],
-                ).fetchone()
-            finally:
-                if not self.is_memory:
-                    row.close()
-            date = (
-                "the qfq anchor"
-                if latest is None
-                else (latest[0] if isinstance(latest[0], str) else latest[0].isoformat())
-                + " (qfq anchor, latest factor row)"
-            )
-            source = None if latest is None else latest[1]
+            # The anchor is the symbol's latest row, which may lie AFTER this window's `end`.
+            if event_sources is not None:
+                date = "the qfq anchor (latest factor row)"
+                source = None if anchor_source is None else anchor_source
+            else:
+                row = self._get_connection(read_only=True)
+                try:
+                    latest = row.execute(
+                        "SELECT date, source FROM adjust_factors WHERE symbol = ? "
+                        "ORDER BY date DESC LIMIT 1",
+                        [symbol],
+                    ).fetchone()
+                finally:
+                    if not self.is_memory:
+                        row.close()
+                date = (
+                    "the qfq anchor"
+                    if latest is None
+                    else (latest[0] if isinstance(latest[0], str) else latest[0].isoformat())
+                    + " (qfq anchor, latest factor row)"
+                )
+                source = None if latest is None else latest[1]
 
         bars = pd.Timestamp(bar_index.min()).date().isoformat() + ".." + pd.Timestamp(
             bar_index.max()
@@ -3401,11 +3712,11 @@ class DuckDBCache:
         raise ImplausibleAdjustFactorStep(
             symbol,
             date,
-            values[worst],
-            median,
+            worst["value"],
+            worst["median"],
             source=source,
-            n_offending=int(bad.size),
-            n_factors=int(positive.size),
+            n_offending=worst["n_offending"],
+            n_factors=worst["n_factors"],
             bar_window=bars,
         )
 
@@ -3560,6 +3871,15 @@ class DuckDBCache:
         - Bars before the first factor date use 1.0.
         - Volume and Amount are NEVER scaled!
 
+        CROSS-SOURCE REBASE (`QUANT_REBASE_ADJUST_FACTORS`, default OFF): when on and the symbol's
+        rows carry MORE THAN ONE `source`, every row first gets
+        `factor_hfq(t) * scale[source(t)]` from `_rebase_source_scales`, so a window that spans a
+        BaoStock prefix and a Fuyao suffix is priced on ONE basis instead of applying
+        `f_BaoStock(t)/f_Fuyao(latest)` (a verified 26% error on `600362.SH`, 37x on
+        `000157.SZ`). The source owning the latest row (the qfq divisor) is scaled by exactly
+        1.0, and a single-source symbol gets no arithmetic at all, so both are bit-identical to
+        the legacy read -- which is why the feature is safe to land default-off.
+
         The as-of lookup is a single `np.searchsorted` over DAY-normalised dates
         (M3.6 review F5): the previous implementation did a Python loop with `bisect` per bar,
         i.e. one million iterations on a 1.23M-bar 5m series, on the hot read path. The
@@ -3588,16 +3908,50 @@ class DuckDBCache:
 
         out = df.copy()
 
-        hfq_latest = self.get_latest_factor_hfq(symbol)
-        if hfq_latest is None:
-            raise MissingAdjustFactorsError(symbol)
-
         max_bar_date = pd.Timestamp(df.index.max()).date().strftime("%Y-%m-%d")
-        fac_df = self.query_adjust_factors(symbol, end=max_bar_date)
-        if fac_df.empty:
-            raise MissingAdjustFactorsError(symbol)
+        event_sources: Optional[np.ndarray] = None
+        rebase: Optional[Dict[str, Any]] = None
+        if self._rebase_adjust_factors:
+            # Opt-in: ONE full-table read replaces the legacy (latest-row + truncated-window) pair,
+            # so the rebase sees every source and the divisor is still the same latest row.
+            fac_full = self.query_adjust_factors(symbol)
+            if fac_full.empty:
+                raise MissingAdjustFactorsError(symbol)
+            hfq_latest = float(fac_full["factor_hfq"].values[-1])
+            rebase = _rebase_source_scales(fac_full, symbol)
+            fac_df = fac_full.loc[fac_full.index <= pd.Timestamp(max_bar_date)]
+            if fac_df.empty:
+                raise MissingAdjustFactorsError(symbol)
+            event_hfq = fac_df["factor_hfq"].values.astype(float)
+            if rebase is not None:
+                source_keys = [
+                    None if pd.isna(v) else canonicalize_provider_key(v)
+                    for v in fac_df["source"]
+                ]
+                event_sources = np.asarray(source_keys, dtype=object)
+                event_hfq = event_hfq * np.asarray(
+                    [rebase["scales"][k] for k in source_keys], dtype=float
+                )
+                if rebase["seams"]:
+                    logger.info(
+                        "Cross-source adjust-factor rebase for %s: anchor=%r, seam ratio(s) %s",
+                        symbol,
+                        rebase["anchor_source"],
+                        ", ".join(
+                            f"{s['prev_source']}->{s['next_source']}@{s['seam_date']}="
+                            f"{s['ratio']:.9f}"
+                            for s in rebase["seams"]
+                        ),
+                    )
+        else:
+            hfq_latest = self.get_latest_factor_hfq(symbol)
+            if hfq_latest is None:
+                raise MissingAdjustFactorsError(symbol)
+            fac_df = self.query_adjust_factors(symbol, end=max_bar_date)
+            if fac_df.empty:
+                raise MissingAdjustFactorsError(symbol)
+            event_hfq = fac_df["factor_hfq"].values.astype(float)
 
-        event_hfq = fac_df["factor_hfq"].values.astype(float)
         event_days = _day_keys(fac_df.index)
         bar_days = _day_keys(out.index)
 
@@ -3611,8 +3965,20 @@ class DuckDBCache:
         # foreign-basis prefix the requested window never touches. Banding the raw array turned
         # every 2024+ read of `600660.SH` into `ImplausibleAdjustFactorStep` even though the
         # prices being scaled were all dense-basis -- a wrong error replacing a wrong price.
+        # With the rebase on, `event_hfq` is already per-source rescaled and `event_sources`
+        # groups the band per SOURCE (relative to that source's own anchor), which is the only
+        # scope in which the 4x test still means "a value in the wrong UNIT" rather than "two
+        # origins in one window" -- the defect the rebase just removed.
         self._assert_plausible_adjust_factors(
-            symbol, fac_df, event_hfq, pos, divisor, mode, out.index
+            symbol,
+            fac_df,
+            event_hfq,
+            pos,
+            divisor,
+            mode,
+            out.index,
+            event_sources,
+            None if rebase is None else rebase["anchor_source"],
         )
 
         if mode == "hfq":

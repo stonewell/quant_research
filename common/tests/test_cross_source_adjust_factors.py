@@ -31,6 +31,9 @@ from common.duckdb_cache import (
     MissingAdjustFactorsError,
     ImplausibleAdjustFactorStep,
     IMPLAUSIBLE_ADJUST_FACTOR_RATIO,
+    AdjustFactorRebaseRefused,
+    REBASE_ADJUST_FACTORS_ENV,
+    _rebase_source_scales,
 )
 
 DENSE_SOURCE = "FuyaoDataProvider"
@@ -948,3 +951,363 @@ def _md5(path) -> str:
     with open(path, "rb") as handle:
         digest.update(handle.read())
     return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# (8) READ-TIME CROSS-SOURCE REBASE (`QUANT_REBASE_ADJUST_FACTORS`, default OFF)
+# ---------------------------------------------------------------------------
+#
+# WHY: `_apply_factors_to_df` applies whatever as-of row the as-of lookup lands on, and the
+# table's sources normalise differently (BaoStock accumulates from the IPO, Fuyao anchors near
+# its own window start). A bar window spanning both segments therefore applies
+# `f_BaoStock(t)/f_Fuyao(latest)` -- a verified 26% error on `600362.SH`, 3.5x on `600584.SH`,
+# 37x on `000157.SZ`. The flag rescales each source into the anchor source's units, so the two
+# segments sit on ONE basis; with the flag OFF every read keeps the legacy arithmetic bit for bit.
+#
+# The anchor is the SEAM -- the earlier source's last row and the later source's first row at or
+# after it -- because the table's primary key is `(symbol, date)`: a date can carry only ONE
+# source, so an identical row in both sources cannot exist. See `_rebase_source_scales`.
+
+
+_REBASE_A_LAST = 1.32417
+_REBASE_B_FIRST = 1.04639
+_REBASE_B_LAST = 1.20089
+_REBASE_START = "2020-12-01"
+_REBASE_END = "2022-06-30"
+
+
+def _rebase_bars(dates, close: float = 100.0) -> pd.DataFrame:
+    n = len(dates)
+    return pd.DataFrame(
+        {
+            "Open": [close] * n,
+            "High": [close + 1.0] * n,
+            "Low": [close - 1.0] * n,
+            "Close": [close] * n,
+            "Volume": [1000.0] * n,
+        },
+        index=pd.DatetimeIndex(dates),
+    )
+
+
+def _seed_rebase_fixture(
+    cache,
+    symbol: str = "600362.RB",
+    provider: str = "RebaseProv",
+    a_last: float = _REBASE_A_LAST,
+    b_first: float = _REBASE_B_FIRST,
+    b_last: float = _REBASE_B_LAST,
+):
+    """BaoStock-like sparse prefix (1.0 -> `a_last`) then Fuyao-like dense suffix."""
+    dates = pd.bdate_range(_REBASE_START, _REBASE_END)
+    cache.store_bars(provider, symbol, _rebase_bars(dates), adjustflag="raw")
+    a_dates = pd.to_datetime([_REBASE_START, "2021-07-20"])
+    cache.store_adjust_factors(
+        symbol, pd.DataFrame({"factor_hfq": [1.0, a_last]}, index=a_dates), source=SPARSE_SOURCE
+    )
+    b_dates = pd.bdate_range("2022-01-04", _REBASE_END)
+    b_vals = np.linspace(b_first, b_last, len(b_dates))
+    # The write gate refuses a source switch past the frontier by default (D9); the read-time
+    # rebase is precisely the opt-in that makes such a table readable, so seed with the hatch.
+    cache.store_adjust_factors(
+        symbol,
+        pd.DataFrame({"factor_hfq": b_vals}, index=b_dates),
+        source=DENSE_SOURCE,
+        allow_cross_source=True,
+    )
+    return dates, b_dates, b_vals
+
+
+def _qfq_multipliers(cache, provider: str, symbol: str) -> pd.Series:
+    """`qfq/raw` per bar -- the applied factor, independent of the price level."""
+    raw = cache.query_bars(provider, symbol, adjust="raw")
+    qfq = cache.query_bars(provider, symbol, adjust="qfq")
+    return (qfq["Close"] / raw["Close"]).dropna()
+
+
+def test_rebase_qfq_matches_hand_computed_prices(monkeypatch):
+    """A two-source window is priced with ONE basis, and the arithmetic is hand-checkable."""
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    cache = DuckDBCache(db_path=":memory:")
+    _seed_rebase_fixture(cache)
+
+    out = cache.query_bars("RebaseProv", "600362.RB", adjust="qfq")
+    # The anchor segment divides by its own latest row, so the last bar's multiplier is exactly
+    # 1.0 (not "approximately"): qfq == raw there, which is the qfq definition.
+    assert float(out["Close"].iloc[-1]) == 100.0
+    # Volume is never scaled.
+    assert (out["Volume"] == 1000.0).all()
+
+    # Prefix rows: f_A * scale_A / divisor, scale_A = f_B(first) / f_A(last) (the seam anchor:
+    # exactly one A unit at the seam equals one B unit there), divisor = f_B(last). This is the
+    # ONLY basis on which 2020-12 and 2022-06 prices agree.
+    scale_a = _REBASE_B_FIRST / _REBASE_A_LAST
+    expected_prefix = 100.0 * (_REBASE_A_LAST * scale_a) / _REBASE_B_LAST
+    assert float(out.loc["2021-07-20", "Close"]) == pytest.approx(expected_prefix, rel=1e-12)
+    assert expected_prefix == pytest.approx(100.0 * _REBASE_B_FIRST / _REBASE_B_LAST, rel=1e-12)
+    # The row before the first rebalance-date event carries the 1.0 listing factor.
+    expected_first = 100.0 * (1.0 * scale_a) / _REBASE_B_LAST
+    assert float(out.loc["2020-12-02", "Close"]) == pytest.approx(expected_first, rel=1e-12)
+
+    # ...and the suffix's own level: 100 * f_B(t)/f_B(last), no prefix scale at all.
+    first_b = pd.Timestamp("2022-01-04")
+    expected_suffix = 100.0 * _REBASE_B_FIRST / _REBASE_B_LAST
+    assert float(out.loc[first_b, "Close"]) == pytest.approx(expected_suffix, rel=1e-12)
+
+
+def test_rebase_seam_ratio_is_one_and_a_wrong_anchor_is_detectable(monkeypatch):
+    """DISCRIMINATING: the seam metric reads 1.0 after the rebase and >1.5x without it.
+
+    This is what makes the seam check meaningful: the same probe, evaluated on the legacy
+    (unrebased) applied multiplier, shows the origin error, so a future "rebase" that silently
+    stops rescaling cannot pass.
+    """
+    a_last, b_first = 1.97131, 1.26662  # 601398.SH's real pair -> 1.5564x
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    on = DuckDBCache(db_path=":memory:")
+    _seed_rebase_fixture(on, a_last=a_last, b_first=b_first)
+
+    plan = _rebase_source_scales(on.query_adjust_factors("600362.RB"), "600362.RB")
+    seam = plan["seams"][0]
+    assert seam["ratio"] == pytest.approx(1.0, rel=1e-12, abs=0)
+    assert seam["prev_value"] == pytest.approx(seam["next_value"], rel=1e-12)
+    assert plan["anchor_source"] == "fuyao"
+    assert plan["scales"]["fuyao"] == 1.0  # the divisor's own segment is untouched, exactly
+
+    seam_date = pd.Timestamp("2022-01-04")
+    mult_on = _qfq_multipliers(on, "RebaseProv", "600362.RB")
+    ratio_on = float(mult_on.loc[: seam_date - pd.Timedelta(days=1)].iloc[-1]) / float(
+        mult_on.loc[seam_date:].iloc[0]
+    )
+    assert ratio_on == pytest.approx(1.0, rel=1e-12)
+
+    # Deliberately WRONG anchor: the prefix left unscaled. Same probe, 1.5564x.
+    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV)
+    off = DuckDBCache(db_path=":memory:")
+    _seed_rebase_fixture(off, a_last=a_last, b_first=b_first)
+    mult_off = _qfq_multipliers(off, "RebaseProv", "600362.RB")
+    ratio_off = float(mult_off.loc[: seam_date - pd.Timedelta(days=1)].iloc[-1]) / float(
+        mult_off.loc[seam_date:].iloc[0]
+    )
+    assert ratio_off == pytest.approx(a_last / b_first, rel=1e-9)
+    assert ratio_off > 1.5
+    # The seam probe is what distinguishes the two runs; the prices differ by exactly that factor.
+    assert ratio_off / ratio_on == pytest.approx(a_last / b_first, rel=1e-9)
+
+
+def test_prefix_suffix_sources_anchor_at_the_junction(monkeypatch):
+    """No shared date is POSSIBLE (PK `(symbol, date)`), so the seam itself is the anchor.
+
+    A prefix/suffix pair with a gap is chained at the junction -- the earlier source's last row
+    and the later source's first row at or after it -- which is the least-extrapolation pair
+    available. Documented here because it is the branch that makes the 19 dual-source symbols in
+    the real cache readable at all: NONE of them has a shared date, only a gap.
+    """
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    cache = DuckDBCache(db_path=":memory:")
+    _, b_dates, _ = _seed_rebase_fixture(cache)
+
+    fac = cache.query_adjust_factors("600362.RB")
+    assert (
+        fac.loc[fac["source"] == SPARSE_SOURCE].index.intersection(b_dates).size == 0
+    ), "the fixture must not rely on a shared date -- one cannot exist for a real cache either"
+
+    plan = _rebase_source_scales(fac, "600362.RB")
+    seam = plan["seams"][0]
+    assert seam["prev_source"] == "baostock" and seam["next_source"] == "fuyao"
+    assert seam["seam_date"] == "2021-07-20"  # the prefix's last row
+    assert pd.Timestamp(seam["next_date"]) == b_dates[0]  # the suffix's first row at/after it
+    assert seam["ratio"] == pytest.approx(1.0, rel=1e-12, abs=0)
+
+
+def test_rebase_fails_closed_when_no_anchor_pair_is_usable(monkeypatch):
+    """A seam with no usable value refuses the read, naming symbol/sources/spans and the fix."""
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    cache = DuckDBCache(db_path=":memory:")
+    dates = pd.bdate_range(_REBASE_START, _REBASE_END)
+    cache.store_bars("RebaseProv", "600362.NO", _rebase_bars(dates), adjustflag="raw")
+    cache.store_adjust_factors(
+        "600362.NO",
+        pd.DataFrame({"factor_hfq": [1.0, 1.3]}, index=pd.to_datetime([_REBASE_START, "2021-07-20"])),
+        source=SPARSE_SOURCE,
+    )
+    # The later source's anchor row is unusable (0.0): there is no pair to scale onto, and a
+    # second origin would have to be guessed. Fail closed rather than rescale prices by a guess.
+    cache.store_adjust_factors(
+        "600362.NO",
+        pd.DataFrame(
+            {"factor_hfq": [0.0, 1.1]},
+            index=pd.to_datetime(["2022-01-04", "2022-01-05"]),
+        ),
+        source=DENSE_SOURCE,
+        allow_cross_source=True,
+    )
+
+    with pytest.raises(AdjustFactorRebaseRefused) as excinfo:
+        cache.query_bars("RebaseProv", "600362.NO", adjust="qfq")
+    err = excinfo.value
+    assert str(err).startswith(AdjustFactorRebaseRefused.PREFIX)
+    assert err.rule == AdjustFactorRebaseRefused.RULE_NO_ANCHOR
+    text = str(err)
+    assert "600362.NO" in text
+    assert "baostock" in text and "fuyao" in text          # both sources named
+    assert "2020-12-01..2021-07-20" in text                # both spans named
+    assert "2022-01-04..2022-01-05" in text
+    assert "no overlapping date to anchor the rebase" in text
+
+    # Flag OFF keeps the legacy behaviour on the very same rows: no refusal, legacy prices.
+    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV)
+    legacy = DuckDBCache(db_path=":memory:")
+    legacy.store_bars("RebaseProv", "600362.NO", _rebase_bars(dates), adjustflag="raw")
+    legacy.store_adjust_factors(
+        "600362.NO",
+        pd.DataFrame({"factor_hfq": [1.0, 1.3]}, index=pd.to_datetime([_REBASE_START, "2021-07-20"])),
+        source=SPARSE_SOURCE,
+    )
+    legacy.store_adjust_factors(
+        "600362.NO",
+        pd.DataFrame(
+            {"factor_hfq": [0.0, 1.1]},
+            index=pd.to_datetime(["2022-01-04", "2022-01-05"]),
+        ),
+        source=DENSE_SOURCE,
+        allow_cross_source=True,
+    )
+    assert legacy.query_bars("RebaseProv", "600362.NO", adjust="qfq") is not None
+
+
+@pytest.mark.parametrize("symbol,close", [("600519.ONE", 42.0), ("600036.ONE", 7.5)])
+def test_single_source_synthetic_read_is_bit_identical_with_the_flag_on(symbol, close, tmp_path, monkeypatch):
+    """One source => the rebase is a no-op: no arithmetic is performed, so `df.equals` holds."""
+    db_path = str(tmp_path / f"rebase_single_{symbol.replace('.', '_')}.duckdb")
+    dates = pd.bdate_range("2024-01-02", "2024-06-28")
+    vals = np.linspace(1.0, 1.4, len(dates))
+
+    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV, raising=False)
+    builder = DuckDBCache(db_path=db_path)
+    builder.store_bars("RebaseProv", symbol, _rebase_bars(dates, close=close), adjustflag="raw")
+    builder.store_adjust_factors(
+        symbol, pd.DataFrame({"factor_hfq": vals}, index=dates), source=DENSE_SOURCE
+    )
+    off = builder.query_bars("RebaseProv", symbol, adjust="qfq")
+
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    on = DuckDBCache(db_path=db_path, read_only=True).query_bars("RebaseProv", symbol, adjust="qfq")
+    assert on.equals(off)
+    max_rel = float(((on - off).abs() / off.abs()).max().max())
+    print(f"[rebase] {symbol} (synthetic single-source) max relative price diff = {max_rel!r}")
+    assert max_rel == 0.0
+
+
+#: The production cache. Tests below are READ-ONLY (`read_only=True` is never blocked by the
+#: pytest production-path net) and skip cleanly when it is absent or write-locked, so the suite
+#: stays 100% offline and never touches stored data.
+_REAL_CACHE = os.path.join(_REPO_ROOT, "data", "cache.duckdb")
+
+
+def _real_cache_or_skip():
+    if not os.path.exists(_REAL_CACHE):
+        pytest.skip(f"production cache absent ({_REAL_CACHE}); real-cache drift check skipped")
+    try:
+        return DuckDBCache(_REAL_CACHE, read_only=True)
+    except Exception as exc:  # locked by a concurrent sync, or unreadable
+        pytest.skip(f"production cache not readable right now ({type(exc).__name__}: {exc})")
+
+
+def _single_source_symbol(cache):
+    con = cache._get_connection(read_only=True)
+    try:
+        row = con.execute(
+            "SELECT a.symbol, b.provider FROM "
+            "(SELECT symbol FROM adjust_factors GROUP BY symbol HAVING count(DISTINCT source) = 1) a "
+            "JOIN (SELECT symbol, provider, count(*) n FROM ohlcv_bars GROUP BY symbol, provider) b "
+            "ON b.symbol = a.symbol AND b.n > 200 "
+            "ORDER BY a.symbol, b.n DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        if not cache.is_memory:
+            con.close()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def test_real_single_source_symbol_read_is_unchanged_by_the_flag(monkeypatch):
+    """REQUIRED: flag OFF vs ON on a real single-source symbol must agree EXACTLY (`df.equals`)."""
+    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV, raising=False)
+    off_cache = _real_cache_or_skip()
+    symbol, provider = _single_source_symbol(off_cache)
+    if symbol is None:
+        pytest.skip("no single-source symbol with bars in the production cache")
+    try:
+        off = off_cache.query_bars(provider, symbol, adjust="qfq")
+    except ImplausibleAdjustFactorStep as exc:  # pragma: no cover - data drift
+        pytest.skip(f"{symbol} is no longer readable in legacy mode: {exc}")
+
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    on_cache = _real_cache_or_skip()
+    assert on_cache._rebase_adjust_factors is True and off_cache._rebase_adjust_factors is False
+    on = on_cache.query_bars(provider, symbol, adjust="qfq")
+
+    assert on.equals(off), f"single-source read changed under the rebase flag for {symbol}"
+    max_rel = float(((on - off).abs() / off.abs()).max().max())
+    print(f"[rebase] {symbol} ({provider}) single-source max relative price diff = {max_rel!r}")
+    assert max_rel == 0.0
+
+
+@pytest.mark.parametrize("symbol", ["601872.SH", "601288.SH", "601225.SH", "601919.SH"])
+def test_real_mixed_symbol_seam_ratio_before_and_after_the_rebase(symbol, monkeypatch):
+    """REQUIRED: the four dual-source symbols stop tripping the band, and their seam meets at 1.0."""
+    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV, raising=False)
+    off_cache = _real_cache_or_skip()
+    try:
+        fac = off_cache.query_adjust_factors(symbol)
+    except Exception as exc:  # pragma: no cover - data drift
+        pytest.skip(f"adjust_factors unreadable for {symbol}: {exc}")
+    if fac.empty or fac["source"].nunique() < 2:
+        pytest.skip(f"{symbol} no longer carries two sources in this cache")
+
+    plan = _rebase_source_scales(fac, symbol)
+    seam = plan["seams"][0]
+    seam_date = pd.Timestamp(seam["next_date"]).normalize()
+    legacy_factor_ratio = seam["f_prev"] / seam["f_next"]
+
+    con = off_cache._get_connection(read_only=True)
+    try:
+        provider = con.execute(
+            "SELECT provider FROM ohlcv_bars WHERE symbol = ? GROUP BY provider "
+            "ORDER BY count(*) DESC LIMIT 1",
+            [symbol],
+        ).fetchone()[0]
+    finally:
+        if not off_cache.is_memory:
+            con.close()
+
+    # Flag OFF: the applied multiplier jumps at the seam by the two origins' ratio.
+    try:
+        mult_off = _qfq_multipliers(off_cache, provider, symbol)
+        legacy_price_ratio = float(
+            mult_off.loc[: seam_date - pd.Timedelta(days=1)].iloc[-1] / mult_off.loc[seam_date:].iloc[0]
+        )
+    except ImplausibleAdjustFactorStep:
+        legacy_price_ratio = float("nan")  # the documented residual (b) fail-closed read
+
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    on_cache = _real_cache_or_skip()
+    try:
+        # REQUIRED: no ImplausibleAdjustFactorStep on the rebased read.
+        on = on_cache.query_bars(provider, symbol, adjust="qfq")
+    except ImplausibleAdjustFactorStep as exc:  # pragma: no cover - would be the regression
+        pytest.fail(f"rebase did not rescue {symbol}: {exc}")
+    assert not on.empty
+
+    mult_on = _qfq_multipliers(on_cache, provider, symbol)
+    rebased_ratio = float(
+        mult_on.loc[: seam_date - pd.Timedelta(days=1)].iloc[-1] / mult_on.loc[seam_date:].iloc[0]
+    )
+    print(
+        f"[rebase] {symbol} seam@{seam_date.date()}: legacy applied ratio="
+        f"{legacy_price_ratio:.6f} (factor-level {legacy_factor_ratio:.6f}) -> rebased="
+        f"{rebased_ratio:.9f}, baostock scale={plan['scales']['baostock']:.6f}"
+    )
+    assert rebased_ratio == pytest.approx(1.0, rel=1e-9)
+    assert seam["ratio"] == pytest.approx(1.0, rel=1e-12, abs=0)
+
