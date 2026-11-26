@@ -369,6 +369,29 @@ def test_is_range_covered_false_on_weekend_when_bars_stop_before_friday(mem_cach
     assert mem_cache.is_range_covered("IncidentProvider", "FRIWK", start="2026-10-19", end="2026-10-25", now=sunday) is True
 
 
+def test_is_range_covered_true_on_holiday_friday_weekend_cn(mem_cache):
+    """When end is Sunday 2024-10-06 during National Day holiday, Friday 2024-10-04 is a holiday.
+    Bars through 2024-09-30 (the last trading session) must count as covered.
+    """
+    provider = "BaoStockDataProvider"
+    symbol = "600519.SH"
+    df = _make_daily_ohlcv("2024-09-02", "2024-09-30")
+    _store_bars(mem_cache, provider, symbol, df, sync_time=datetime.datetime(2024, 10, 6, 12, 0))
+
+    # 1. expected_last_session=None
+    assert mem_cache.is_range_covered(
+        provider, symbol, start="2024-09-02", end="2024-10-06",
+        now=pd.Timestamp("2024-10-06 12:00:00"),
+    ) is True
+
+    # 2. expected_last_session=datetime.date(2024, 9, 30)
+    assert mem_cache.is_range_covered(
+        provider, symbol, start="2024-09-02", end="2024-10-06",
+        now=pd.Timestamp("2024-10-06 12:00:00"),
+        expected_last_session=datetime.date(2024, 9, 30),
+    ) is True
+
+
 def test_is_range_covered_is_per_symbol_not_per_provider(mem_cache):
     """One short symbol must not contaminate, nor be masked by, a complete sibling symbol
     under the same provider (the incident hit 6 of 20 symbols in one universe)."""

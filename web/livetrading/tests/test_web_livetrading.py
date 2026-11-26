@@ -2810,14 +2810,17 @@ def _run_wv1_weight_cells(rows):
             _extract_js_function(src, "buildWeightPctCell"),
             f"const rows = {json.dumps(rows)};",
             "const cells = rows.map(r => ({"
-            " model: buildWeightPctCell(r.target_weight_model, '模型目标', 'col-weight-model'),"
-            " eff: buildWeightPctCell(r.target_weight_effective, '交付目标', 'col-weight-effective'),"
+            " model: buildWeightPctCell(r.target_weight_model, '生命周期后目标(取整前)', 'col-weight-model'),"
+            " eff: buildWeightPctCell(r.target_weight_effective, '交付权重(取整后)', 'col-weight-effective'),"
+            " tgt: buildWeightPctCell(r.target_weight, '目标仓位'),"
             "}));",
             "process.stdout.write(JSON.stringify(cells.map(c => ({"
             " modelText: c.model.textContent, modelClass: c.model.className,"
             " modelLabel: c.model.getAttribute('data-label'),"
             " effText: c.eff.textContent, effClass: c.eff.className,"
             " effLabel: c.eff.getAttribute('data-label'),"
+            " tgtText: c.tgt.textContent, tgtClass: c.tgt.className,"
+            " tgtLabel: c.tgt.getAttribute('data-label'),"
             "}))));",
         ]
     )
@@ -2834,6 +2837,7 @@ def _run_wv1_dimension_html(detail_reason):
     src = _app_js_source()
     script = "\n".join(
         [
+            _extract_js_function(src, "escapeHtml"),
             _extract_js_function(src, "buildDimensionSignalsHtml"),
             f"const dr = {json.dumps(detail_reason)};",
             "process.stdout.write(buildDimensionSignalsHtml(dr));",
@@ -2851,11 +2855,11 @@ def test_wv1_index_html_has_both_attribution_weight_headers_and_full_colspan():
     end = html.index("</table>", start)
     table = html[start:end]
 
-    headers = re.findall(r"<th>(.*?)</th>", table)
+    headers = [re.sub(r'<[^>]+>', '', h) for h in re.findall(r"<th[^>]*>(.*?)</th>", table)]
     assert len(headers) == 13, f"orders table should be 13 columns, got {len(headers)}: {headers}"
     tgt = headers.index("目标仓位")
-    assert headers[tgt + 1] == "模型目标%"
-    assert headers[tgt + 2] == "交付目标%"
+    assert headers[tgt + 1] == "生命周期后目标(取整前)"
+    assert headers[tgt + 2] == "交付权重(取整后)"
     # Reading order: current -> model target -> delivered target -> delta.
     assert headers[tgt - 1] == "当前持仓"
     assert headers[tgt + 3] == "权重变动"
@@ -2876,12 +2880,13 @@ def test_wv1_app_js_renders_model_and_effective_weight_cells():
     renderer = _extract_js_function(src, "renderTradingTicket")
     assert "r.target_weight_model" in renderer, "model target column is not wired to the artifact key"
     assert "r.target_weight_effective" in renderer, "delivered target column is not wired to the artifact key"
+    assert "buildWeightPctCell(r.target_weight" in renderer, "target_weight is not using buildWeightPctCell"
 
     cells = _run_wv1_weight_cells(
         [
-            {"target_weight_model": 0.0, "target_weight_effective": 0.0},
-            {"target_weight_model": 0.1234, "target_weight_effective": 0.04181983778193705},
-            {"target_weight_model": None, "target_weight_effective": None},
+            {"target_weight_model": 0.0, "target_weight_effective": 0.0, "target_weight": 0.0},
+            {"target_weight_model": 0.1234, "target_weight_effective": 0.04181983778193705, "target_weight": 0.04},
+            {"target_weight_model": None, "target_weight_effective": None, "target_weight": None},
             {},
         ]
     )
@@ -2892,19 +2897,25 @@ def test_wv1_app_js_renders_model_and_effective_weight_cells():
 
     assert [c["modelText"] for c in cells] == ["0.0%", "12.3%", "--", "--"]
     assert [c["effText"] for c in cells] == ["0.0%", "4.2%", "--", "--"]
+    assert [c["tgtText"] for c in cells] == ["0.0%", "4.0%", "--", "--"]
     # A real zero and an absent value must never look alike.
     assert cells[0]["modelText"] != cells[2]["modelText"]
     assert cells[0]["modelText"] == "0.0%"
+    assert cells[0]["tgtText"] == "0.0%"
+    assert cells[2]["tgtText"] == "--"
 
     for cell in cells:
-        assert cell["modelLabel"] == "模型目标"
-        assert cell["effLabel"] == "交付目标"
-        for cls in (cell["modelClass"], cell["effClass"]):
+        assert cell["modelLabel"] == "生命周期后目标(取整前)"
+        assert cell["effLabel"] == "交付权重(取整后)"
+        assert cell["tgtLabel"] == "目标仓位"
+        for cls in (cell["modelClass"], cell["effClass"], cell["tgtClass"]):
             assert "text-right" in cls and "font-mono" in cls
     # Missing data is dimmed like every other empty cell in the table.
     assert "text-muted" in cells[2]["modelClass"]
     assert "text-muted" in cells[3]["effClass"]
+    assert "text-muted" in cells[2]["tgtClass"]
     assert "text-muted" not in cells[0]["modelClass"]
+    assert "text-muted" not in cells[0]["tgtClass"]
 
 
 def test_wv1_parse_ticket_csv_coerces_both_attribution_weights_to_float(temp_workspace):
@@ -2933,16 +2944,41 @@ def test_wv1_dimension_signals_is_labelled_as_weight_share_not_direction_signal(
     """The attribution table carries the exact caption, and its numbers are untouched."""
     html = _run_wv1_dimension_html(_WV1_FIXTURE_ROW["detail_reason"])
     if html is None:  # no JS runtime on this box -- structural fallback
-        assert "权重份额，非方向信号" in _app_js_source()
+        assert "子策略组合权重，非方向信号" in _app_js_source()
         return
 
-    assert "权重份额，非方向信号" in html
-    assert "权重份额" in html and "不是方向判断" in html
+    assert "子策略组合权重，非方向信号" in html
+    assert "跨路合计不等于 100%" in html
+    assert "不代表方向投票" in html
+    assert "合计 ≈ 100%" not in html
+    assert "积极做多" not in html
+    assert "空仓/防守" not in html
+    assert "子策略权重" in html
+    assert "配置状态" in html
     # Same three sleeve shares as the artifact, same formatter as before WV1.
     for name, value in _WV1_FIXTURE_ROW["detail_reason"]["dimension_signals"].items():
         assert name in html
         assert f"{(value * 100):.1f}%" in html
     assert "20.0%" in html and "16.7%" in html and "14.3%" in html
+
+
+def test_wv1_xss_escaping():
+    """Dynamic strings in dimension signals and modal titles must be HTML-escaped."""
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        pytest.skip("node runtime unavailable")
+
+    evil_dr = {
+        "dimension_signals": {
+            "<img src=x onerror=alert('xss')>": 0.08,
+            "normal_sleeve": 0.02,
+        }
+    }
+    html = _run_wv1_dimension_html(evil_dr)
+    assert "<img" not in html
+    assert "&lt;img src=x onerror=alert(&#039;xss&#039;)&gt;" in html
+    assert "高配 (>5%)" in html
+    assert "轻配 (0-5%]" in html
 
 
 def test_wv1_weight_cells_pass_artifact_values_through_without_recomputation():
@@ -2954,7 +2990,7 @@ def test_wv1_weight_cells_pass_artifact_values_through_without_recomputation():
     """
     twice = _run_wv1_weight_cells([_WV1_FIXTURE_ROW, _WV1_FIXTURE_ROW])
     if twice is None:
-        return  # covered by the structural fallback in the rendering test above
+        pytest.skip("node runtime unavailable")
 
     first, second = twice
     assert first == second, "rendering the same ticket dict twice produced different weight cells"

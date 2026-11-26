@@ -922,4 +922,26 @@ def test_cq2_consolidation_density_post_warmup_is_bit_identical_to_prefix_refere
     expected = np.clip(num / (den + 1e-8), 0.0, 1.0)
 
     assert got.iloc[:warm].isna().all()
-    np.testing.assert_array_equal(got.to_numpy()[warm:], expected.to_numpy()[warm:])
+    # Once full window of post-warmup bars is reached (warm + window - 1 onwards, i.e. 78+),
+    # masked denominator is bit-identical to the pre-fix unmasked formula.
+    np.testing.assert_array_equal(
+        got.to_numpy()[warm + window - 1:], expected.to_numpy()[warm + window - 1:]
+    )
+
+
+def test_cq2_consolidation_density_no_post_warmup_denominator_dilution():
+    """Bars 59..78 inside [ZD, ZG] must have density == 1.0, not diluted to ~0.05 by pre-warmup volume."""
+    bars = _build_test_bars(100)
+    warm = 59
+    window = 20
+    # Create ZD/ZG that strictly envelop High/Low from bar 59 onwards
+    zd = pd.Series(np.nan, index=bars.index)
+    zg = pd.Series(np.nan, index=bars.index)
+    zd.iloc[warm:] = bars["Low"].iloc[warm:].min() - 1.0
+    zg.iloc[warm:] = bars["High"].iloc[warm:].max() + 1.0
+
+    density = consolidation_density(bars, zd, zg, window=window)
+    assert density.iloc[:warm].isna().all()
+    # On bar 59 (the very first post-warmup bar) and through bar 78, price is 100% inside value area.
+    # Without denominator masking, density[59] was ~ 1/20 = 0.05. With masking, it is exactly 1.0.
+    np.testing.assert_allclose(density.iloc[warm:warm + window], 1.0, rtol=1e-6)

@@ -886,9 +886,11 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
     above $ZG$ ($L_{pullback} > ZG$).
     """
 
+    version: str = "1.1.0"
+
     def __init__(self, config: StrategyConfig = None):
         self.config = config or StrategyConfig()
-        super().__init__(name="chan_trend_third_buy", param_grid={})
+        super().__init__(name="chan_trend_third_buy", param_grid={}, version=self.version)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
         cfg = self.config
@@ -933,7 +935,10 @@ class ChanTrendThirdBuyStrategy(AllocationTemplate):
             if enable_vp_filter:
                 piv_df = _extract_pivot_and_stroke_series(bars, min_gap_bars=min_gap_bars, min_strokes=min_strokes)
                 cd_s = consolidation_density(bars, zd=piv_df["zd"], zg=piv_df["zg"], window=20)
-                vp_ok = (cd_s >= min_density).reindex(master_index).fillna(False)
+                if min_density <= 0.0:
+                    vp_ok = pd.Series(True, index=master_index, dtype=bool)
+                else:
+                    vp_ok = (cd_s >= min_density).reindex(master_index).fillna(False)
                 entry_signal = entry_signal & vp_ok
 
             exit_signal = (sig["sell_signal"] | stroke_sig["divergence_sell"]).reindex(master_index).fillna(False)

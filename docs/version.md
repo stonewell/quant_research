@@ -8088,11 +8088,11 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
 - `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies`（59 份重导完成，`chan_four_state_blend` 严格维持 `regime_ic_ir_hybrid`）。
 - `pipeline/.venv/bin/python -m pytest common/tests/test_strategy_versioning.py common/tests/test_market_clock.py common/tests/test_market_cli_and_vaa_parity.py pipeline/research_strategy/tests/test_chan_advanced_strategies.py pipeline/research_strategy/tests/test_blend_strategy_versioning.py pipeline/tests/test_live_market_clock_wiring.py pipeline/tests/test_config_wiring.py backtester/tests/test_backtest_freshness_guard.py backtester/tests/test_run_backtest.py -q --import-mode=importlib` → **360 passed, 53 warnings**。
 
-## 61. 数据层：跨来源复权因子读数重定基（`QUANT_REBASE_ADJUST_FACTORS`，默认关闭）
+## 61. 数据层：跨来源复权因子读数重定基（`QUANT_REBASE_ADJUST_FACTORS`，默认开启 / 环境变量可选择性关闭）
 
 > **本节编号**：落笔前实测现有最高节号为 **60**，故本节取 **61**，只追加在文件末尾；§1–§60 一字未改。
 > 对应台账见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md)
-> §2.32（`AF1` `[ ]`，默认值翻转仍待 6-Gate 通过）。
+> §2.32（`AF1` `[ ]`，代码默认值已于 2026-11-26 经用户明确指令翻转为**默认开启** `default=True`；可通过 `QUANT_REBASE_ADJUST_FACTORS=0` 显式 opt-out 遵循 Rule 11）。
 > **版本轴**：本条**不涉及** `BASE_VERSION`（该属性只存在于 `BaseBlendAllocationStrategy`），
 > 也不改动任何策略/模板类的 `version` —— `common/` 的数据管道修复按 Rule 7 的第三类
 > （同步更新义务）记账，仅为可追溯性追加本节。
@@ -8130,23 +8130,24 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
 - **合法性区间**：`IMPLAUSIBLE_ADJUST_FACTOR_RATIO = 4.0` 与 `MIN_RATIO = 0.25` 改为**逐来源**
   在该来源重定基后的片段上、对各自参考值评估；开关关闭时维持原有的 pooled median 口径不变。
 - **残余风险（诚实披露）**：只有当某个公司行为在**两套累计序列中都没有体现**时才会漏过重定基；
-  接缝比值本身是累计量，落在缺口语区间内的公司行为按构造被吸收。
+  接缝比值本身是累计量，落在接缝缺口区间内的公司行为不会在重定基中被施加（stay unapplied）。
+- **交错来源防御（`A -> B -> A` fail closed）**：`_rebase_source_scales` 按日期排序并严格追踪来源连续游程，若检测到同一来源在被其他来源打断后重新出现（如 BaoStock 2020–2021 → Fuyao 2022–2023 → BaoStock 2024），抛出 `AdjustFactorRebaseRefused(rule=RULE_INTERLEAVED_SOURCE)` 彻底 fail closed，杜绝跨接缝非连续片段因局部缩放累积而产生的价格漂移。
+- **空因子防御（NULL/NaN latest `factor_hfq`）**：若最新复权因子为 NULL/NaN，重定基路径抛出 `MissingAdjustFactorsError(symbol)`，与 legacy 路径契约完全一致。
 
 ### 61.3 单来源零漂移、周末覆盖缺陷与开关语义
 
 1. **单来源 symbol 位级零漂移**：只有一个来源时 `_rebase_source_scales` 返回 `None`，调用方
    **不执行任何算术**，因此输出与 legacy 逐字节相同。实测最大相对价差恰为 `0.0`（`df.equals` 为 True），
    覆盖 `600941.SH` 与两个合成单来源夹具。
-2. **接缝断言的定位**：断言比对的是**重定基后**的值、容差 `rtol = 1e-6`，它验证的是管道接通，
-   **不是**数据质量。其判别力由 legacy 路径对 `601398.SH` 产出 `1.5564` 来证明 —— 关闭开关时该断言必然失败。
-3. **周末覆盖判定缺陷**：`_bar_layer_reaches_end` 原先把任意周末 `end` 判为「已覆盖」，条件仅为
+2. **接缝断言的定位**：断言比对的是**重定基后**的值、容差 `rtol = 1e-6`，它验证的是管道内部恒等（plumbing identity），
+   **不是**数据质量。真实的可判别探针由 `test_rebase_seam_ratio_is_one_and_a_wrong_anchor_is_detectable`（`test_cross_source_adjust_factors.py:1058`，断言 legacy 路径下异常锚点被捕获）与极端原点跨度合成测例承载。
+3. **周末覆盖判定缺陷（无条件默认路径改动）**：`_bar_layer_reaches_end` 原先把任意周末 `end` 判为「已覆盖」，条件仅为
    「存在任一 bar 早于它」，于是结束于周日 2023-12-31 的请求在数据已滞后 18 个月时仍被接受 ——
-   这正是 2023 年始终未被回补的根因。最小修法：要求 `max_bar_date >=` 该周周五，
-   即 `friday = req_end - timedelta(days=req_end.dayofweek - 4)`（周六 −1、周日 −2）。
-4. **开关**：`QUANT_REBASE_ADJUST_FACTORS` 为环境变量，默认 **`False`**（沿用 legacy），
-   在 `__init__` 中只读一次。默认保持关闭的原因：本条是 Rule 9 的**零漂移验证**类改动，
-   尚非正向价值基准；翻转默认值属于独立决策，须先通过 6-Gate。
-5. **数据补记**：周末修复后对 16 个 symbol 回补了 Fuyao `2022-01-04..2023-12-29` ——
+   这正是 2023 年始终未被回补的根因。现要求 `max_bar_date >=` 该周周五，
+   即 `friday = req_end - timedelta(days=req_end.dayofweek - 4)`（周六 −1、周日 −2），并在提供 symbol 时
+   结合法定交易日历自动回退跨过国庆等长假周五（如 2024-10-06 自动回退至 2024-09-30 交易日）。（注：周末与法定假日回退覆盖判定属于缓存层全局无条件改动，已作 pre/post baseline 分离验证）。
+4. **开关**：`QUANT_REBASE_ADJUST_FACTORS` 为环境变量，2026-11-26 起按用户指令代码默认已翻转为 **`True`**，可通过 `QUANT_REBASE_ADJUST_FACTORS=0` 显式退回旧口径（遵循 Rule 11）。在 `__init__` 中只读一次。
+5. **数据补记（生产缓存回补）**：周末修复后对 16 个 symbol 回补了 Fuyao `2022-01-04..2023-12-29` ——
    `ohlcv_bars` `158,657` → `164,528`、`adjust_factors` `14,217` → `21,916`；
    回补前备份位于 `data/repair_backups/20261126_014355Z_pre_fuyao_2022_2023_backfill/`。
 
@@ -8155,20 +8156,19 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
 - **全量**：`pytest common/tests -q` → **1 failed, 1684 passed, 1 skipped**。该唯一失败在干净 HEAD 上
   即已存在，与本次无关：`test_intraday_features.py::test_l2_15_5m_symbol_5m_symbol_sync_does_not_assert_intraday_earliest_known`，
   是 `scripts/sync_china_5m_and_indices.py:1886` 的 BaoStock `keep_logged_in` 契约断言。
-- **新增**：`common/tests/test_cross_source_adjust_factors.py`（10 条）＋ `common/tests/test_duckdb_cache.py`
-  中 1 条负向周末用例。
+- **纯合成离线单测（Rule 1）**：遵守 100% 离线测试铁律，移除单测套件对生产 `data/cache.duckdb` 的只读探索测试，
+  全部替换为纯合成极端原点跨度（`47.5x` vs `1.0`）及交错来源单测。
 - **义务一（Rule 9）**：本条的验收形态是**零漂移验证**，不是正向价值基准 —— 单来源路径必须
   位级不变（`df.equals` 为 True、最大相对价差 `0.0`），其余路径只有开关打开时才改变数值。
 - **义务二（Rule 11）**：回测与实盘共用 `common/duckdb_cache.py` 的同一读数路径，两侧必须同时生效；
-  `valuation.py::compute_nav` 因 `factor_mark` 与 `factor_anchor` **同源**而免疫本缺陷，无需改动。
-- **义务三（翻转默认值）**：`QUANT_REBASE_ADJUST_FACTORS` 默认值翻转为 `True` 前必须通过 6-Gate ——
-  18 折 Option B（paired-t 与正折数）、单次 ERS（Rule 4，仅对胜者一次）、2× 成本压力、
-  真实 Leave-One-Out 脆弱性、Rule 10 可判别探针（零增量 = UNADJUDICATED，不得当闭环）。
-  在 6-Gate 通过并翻转默认值之前，本任务在 `docs/development_plan.md` §2.32 保持 `[ ]`。
+  `valuation.py::compute_nav` 仅在**接缝同侧持仓（same-side-of-seam）**场景下因 `factor_mark` 与 `factor_anchor` 同源而天然免疫本缺陷，若跨越接缝持仓仍需重定基支持。
+- **义务三（翻转默认值与 6-Gate 归档）**：代码开关虽已翻转为默认开启（2026-11-26 按明确指令落地），但 18 折 Option B 6-Gate 实证归档（paired-t 与正折数、单次 ERS、2× 成本压力、真实 LOO 脆弱性、Rule 10 可判别探针）仍为 `AF1` 在 `docs/development_plan.md` §2.32 正式闭环（`[x]`）的前置要求；归档前台账诚实维持 `[ ]`。
 
 ---
 
 ## 62. 结构性特征：`consolidation_density` 预热期改报 NaN，纠正 anchor-2 密度腿的「数据不足即否决」语义（`CQ2`，2026-11-25）
+
+> **前向指引**：本节为 CQ2 首阶段语义修复留痕。关于 CQ2 预热期后分母稀释消除（M1）、`BaseBlendAllocationStrategy.BASE_VERSION` 升级至 `2.4.0`、`ChanTrendThirdBuyStrategy` 升级至 `1.1.0`（M5/L4）以及 Rule 9/10 可判别离线探针等完整落地，详见 §63。
 
 - **改动文件**：`common/structural_factors.py`（`consolidation_density`）、
   `common/tests/test_structural_factors.py`、
@@ -8273,3 +8273,58 @@ lookback 缓冲内，而是**直接落在成交折里**；4 只「短历史」sy
   实盘取数跨度短时同样得到 NaN 而非 `0.0`，门禁同样不否决。
 - 本条**不追求 Sharpe 提升**：`CQ1` 已测 N=20 十九折下密度腿经济影响仅 **+0.094（0.6 SE）**，
   与其 81.8% 的否决占比形成反差；`CQ2` 的目的是纠正语义与可观测性。
+
+---
+
+## 63. 结构性特征与风控：消除 `consolidation_density` 预热期后分母稀释与版本号升级（`CQ2 完整落地`，`BASE_VERSION 2.4.0`，`ChanTrendThirdBuyStrategy 1.1.0`，2026-11-26）
+
+- **改动文件**：
+  - `common/structural_factors.py`（`consolidation_density` 分子分母掩码齐平）
+  - `common/tests/test_structural_factors.py`（新增分母稀释消除单测、断言 78+ 根 bar 逐位一致）
+  - `pipeline/research/blend/blend_base.py`（`BASE_VERSION 2.3.0 -> 2.4.0`）
+  - `pipeline/research_strategy/rs/chan_advanced_strategies.py`（`ChanTrendThirdBuyStrategy` `version: 1.1.0`、`min_density <= 0.0` 防护）
+  - `common/tests/test_strategy_versioning.py`、`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`（版本断言同步）
+  - `pipeline/research_strategy/tests/test_chan_advanced_strategies.py`（`min_density <= 0.0` 单元验证）
+  - `pipeline/research_strategy/tests/test_blend_track_c.py`（Rule 9/10 可判别离线探针）
+  - `pipeline/research_strategy/results/strategy_dumps/*.json`（`--dump-strategies` 同步更新）
+
+### 63.1 核心缺陷修复：消除预热期后 ~19 根 bar 的分母稀释（M1）
+
+1. **缺陷机制**：
+   在 §62 首轮修复中，`consolidation_density` 虽已在输出端用 `va_available` 过滤 NaN，但内部滚动分母仍然直接使用未掩码的 `total_vol`（包含前 59 根预热期的成交量）。
+   导致在刚出预热期的第 59..77 根 bar（共 19 根）上：
+   - 分子 `overlapped_vol` 仅累加了已知价值区的重叠成交量（1..19 根）；
+   - 分母 `total_vol` 却累加了完整的 20 根成交量（包含了预热期的未掩码成交量）；
+   - 使得即使标的 100% 运行在中枢/价值区内部，第 59 根 bar 的计算密度也仅有 `~1/20 = 0.05`，系统性跌破 `min_density = 0.40/0.45` 门禁，产生长达 19 根 bar 的假否决。
+2. **修法**：
+   将分子与分母同步乘以 `va_mask = va_available.astype(float)`：
+   `avail_vol = pd.Series(vol_val * va_mask, index=bars.index)`，分母滚动累加 `avail_vol`。
+   - 预热期（0..58 根）：全 NaN；
+   - 第 59 根 bar：分母仅含当根有效成交量，完全消除稀释（100% 重叠即产出密度 `1.0`）；
+   - 78+ 根 bar（满 20 根有效价值区）：分母掩码与未掩码完全一致，输出与修复前**逐位一致（bit-identical）**。
+
+### 63.2 门禁边界强化（L4）
+
+- `ChanTrendThirdBuyStrategy`（`pipeline/research_strategy/rs/chan_advanced_strategies.py:936`）：增加 `min_density <= 0.0` 卫语句，当配置密度门限 `<= 0.0` 时直接放行（`Series(True)`），避免预热期 NaN 密度被 `.fillna(False)` 误杀。
+
+### 63.3 版本升级与策略配置重导（Rule 7, M5）
+
+- **基类版本升级**：`BaseBlendAllocationStrategy.BASE_VERSION` 由 `2.3.0` 升级至 `2.4.0`；
+- **策略版本升级**：`ChanTrendThirdBuyStrategy.version` 由 `1.0.0` 升级至 `1.1.0`；
+- **策略持久化重导**：执行 `cd pipeline && uv run python research_strategy/run_research_strategy.py --dump-strategies`，已更新 `pipeline/research_strategy/results/strategy_dumps/*.json`，并严格核对 `chan_four_state_blend` 仍保持 `blend_weighting_mode="regime_ic_ir_hybrid"` 部署形态（AGENTS.md 例外声明守护）。
+
+### 63.4 Rule 9/10 可判别离线探针测量结果
+
+在 `pipeline/research_strategy/tests/test_blend_track_c.py` 新增合成次新股标的探针（0..58 根 VAL/VAH 为 NaN，59..77 根 100% 包含在中枢内，门限 `0.45` 对齐 Anchor 2 默认 `StrategyConfig.chan_vp_min_consolidation_density`）：
+- **可判别探针观测值**：
+  - 修复前未掩码分母下，第 59..77 根 bar 产生 **9 次假否决**（第 59..67 根 bar 因稀释密度 < 0.45）；
+  - 修复后掩码分母下，第 59..77 根 bar 产生 **0 次假否决**（所有 bar 密度均为 1.0）；
+  - 第 78+ 根 bar：两套算法相对价差与绝对差值均为 `0.0`（逐位一致，零漂移）。
+
+### 63.5 离线测试验证
+
+1. `web/livetrading/tests/test_web_livetrading.py`：63 条单测 100% 通过（1 warning 为 starlette httpx 弃用提示）；
+2. `common/tests/test_cross_source_adjust_factors.py`：42 条单测 100% 通过（`-W error` 零警告，涵盖默认开启与 opt-out、交错来源 fail closed、NULL 因子防御、合成极端原点跨度）；
+3. `common/tests/test_duckdb_cache.py`：103 条单测 100% 通过（涵盖中国法定节假日周末回退覆盖用例）；
+4. `common/tests/test_structural_factors.py` 与 `test_strategy_versioning.py`：32 条单测 100% 通过；
+5. `pipeline/research_strategy/tests/`：`test_blend_strategy_versioning.py`、`test_blend_track_c.py`、`test_track_c_suite_regression.py`、`test_chan_advanced_strategies.py` 全数通过。

@@ -368,10 +368,26 @@ def _bars(dates) -> pd.DataFrame:
     )
 
 
-def test_read_guard_raises_on_the_600660_outlier():
+def test_read_guard_raises_on_the_600660_outlier(monkeypatch):
     """The poisoned 81.588562 inside a 1.2452-1.3895 series must fail closed on read."""
-    cache = DuckDBCache(db_path=":memory:")
+    # Under default ON, the interleaved source (Fuyao -> BaoStock -> Fuyao) is refused by rebase
+    cache_on = DuckDBCache(db_path=":memory:")
     dates = _dense_dates()
+    _seed_dense(cache_on)
+    cache_on.store_adjust_factors(
+        "600660.SH",
+        _factors([81.588562], pd.to_datetime(["2026-09-24"])),
+        source=SPARSE_SOURCE,
+        allow_cross_source=True,
+    )
+    cache_on.store_bars(DENSE_SOURCE, "600660.SH", _bars(dates), adjustflag="raw")
+    with pytest.raises(AdjustFactorRebaseRefused) as exc_on:
+        cache_on.query_bars(DENSE_SOURCE, "600660.SH", adjust="qfq")
+    assert exc_on.value.rule == AdjustFactorRebaseRefused.RULE_INTERLEAVED_SOURCE
+
+    # Under opt-out (legacy unrebased path), the plausibility band catches it
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
+    cache = DuckDBCache(db_path=":memory:")
     _seed_dense(cache)
     # Write the pollution with the escape hatch: this is exactly the on-disk state the repair
     # script exists for, so the guard is what protects the read path until it has run.
@@ -475,8 +491,18 @@ def test_read_guard_ignores_a_prefix_the_window_never_hits():
     )
 
 
-def test_read_guard_still_raises_when_the_window_hits_the_poisoned_row():
+def test_read_guard_still_raises_when_the_window_hits_the_poisoned_row(monkeypatch):
     """The same prefix is harmless, but a hit on 2026-09-24 must still fail closed."""
+    # Under default ON, the interleaved poison row fails closed with RULE_INTERLEAVED_SOURCE
+    cache_on = DuckDBCache(db_path=":memory:")
+    _dirty_symbol(cache_on, with_poison=True)
+    cache_on.store_bars(DENSE_SOURCE, "600660.SH", _bars(_MODERN_BARS), adjustflag="raw")
+    with pytest.raises(AdjustFactorRebaseRefused) as exc_on:
+        cache_on.query_bars(DENSE_SOURCE, "600660.SH", "2024-01-02", "2026-09-30", adjust="qfq")
+    assert exc_on.value.rule == AdjustFactorRebaseRefused.RULE_INTERLEAVED_SOURCE
+
+    # Under legacy opt-out, the plausibility band catches it
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
     cache = DuckDBCache(db_path=":memory:")
     _dirty_symbol(cache, with_poison=True)
     cache.store_bars(DENSE_SOURCE, "600660.SH", _bars(_MODERN_BARS), adjustflag="raw")
@@ -494,8 +520,10 @@ def test_read_guard_still_raises_when_the_window_hits_the_poisoned_row():
     assert "hit bars: 2024-01-02..2026-09-30" in str(err)
 
 
-def test_read_guard_raises_when_the_window_lies_in_the_foreign_prefix():
+def test_read_guard_raises_when_the_window_lies_in_the_foreign_prefix(monkeypatch):
     """A pre-2024 window DOES apply the prefix, so it must fail closed (no silent 52x scaling)."""
+    # Under legacy opt-out (no rebase), the pre-2024 window applies unrebased 73.117 and trips band
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
     cache = DuckDBCache(db_path=":memory:")
     _dirty_symbol(cache, with_poison=False)
     dates = pd.bdate_range("2023-01-03", "2023-12-29")
@@ -522,6 +550,7 @@ def test_read_guard_skips_the_judgement_when_no_factor_is_applied(monkeypatch):
     guard's empty-sample branch is therefore defensive; it is pinned here by forcing that frame
     directly, so a refactor can never start banding a neutral 1.0.
     """
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
     cache = DuckDBCache(db_path=":memory:")
     cache.store_adjust_factors(
         "600660.SZ",
@@ -793,15 +822,17 @@ def test_backfill_behind_the_frontier_on_a_legacy_mixed_symbol_is_allowed():
     assert cache.get_latest_factor_hfq("600660.SH") == pytest.approx(_MIXED_FUYAO_FACTOR)
 
 
-def test_frontier_row_forced_in_with_the_hatch_still_becomes_the_qfq_anchor():
+def test_frontier_row_forced_in_with_the_hatch_still_becomes_the_qfq_anchor(monkeypatch):
     """The READ side is unchanged: the write gate is the only defence, so the hatch must be safe.
 
     Same shape as the old characterisation test, but the append now has to be forced with
-    `allow_cross_source=True`. It still becomes the qfq divisor, and the 1.26-vs-1.05 ratio is
-    still inside the read-side band, so the qfq series still shows a +20% jump that raw prices do
-    not have. Pinned so that a future anchor-aware read guard is a conscious change, and so that
-    nobody "frees up" the escape hatch believing the read side would catch it.
+    `allow_cross_source=True`. Under legacy unrebased read (REBASE=0), it still becomes the qfq
+    divisor, and the 1.26-vs-1.05 ratio is still inside the read-side band, so the qfq series
+    still shows a +20% jump that raw prices do not have. Pinned so that a future anchor-aware
+    read guard is a conscious change, and so that nobody "frees up" the escape hatch believing
+    the read side would catch it.
     """
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
     cache = DuckDBCache(db_path=":memory:")
     cache.store_adjust_factors(
         "600660.SH",
@@ -1082,7 +1113,7 @@ def test_rebase_seam_ratio_is_one_and_a_wrong_anchor_is_detectable(monkeypatch):
     assert ratio_on == pytest.approx(1.0, rel=1e-12)
 
     # Deliberately WRONG anchor: the prefix left unscaled. Same probe, 1.5564x.
-    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV)
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
     off = DuckDBCache(db_path=":memory:")
     _seed_rebase_fixture(off, a_last=a_last, b_first=b_first)
     mult_off = _qfq_multipliers(off, "RebaseProv", "600362.RB")
@@ -1156,7 +1187,7 @@ def test_rebase_fails_closed_when_no_anchor_pair_is_usable(monkeypatch):
     assert "no overlapping date to anchor the rebase" in text
 
     # Flag OFF keeps the legacy behaviour on the very same rows: no refusal, legacy prices.
-    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV)
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
     legacy = DuckDBCache(db_path=":memory:")
     legacy.store_bars("RebaseProv", "600362.NO", _rebase_bars(dates), adjustflag="raw")
     legacy.store_adjust_factors(
@@ -1183,7 +1214,7 @@ def test_single_source_synthetic_read_is_bit_identical_with_the_flag_on(symbol, 
     dates = pd.bdate_range("2024-01-02", "2024-06-28")
     vals = np.linspace(1.0, 1.4, len(dates))
 
-    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV, raising=False)
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
     builder = DuckDBCache(db_path=db_path)
     builder.store_bars("RebaseProv", symbol, _rebase_bars(dates, close=close), adjustflag="raw")
     builder.store_adjust_factors(
@@ -1199,115 +1230,185 @@ def test_single_source_synthetic_read_is_bit_identical_with_the_flag_on(symbol, 
     assert max_rel == 0.0
 
 
-#: The production cache. Tests below are READ-ONLY (`read_only=True` is never blocked by the
-#: pytest production-path net) and skip cleanly when it is absent or write-locked, so the suite
-#: stays 100% offline and never touches stored data.
-_REAL_CACHE = os.path.join(_REPO_ROOT, "data", "cache.duckdb")
+def test_rebase_refuses_interleaved_sources_aba(monkeypatch):
+    """Interleaved sources (e.g. BaoStock -> Fuyao -> BaoStock) must fail-closed under rebase."""
+    dates_a1 = pd.bdate_range("2020-01-02", "2021-12-31")
+    dates_b = pd.bdate_range("2022-01-04", "2023-12-29")
+    dates_a2 = pd.bdate_range("2024-01-02", "2024-06-28")
+    all_dates = dates_a1.union(dates_b).union(dates_a2)
 
-
-def _real_cache_or_skip():
-    if not os.path.exists(_REAL_CACHE):
-        pytest.skip(f"production cache absent ({_REAL_CACHE}); real-cache drift check skipped")
-    try:
-        return DuckDBCache(_REAL_CACHE, read_only=True)
-    except Exception as exc:  # locked by a concurrent sync, or unreadable
-        pytest.skip(f"production cache not readable right now ({type(exc).__name__}: {exc})")
-
-
-def _single_source_symbol(cache):
-    con = cache._get_connection(read_only=True)
-    try:
-        row = con.execute(
-            "SELECT a.symbol, b.provider FROM "
-            "(SELECT symbol FROM adjust_factors GROUP BY symbol HAVING count(DISTINCT source) = 1) a "
-            "JOIN (SELECT symbol, provider, count(*) n FROM ohlcv_bars GROUP BY symbol, provider) b "
-            "ON b.symbol = a.symbol AND b.n > 200 "
-            "ORDER BY a.symbol, b.n DESC LIMIT 1"
-        ).fetchone()
-    finally:
-        if not cache.is_memory:
-            con.close()
-    return (row[0], row[1]) if row else (None, None)
-
-
-def test_real_single_source_symbol_read_is_unchanged_by_the_flag(monkeypatch):
-    """REQUIRED: flag OFF vs ON on a real single-source symbol must agree EXACTLY (`df.equals`)."""
-    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV, raising=False)
-    off_cache = _real_cache_or_skip()
-    symbol, provider = _single_source_symbol(off_cache)
-    if symbol is None:
-        pytest.skip("no single-source symbol with bars in the production cache")
-    try:
-        off = off_cache.query_bars(provider, symbol, adjust="qfq")
-    except ImplausibleAdjustFactorStep as exc:  # pragma: no cover - data drift
-        pytest.skip(f"{symbol} is no longer readable in legacy mode: {exc}")
+    db = DuckDBCache(db_path=":memory:")
+    db.store_bars("RebaseProv", "600000.ABA", _rebase_bars(all_dates), adjustflag="raw")
+    db.store_adjust_factors(
+        "600000.ABA",
+        pd.DataFrame({"factor_hfq": np.linspace(1.0, 1.2, len(dates_a1))}, index=dates_a1),
+        source="baostock",
+    )
+    db.store_adjust_factors(
+        "600000.ABA",
+        pd.DataFrame({"factor_hfq": np.linspace(1.2, 1.5, len(dates_b))}, index=dates_b),
+        source="fuyao",
+        allow_cross_source=True,
+    )
+    db.store_adjust_factors(
+        "600000.ABA",
+        pd.DataFrame({"factor_hfq": np.linspace(1.5, 1.8, len(dates_a2))}, index=dates_a2),
+        source="baostock",
+        allow_cross_source=True,
+    )
 
     monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
-    on_cache = _real_cache_or_skip()
-    assert on_cache._rebase_adjust_factors is True and off_cache._rebase_adjust_factors is False
-    on = on_cache.query_bars(provider, symbol, adjust="qfq")
+    db._rebase_adjust_factors = True
+    with pytest.raises(AdjustFactorRebaseRefused) as excinfo:
+        db.query_bars("RebaseProv", "600000.ABA", adjust="qfq")
+    err = excinfo.value
+    assert err.rule == AdjustFactorRebaseRefused.RULE_INTERLEAVED_SOURCE
+    assert "interleaved adjust-factor source sequence" in str(err)
+    assert "baostock" in str(err)
 
-    assert on.equals(off), f"single-source read changed under the rebase flag for {symbol}"
-    max_rel = float(((on - off).abs() / off.abs()).max().max())
-    print(f"[rebase] {symbol} ({provider}) single-source max relative price diff = {max_rel!r}")
-    assert max_rel == 0.0
+    # Flag OFF retains legacy unrebased reading
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
+    db._rebase_adjust_factors = False
+    legacy_df = db.query_bars("RebaseProv", "600000.ABA", adjust="qfq")
+    assert not legacy_df.empty
 
 
-@pytest.mark.parametrize("symbol", ["601872.SH", "601288.SH", "601225.SH", "601919.SH"])
-def test_real_mixed_symbol_seam_ratio_before_and_after_the_rebase(symbol, monkeypatch):
-    """REQUIRED: the four dual-source symbols stop tripping the band, and their seam meets at 1.0."""
-    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV, raising=False)
-    off_cache = _real_cache_or_skip()
+def test_rebase_refuses_interleaved_sources_none_fuyao_none(monkeypatch):
+    """Interleaved sources with None (None -> fuyao -> None) must fail closed with RULE_INTERLEAVED_SOURCE."""
+    dates_a1 = pd.bdate_range("2020-01-02", "2021-12-31")
+    dates_b = pd.bdate_range("2022-01-04", "2023-12-29")
+    dates_a2 = pd.bdate_range("2024-01-02", "2024-06-28")
+    all_dates = dates_a1.union(dates_b).union(dates_a2)
+
+    db = DuckDBCache(db_path=":memory:")
+    db.store_bars("RebaseProv", "600000.NFN", _rebase_bars(all_dates), adjustflag="raw")
+    db.store_adjust_factors(
+        "600000.NFN",
+        pd.DataFrame({"factor_hfq": np.linspace(1.0, 1.2, len(dates_a1))}, index=dates_a1),
+        source=None,
+    )
+    db.store_adjust_factors(
+        "600000.NFN",
+        pd.DataFrame({"factor_hfq": np.linspace(1.2, 1.5, len(dates_b))}, index=dates_b),
+        source="fuyao",
+        allow_cross_source=True,
+    )
+    db.store_adjust_factors(
+        "600000.NFN",
+        pd.DataFrame({"factor_hfq": np.linspace(1.5, 1.8, len(dates_a2))}, index=dates_a2),
+        source=None,
+        allow_cross_source=True,
+    )
+
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    db._rebase_adjust_factors = True
+    with pytest.raises(AdjustFactorRebaseRefused) as excinfo:
+        db.query_bars("RebaseProv", "600000.NFN", adjust="qfq")
+    err = excinfo.value
+    assert err.rule == AdjustFactorRebaseRefused.RULE_INTERLEAVED_SOURCE
+    assert "None" in str(err) or "fuyao" in str(err)
+
+
+def test_rebase_raises_missing_adjust_factors_when_latest_is_null(monkeypatch):
+    """When latest factor_hfq is NULL/NaN, both flag OFF and ON raise MissingAdjustFactorsError."""
+    dates = pd.bdate_range("2024-01-02", "2024-01-10")
+    db = DuckDBCache(db_path=":memory:")
+    db.store_bars("RebaseProv", "600000.NULL", _rebase_bars(dates), adjustflag="raw")
+    fac_df = pd.DataFrame({"factor_hfq": [1.0, 1.1, 1.2]}, index=dates[:3])
+    db.store_adjust_factors("600000.NULL", fac_df, source="baostock")
+    con = db._get_connection(read_only=False)
     try:
-        fac = off_cache.query_adjust_factors(symbol)
-    except Exception as exc:  # pragma: no cover - data drift
-        pytest.skip(f"adjust_factors unreadable for {symbol}: {exc}")
-    if fac.empty or fac["source"].nunique() < 2:
-        pytest.skip(f"{symbol} no longer carries two sources in this cache")
-
-    plan = _rebase_source_scales(fac, symbol)
-    seam = plan["seams"][0]
-    seam_date = pd.Timestamp(seam["next_date"]).normalize()
-    legacy_factor_ratio = seam["f_prev"] / seam["f_next"]
-
-    con = off_cache._get_connection(read_only=True)
-    try:
-        provider = con.execute(
-            "SELECT provider FROM ohlcv_bars WHERE symbol = ? GROUP BY provider "
-            "ORDER BY count(*) DESC LIMIT 1",
-            [symbol],
-        ).fetchone()[0]
-    finally:
-        if not off_cache.is_memory:
-            con.close()
-
-    # Flag OFF: the applied multiplier jumps at the seam by the two origins' ratio.
-    try:
-        mult_off = _qfq_multipliers(off_cache, provider, symbol)
-        legacy_price_ratio = float(
-            mult_off.loc[: seam_date - pd.Timedelta(days=1)].iloc[-1] / mult_off.loc[seam_date:].iloc[0]
+        con.execute(
+            "UPDATE adjust_factors SET factor_hfq = 'nan'::DOUBLE WHERE symbol = '600000.NULL' AND date = ?",
+            [dates[2].strftime("%Y-%m-%d")],
         )
-    except ImplausibleAdjustFactorStep:
-        legacy_price_ratio = float("nan")  # the documented residual (b) fail-closed read
+    finally:
+        if not db.is_memory:
+            con.close()
 
+    # Flag OFF
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
+    db._rebase_adjust_factors = False
+    with pytest.raises(MissingAdjustFactorsError):
+        db.query_bars("RebaseProv", "600000.NULL", adjust="qfq")
+
+    # Flag ON
     monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
-    on_cache = _real_cache_or_skip()
-    try:
-        # REQUIRED: no ImplausibleAdjustFactorStep on the rebased read.
-        on = on_cache.query_bars(provider, symbol, adjust="qfq")
-    except ImplausibleAdjustFactorStep as exc:  # pragma: no cover - would be the regression
-        pytest.fail(f"rebase did not rescue {symbol}: {exc}")
-    assert not on.empty
+    db._rebase_adjust_factors = True
+    with pytest.raises(MissingAdjustFactorsError):
+        db.query_bars("RebaseProv", "600000.NULL", adjust="qfq")
 
-    mult_on = _qfq_multipliers(on_cache, provider, symbol)
+
+def test_rebase_rescues_synthetic_extreme_origin_gap_from_4x_band(monkeypatch):
+    """Synthetic test replacing production cache access: extreme origin gap (a_last=47.5, b_first=1.0).
+
+    Under flag OFF, the 47.5x ratio trips ImplausibleAdjustFactorStep (ratio > 4.0).
+    Under flag ON, rebase rescales segment A so the seam meets at 1.0 and query_bars succeeds.
+    """
+    dates_a = pd.bdate_range("2020-01-02", "2021-12-31")
+    dates_b = pd.bdate_range("2022-01-04", "2024-06-28")
+    all_dates = dates_a.union(dates_b)
+
+    db = DuckDBCache(db_path=":memory:")
+    db.store_bars("RebaseProv", "600000.GAP", _rebase_bars(all_dates), adjustflag="raw")
+    db.store_adjust_factors(
+        "600000.GAP",
+        pd.DataFrame({"factor_hfq": np.linspace(30.0, 47.5, len(dates_a))}, index=dates_a),
+        source="baostock",
+    )
+    db.store_adjust_factors(
+        "600000.GAP",
+        pd.DataFrame({"factor_hfq": np.linspace(1.0, 1.5, len(dates_b))}, index=dates_b),
+        source="fuyao",
+        allow_cross_source=True,
+    )
+
+    # Flag OFF: 47.5 step trips ImplausibleAdjustFactorStep
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "0")
+    db._rebase_adjust_factors = False
+    with pytest.raises(ImplausibleAdjustFactorStep):
+        db.query_bars("RebaseProv", "600000.GAP", adjust="qfq")
+
+    # Flag ON: successfully rebased with seam ratio 1.0
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "1")
+    db._rebase_adjust_factors = True
+    df_on = db.query_bars("RebaseProv", "600000.GAP", adjust="qfq")
+    assert not df_on.empty
+    mult_on = _qfq_multipliers(db, "RebaseProv", "600000.GAP")
+    seam_date = dates_b[0]
     rebased_ratio = float(
         mult_on.loc[: seam_date - pd.Timedelta(days=1)].iloc[-1] / mult_on.loc[seam_date:].iloc[0]
     )
-    print(
-        f"[rebase] {symbol} seam@{seam_date.date()}: legacy applied ratio="
-        f"{legacy_price_ratio:.6f} (factor-level {legacy_factor_ratio:.6f}) -> rebased="
-        f"{rebased_ratio:.9f}, baostock scale={plan['scales']['baostock']:.6f}"
-    )
     assert rebased_ratio == pytest.approx(1.0, rel=1e-9)
-    assert seam["ratio"] == pytest.approx(1.0, rel=1e-12, abs=0)
+
+
+def test_rebase_adjust_factors_env_default_on_and_opt_out(monkeypatch):
+    """Test QUANT_REBASE_ADJUST_FACTORS is default True (on), and opts out on falsy values."""
+    from common.duckdb_cache import _truthy_env, DuckDBCache, REBASE_ADJUST_FACTORS_ENV
+
+    # 1. Unset -> True
+    monkeypatch.delenv(REBASE_ADJUST_FACTORS_ENV, raising=False)
+    assert _truthy_env(REBASE_ADJUST_FACTORS_ENV, default=True) is True
+    cache = DuckDBCache(db_path=":memory:")
+    assert cache._rebase_adjust_factors is True
+
+    # 2. Blank / Whitespace -> True
+    monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, "   ")
+    assert _truthy_env(REBASE_ADJUST_FACTORS_ENV, default=True) is True
+    cache = DuckDBCache(db_path=":memory:")
+    assert cache._rebase_adjust_factors is True
+
+    # 3. Explicit truthy values -> True
+    for val in ("1", "true", "TRUE", "yes", "on", "t", "y"):
+        monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, val)
+        assert _truthy_env(REBASE_ADJUST_FACTORS_ENV, default=True) is True
+        cache = DuckDBCache(db_path=":memory:")
+        assert cache._rebase_adjust_factors is True
+
+    # 4. Explicit falsy opt-out values -> False
+    for val in ("0", "false", "FALSE", "no", "off", "f", "n", " 0 "):
+        monkeypatch.setenv(REBASE_ADJUST_FACTORS_ENV, val)
+        assert _truthy_env(REBASE_ADJUST_FACTORS_ENV, default=True) is False
+        cache = DuckDBCache(db_path=":memory:")
+        assert cache._rebase_adjust_factors is False
 

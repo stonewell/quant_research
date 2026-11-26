@@ -362,10 +362,10 @@
                                     <th>当前持仓</th>
                                     <th>目标仓位</th>
                                     <!-- WV1: the two attribution coordinates the artifact already
-                                         carries. Reading order is current -> model target (post-blend)
-                                         -> delivered target (post-inertia/confirmation band) -> delta. -->
-                                    <th>模型目标%</th>
-                                    <th>交付目标%</th>
+                                         carries. Reading order is current -> model target (post-blend/post-lifecycle,
+                                         before lot rounding) -> delivered weight (post-lot-rounding) -> delta. -->
+                                    <th title="生命周期与风控后目标权重（整百股取整前）">生命周期后目标(取整前)</th>
+                                    <th title="实际交付持仓权重（整百股取整后，与目标仓位一致）">交付权重(取整后)</th>
                                     <th>权重变动</th>
                                     <th>净交易股数</th>
                                     <th>内部对冲</th>

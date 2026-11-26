@@ -26,6 +26,7 @@ from common.market_clock import (
     infer_market_from_symbol,
     last_expected_bar_ts,
 )
+from common.market_holidays import HolidayCalendarCoverageError, holidays_for
 from common.data_coverage import find_volume_column
 
 if TYPE_CHECKING:
@@ -96,11 +97,12 @@ _HISTORY_REWRITE_RTOL = 1e-9
 IMPLAUSIBLE_ADJUST_FACTOR_RATIO = 4.0
 IMPLAUSIBLE_ADJUST_FACTOR_MIN_RATIO = 0.25
 
-#: Opt-in read-time cross-source rebase (`AdjustFactorRebaseRefused` explains why it is needed).
-#: DEFAULT OFF, and that is the whole safety story of the change: with the variable unset every
-#: read path behaves exactly as before, so landing this cannot move a single existing price. Read
-#: ONCE per `DuckDBCache` instance (see `__init__`) -- a per-call `os.environ` lookup would let a
-#: process change basis mid-window and would pay a syscall on the 1.23M-bar hot path.
+#: Cross-source adjust-factor rebase (`AdjustFactorRebaseRefused` explains why it is needed).
+#: DEFAULT ON (True) as of 2026-11-26 per explicit user directive. Opt-out via setting
+#: QUANT_REBASE_ADJUST_FACTORS to "0", "false", "no", or "off" to read legacy unrebased prices
+#: (aligning with Rule 11). Read ONCE per `DuckDBCache` instance (see `__init__`).
+#: Note: unlike factor-derivation arithmetic, `_bar_layer_reaches_end` weekend/holiday
+#: coverage is an unconditional cache freshness check shared across all reads.
 REBASE_ADJUST_FACTORS_ENV = "QUANT_REBASE_ADJUST_FACTORS"
 
 #: Relative tolerance for "the two rebased segments meet at the seam". Loose enough for one
@@ -138,9 +140,9 @@ class MissingAdjustFactorsError(RuntimeError):
 class AdjustFactorRebaseRefused(RuntimeError):
     """Read-time cross-source rebase could not establish ONE basis for a symbol.
 
-    Raised only when `QUANT_REBASE_ADJUST_FACTORS` is on (default off = legacy behaviour) and a
-    symbol's `adjust_factors` rows come from more than one source, so `qfq`/`hfq` would otherwise
-    multiply a window by two unrelated origins.
+    Raised only when `QUANT_REBASE_ADJUST_FACTORS` is on (default ON as of 2026-11-26; opt-out
+    with QUANT_REBASE_ADJUST_FACTORS=0) and a symbol's `adjust_factors` rows come from more than
+    one source, so `qfq`/`hfq` would otherwise multiply a window by two unrelated origins.
 
     WHY the rebase exists: the table's write path is keyed on `(symbol, date)` and holds a
     `source` column whose two writers normalise differently (BaoStock accumulates from the IPO,
@@ -170,6 +172,8 @@ class AdjustFactorRebaseRefused(RuntimeError):
     RULE_NO_ANCHOR = "no-anchor"
     #: The applied per-source multipliers do not meet at the seam (an arithmetic/plumbing bug).
     RULE_SEAM_MISMATCH = "seam-mismatch"
+    #: Interleaved source sequence (A -> B -> A).
+    RULE_INTERLEAVED_SOURCE = "interleaved-source"
 
     def __init__(
         self,
@@ -211,8 +215,19 @@ class AdjustFactorRebaseRefused(RuntimeError):
                 "This is an implementation/plumbing defect (a scale applied to the wrong "
                 "segment, a scale that also reached the divisor, or a one-row as-of slip), not "
                 "a corporate action: a genuine split/bonus/dividend is a single-date monotone "
-                "step inside ONE source's chain, so both rebased sides move together. Unset "
-                "QUANT_REBASE_ADJUST_FACTORS to read the legacy (unrebase) prices."
+                "step inside ONE source's chain, so both rebased sides move together. Set "
+                "QUANT_REBASE_ADJUST_FACTORS=0 to read the legacy (unrebase) prices."
+            )
+        elif rule == self.RULE_INTERLEAVED_SOURCE:
+            detail = (
+                f"interleaved adjust-factor source sequence: source {next_source!r} reappeared "
+                f"at {seam_date} after intervening source {prev_source!r} ({spans}). "
+                f"Chaining non-contiguous source segments with different base scales drifts factor series."
+            )
+            advice = (
+                "re-pull adjust factors with a single consistent provider or clean non-contiguous "
+                "source entries from adjust_factors table. Set QUANT_REBASE_ADJUST_FACTORS=0 to "
+                "read legacy unrebased prices."
             )
         else:
             detail = (
@@ -601,8 +616,29 @@ def _rebase_source_scales(
     if fac_df is None or fac_df.empty or "source" not in fac_df.columns:
         return None
 
+    fac_df = fac_df.sort_index()
     raw_sources = fac_df["source"]
     keys = [None if pd.isna(v) else canonicalize_provider_key(v) for v in raw_sources]
+
+    # Chronologically verify source contiguity: fail closed on interleaved sources (A -> B -> A)
+    seen_sources = set()
+    _SENTINEL = object()
+    last_key = _SENTINEL
+    for key, dt in zip(keys, fac_df.index):
+        if key != last_key:
+            if key in seen_sources:
+                raise AdjustFactorRebaseRefused(
+                    symbol,
+                    rule=AdjustFactorRebaseRefused.RULE_INTERLEAVED_SOURCE,
+                    prev_source=str(last_key),
+                    next_source=str(key),
+                    prev_span=str(fac_df.index[keys.index(last_key)].date()) if last_key in keys else "?",
+                    next_span=str(pd.Timestamp(dt).date()),
+                    seam_date=pd.Timestamp(dt).date().isoformat(),
+                )
+            seen_sources.add(key)
+            last_key = key
+
     by_source: Dict[Any, pd.DataFrame] = {}
     for key, (_, row) in zip(keys, fac_df.iterrows()):
         by_source.setdefault(key, []).append(row)
@@ -627,9 +663,7 @@ def _rebase_source_scales(
         next_frame = frames[key]
         t_prev = prev_frame.index[-1]
         later = next_frame.index[next_frame.index >= t_prev]
-        # `later` is empty only for a fully interleaved pair (the later source's rows all precede
-        # the earlier source's last row); then the first row is the nearest observation and the
-        # seam is still well defined, just extrapolated backwards.
+        # Because contiguity is guaranteed, next_frame starts at or after prev_frame's end
         t_next = later[0] if len(later) else next_frame.index[0]
         f_prev = float(prev_frame["factor_hfq"].loc[t_prev])
         f_next = float(next_frame["factor_hfq"].loc[t_next])
@@ -957,6 +991,7 @@ def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
 _PYTEST_MARKER_ENV = "PYTEST_CURRENT_TEST"
 _ALLOW_PRODUCTION_ENV = "LIVETRADING_ALLOW_PRODUCTION_PATHS"
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
+_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off", "n", "f"})
 #: Markers used to discover the workspace root from this file's own location
 #: (mirrors `web/livetrading/storage.py::find_repo_root`, incl. the 10-level cap
 #: so a relocated/frozen install cannot walk to `/`).
@@ -1041,8 +1076,16 @@ class NullVolumeRefused(RuntimeError):
         )
 
 
-def _truthy_env(name: str) -> bool:
-    return str(os.environ.get(name, "")).strip().lower() in _TRUE_ENV_VALUES
+def _truthy_env(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    val_clean = str(val).strip().lower()
+    if val_clean == "":
+        return default
+    if default:
+        return val_clean not in _FALSE_ENV_VALUES
+    return val_clean in _TRUE_ENV_VALUES
 
 
 def production_cache_guard_active() -> bool:
@@ -1488,6 +1531,7 @@ def _bar_layer_reaches_end(
     expected_session_deadline: Optional[datetime.datetime] = None,
     expected_session_max_ts: Any = None,
     log_context: str = "",
+    symbol: Optional[str] = None,
 ) -> bool:
     """BAR half of the contract, shared by the daily and intraday gates.
 
@@ -1529,16 +1573,28 @@ def _bar_layer_reaches_end(
     max_bar_date = _coerce_session_date(max_bar_session, "max_bar_session")
     if expected_last_session is not None and max_bar_date < expected_last_session:
         return False
-    if max_bar_date < req_end_date and req_end_date <= current_date:
-        if req_end_date.weekday() < 5:
+    effective_req_end = min(req_end_date, expected_last_session) if expected_last_session is not None else req_end_date
+    if max_bar_date < effective_req_end and effective_req_end <= current_date:
+        if effective_req_end.weekday() < 5:
             return False
         # Weekend end: the requirement is that week's FRIDAY, not "any bar at all". The old
         # `weekday() < 5` test skipped the check entirely for a Saturday/Sunday `end`, so a
         # request ending Sunday 2023-12-31 counted as covered while the newest bar was 18 months
         # old -- that is why 2023 never backfilled. Friday is `weekday() - 4` days back: 1 for a
         # Saturday, 2 for a Sunday (never `-3`, which lands on Thursday).
-        friday = req_end_date - datetime.timedelta(days=req_end_date.weekday() - 4)
-        if max_bar_date < friday:
+        friday = effective_req_end - datetime.timedelta(days=effective_req_end.weekday() - 4)
+        target_date = friday
+        if symbol:
+            try:
+                market = infer_market_from_symbol(symbol)
+                holidays = holidays_for(market, friday.year)
+                while target_date.weekday() >= 5 or target_date in holidays:
+                    target_date -= datetime.timedelta(days=1)
+                    if target_date.year != friday.year:
+                        holidays = holidays | holidays_for(market, target_date.year)
+            except (UnknownSymbolMarketError, HolidayCalendarCoverageError):
+                target_date = friday
+        if max_bar_date < target_date:
             return False
     if expected_session_deadline is not None and expected_last_session is not None:
         # L2.26 time-of-day rule (intraday only). Lunch break needs no state of its own: the
@@ -1645,8 +1701,9 @@ class DuckDBCache:
 
     def __init__(self, db_path: Optional[str] = None, read_only: bool = False):
         # Read ONCE per instance (see `REBASE_ADJUST_FACTORS_ENV`): the cross-source rebase is
-        # opt-in, and with the variable unset every read path below keeps the legacy arithmetic.
-        self._rebase_adjust_factors = _truthy_env(REBASE_ADJUST_FACTORS_ENV)
+        # enabled by default (default=True) as of 2026-11-26. Setting QUANT_REBASE_ADJUST_FACTORS=0
+        # opts out to legacy unrebased prices.
+        self._rebase_adjust_factors = _truthy_env(REBASE_ADJUST_FACTORS_ENV, default=True)
         if db_path is None or db_path == ":memory:":
             if read_only:
                 raise ValueError("':memory:' caches are per-process scratch state; read_only=False only")
@@ -2129,6 +2186,7 @@ class DuckDBCache:
             expected_session_deadline=session_deadline,
             expected_session_max_ts=session_max_ts,
             log_context=f"{provider}/{symbol} {interval}",
+            symbol=symbol,
         )
 
     def is_range_covered(
@@ -2319,7 +2377,9 @@ class DuckDBCache:
         if isinstance(min_bar_date, (pd.Timestamp, datetime.datetime)):
             min_bar_date = min_bar_date.date()
 
-        if not _bar_layer_reaches_end(max_bar_date, req_end_date, expected_date, current_date):
+        if not _bar_layer_reaches_end(
+            max_bar_date, req_end_date, expected_date, current_date, symbol=symbol
+        ):
             return False
 
         # Layer 3 (L2.18): reject a *front hole* -- the request starts strictly before the oldest
@@ -3527,7 +3587,10 @@ class DuckDBCache:
         finally:
             if not self.is_memory:
                 con.close()
-        return float(row[0]) if row and row[0] is not None else None
+        if row and row[0] is not None:
+            val = float(row[0])
+            return val if np.isfinite(val) else None
+        return None
 
     def query_adjust_factors(
         self,
@@ -3871,7 +3934,7 @@ class DuckDBCache:
         - Bars before the first factor date use 1.0.
         - Volume and Amount are NEVER scaled!
 
-        CROSS-SOURCE REBASE (`QUANT_REBASE_ADJUST_FACTORS`, default OFF): when on and the symbol's
+        CROSS-SOURCE REBASE (`QUANT_REBASE_ADJUST_FACTORS`, default ON as of 2026-11-26; opt-out with =0): when on and the symbol's
         rows carry MORE THAN ONE `source`, every row first gets
         `factor_hfq(t) * scale[source(t)]` from `_rebase_source_scales`, so a window that spans a
         BaoStock prefix and a Fuyao suffix is priced on ONE basis instead of applying
@@ -3912,12 +3975,15 @@ class DuckDBCache:
         event_sources: Optional[np.ndarray] = None
         rebase: Optional[Dict[str, Any]] = None
         if self._rebase_adjust_factors:
-            # Opt-in: ONE full-table read replaces the legacy (latest-row + truncated-window) pair,
+            # Default ON (opt-out via QUANT_REBASE_ADJUST_FACTORS=0): ONE full-table read replaces the legacy (latest-row + truncated-window) pair,
             # so the rebase sees every source and the divisor is still the same latest row.
             fac_full = self.query_adjust_factors(symbol)
             if fac_full.empty:
                 raise MissingAdjustFactorsError(symbol)
-            hfq_latest = float(fac_full["factor_hfq"].values[-1])
+            latest_raw = fac_full["factor_hfq"].values[-1]
+            if pd.isna(latest_raw) or not np.isfinite(float(latest_raw)):
+                raise MissingAdjustFactorsError(symbol)
+            hfq_latest = float(latest_raw)
             rebase = _rebase_source_scales(fac_full, symbol)
             fac_df = fac_full.loc[fac_full.index <= pd.Timestamp(max_bar_date)]
             if fac_df.empty:

@@ -1044,3 +1044,73 @@ def test_c62_anchor3_is_nested_in_legacy_block_and_keys_stay_distinct():
         BaseBlendAllocationStrategy.LEGACY_CONFLUENCE_SIZING_KEY
         != BaseBlendAllocationStrategy.TRACK_C_ANCHOR3_CONFLUENCE_SIZING_KEY
     )
+
+
+def test_rule9_10_anchor2_consolidation_density_discriminating_probe():
+    """Rule 9/10 Discriminating Probe for CQ2 masked-denominator consolidation_density.
+
+    Constructs a synthetic late-IPO symbol:
+    - Bars 0..58 (warmup): VAL/VAH is NaN -> consolidation_density is NaN.
+    - Bars 59..77: 100% overlap with VAL/VAH ([ZD, ZG]).
+      Under the unmasked denominator, density was diluted to ~ (i - 58) / 20 < 0.40 on bars 59..65+,
+      causing false vetoes (raw_w[s] = 0.0).
+      Under masked denominator, density == 1.0 >= 0.40 on ALL bars 59..77 -> exactly 0 vetoes.
+    - Bars 78+: full 20-bar post-warmup window -> masked density is bit-identical to unmasked formula.
+    """
+    from common.structural_factors import consolidation_density
+
+    n_bars = 100
+    dates = pd.date_range("2024-01-01", periods=n_bars, freq="B")
+    warm = 59
+    window = 20
+
+    # Build bars with volume
+    df = _build_synthetic_bar_df(dates, base_price=20.0, daily_ret=0.001)
+    df["Volume"] = 1000.0
+
+    # Synthetic ZD/ZG (VAL/VAH): NaN on bars 0..58, and generously envelop bars 59..99
+    zd = pd.Series(np.nan, index=dates)
+    zg = pd.Series(np.nan, index=dates)
+    zd.iloc[warm:] = df["Low"].iloc[warm:].min() - 5.0
+    zg.iloc[warm:] = df["High"].iloc[warm:].max() + 5.0
+
+    # 1. Masked density (current production implementation)
+    cd_masked = consolidation_density(df, zd=zd, zg=zg, window=window)
+
+    # 2. Unmasked denominator formula (pre-fix reference)
+    v = df["Volume"].values.astype(float)
+    h = df["High"].values.astype(float)
+    l = df["Low"].values.astype(float)
+    a = zd.values.astype(float)
+    b = zg.values.astype(float)
+    ratio = np.zeros(n_bars, dtype=float)
+    for i in range(n_bars):
+        if np.isnan(a[i]) or np.isnan(b[i]) or not (b[i] > a[i]):
+            ratio[i] = 0.0
+        else:
+            inter = max(0.0, min(h[i], b[i]) - max(l[i], a[i]))
+            ratio[i] = float(np.clip(inter / (h[i] - l[i] + 1e-8), 0.0, 1.0))
+    unmasked_num = pd.Series(ratio * v, index=dates).rolling(window, min_periods=1).sum()
+    unmasked_den = pd.Series(v, index=dates).rolling(window, min_periods=1).sum()
+    cd_unmasked = np.clip(unmasked_num / (unmasked_den + 1e-8), 0.0, 1.0)
+    cd_unmasked = cd_unmasked.where(pd.notna(zd), np.nan)
+
+    # Veto threshold in Anchor 2
+    min_density = 0.45
+
+    # PROBE MEASUREMENT on bars 59..77:
+    unmasked_vetoes = int((cd_unmasked.iloc[warm:warm + window - 1] < min_density).sum())
+    masked_vetoes = int((cd_masked.iloc[warm:warm + window - 1] < min_density).sum())
+
+    # The unmasked formula caused > 0 false vetoes (9 bars vetoed: bars 59..67)
+    assert unmasked_vetoes > 0, f"unmasked formula expected to trigger vetoes, got {unmasked_vetoes}"
+    # The masked formula records exactly 0 vetoes (all density == 1.0)
+    assert masked_vetoes == 0, f"masked formula should record 0 vetoes on 100% overlapping bars, got {masked_vetoes}"
+
+    # Zero-drift probe on bars 78+:
+    # Once full 20 bars of value area are available, masked and unmasked are bit-identical.
+    np.testing.assert_allclose(
+        cd_masked.iloc[warm + window - 1:].values,
+        cd_unmasked.iloc[warm + window - 1:].values,
+        rtol=1e-12,
+    )

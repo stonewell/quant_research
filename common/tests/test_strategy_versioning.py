@@ -63,6 +63,7 @@ from pipeline.research_strategy.rs.chan_advanced_strategies import (
     ChanFourStateExecutionStrategy,
     ChanCompositeStrategy,
     ChanMeanReversionDivergenceStrategy,
+    ChanTrendThirdBuyStrategy,
 )
 from pipeline.research_strategy.rs.chan_vp_hybrid_strategy import (
     ChanVolumeProfileHybridStrategy,
@@ -207,13 +208,13 @@ def test_blend_strategies_versioning():
     for b_cls in blend_classes:
         exp = expected_versions[b_cls]
         inst = b_cls()
-        assert inst.BASE_VERSION == "2.3.0"
+        assert inst.BASE_VERSION == "2.4.0"
         assert inst.version == exp
-        assert inst.base_version == "2.3.0"
-        assert f"v{exp} [base: v2.3.0]" in inst.version_string
+        assert inst.base_version == "2.4.0"
+        assert f"v{exp} [base: v2.4.0]" in inst.version_string
         v_info = inst.get_version_info()
         assert v_info["version"] == exp
-        assert v_info["base_version"] == "2.3.0"
+        assert v_info["base_version"] == "2.4.0"
         assert "sub_strategies" in v_info
         assert len(v_info["sub_strategies"]) > 0
 
@@ -241,6 +242,7 @@ def test_research_strategies_versioning():
         WyckoffChanSpringStrategy: "1.1.0",
         ChanMeanReversionDivergenceStrategy: "1.1.0",
         ChanVolumeProfileHybridStrategy: "1.1.0",
+        ChanTrendThirdBuyStrategy: "1.1.0",
         MicrostructureAlphaCompositeStrategy: "1.2.0",
     }
     for cls, expected in expected_versions.items():

@@ -1779,8 +1779,8 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
     line-height: 1.5;
 }
 
-/* WV1: the dimension-signal table lists sub-strategy SHARES of the held book, not
-   direction scores -- label it as such, above the numbers. */
+/* WV1: the dimension-signal table lists sub-strategy independent sleeve weights, not
+   direction scores and not summing to 100% across sleeves -- label it as such, above the numbers. */
 .dimension-signals-caption {
     font-weight: 600;
     color: #38bdf8;

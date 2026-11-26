@@ -2882,15 +2882,25 @@
         return { key: "HOLD", cls: "badge badge-hold", text: "⚪ HOLD (维持)" };
     }
 
+    function escapeHtml(value) {
+        if (value === null || value === undefined) return "";
+        return String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
     // -------------------------------------------------------------------------
     // WV1 -- weight cells are PASSED THROUGH, never recomputed.
     //
     // The ticket artifact already carries three target coordinates per row:
-    // `target_weight` (the delivered/ticket coordinate the engine trades),
-    // `target_weight_model` (the sub-strategy blend's own final target, frozen
-    // before inertia / entry-confirmation-band filtering) and
-    // `target_weight_effective` (the target after those filters). The page only
-    // formats them; it must never re-derive one from another.
+    // `target_weight` (the delivered/ticket coordinate the engine trades, after
+    // lot-rounding), `target_weight_model` (post-Stage-1/vol-cap/lifecycle/min-entry
+    // target before lot rounding, also forced to 0.0 by vol-ceiling force-exit), and
+    // `target_weight_effective` (post-lot-rounding delivered weight).
+    // The page only formats them; it must never re-derive one from another.
     //
     // An ABSENT key and a genuine `0.0` are different facts and must look
     // different: a run that never produced a model coordinate has nothing to
@@ -2971,16 +2981,13 @@
             tdCurW.setAttribute("data-label", "当前仓位");
             tdCurW.textContent = `${((r.current_weight || 0) * 100).toFixed(1)}%`;
 
-            const tdTgtW = document.createElement("td");
-            tdTgtW.className = "text-right font-mono";
-            tdTgtW.setAttribute("data-label", "目标仓位");
-            tdTgtW.textContent = `${((r.target_weight || 0) * 100).toFixed(1)}%`;
+            const tdTgtW = buildWeightPctCell(r.target_weight, "目标仓位");
 
-            // WV1: model target (post-blend) then delivered target (post-inertia /
-            // confirmation band), rendered straight from the artifact so the four
-            // weight columns read current -> model -> delivered -> delta.
-            const tdTgtModelW = buildWeightPctCell(r.target_weight_model, "模型目标", "col-weight-model");
-            const tdTgtEffW = buildWeightPctCell(r.target_weight_effective, "交付目标", "col-weight-effective");
+            // WV1: model target (post-blend/lifecycle, before lot rounding) then
+            // delivered weight (post-lot-rounding), rendered straight from the artifact
+            // so the four weight columns read current -> model -> delivered -> delta.
+            const tdTgtModelW = buildWeightPctCell(r.target_weight_model, "生命周期后目标(取整前)", "col-weight-model");
+            const tdTgtEffW = buildWeightPctCell(r.target_weight_effective, "交付权重(取整后)", "col-weight-effective");
 
             const tdDeltaW = document.createElement("td");
             tdDeltaW.className = "text-right font-mono";
@@ -3444,21 +3451,22 @@
         if (dimEntries.length === 0) {
             return '<span class="text-muted">单策略单一维度信号</span>';
         }
-        let dTable = '<div class="dimension-signals-caption">权重份额，非方向信号</div>'
-            + '<div class="dimension-signals-note text-muted">下表百分比是子策略 / 因子维度在这一已持仓组合内部的权重份额（合计 ≈ 100%），不是方向判断，也不是候选池排序分数。</div>'
-            + '<table class="order-detail-table"><thead><tr><th>子策略 / 因子维度</th><th>模型输出权重</th><th>信号倾向</th></tr></thead><tbody>';
+        let dTable = '<div class="dimension-signals-caption">子策略组合权重，非方向信号</div>'
+            + '<div class="dimension-signals-note text-muted">下表百分比为各子策略 / 因子维度各自组合内分配给该标的的权重（各路独立口径，跨路合计不等于 100%），不代表方向投票或候选池排序分数，且未经生命周期与风控过滤。</div>'
+            + '<table class="order-detail-table"><thead><tr><th>子策略 / 因子维度</th><th>子策略权重</th><th>配置状态</th></tr></thead><tbody>';
         dimEntries.forEach(([dName, dWeight]) => {
+            const safeName = escapeHtml(dName);
             const wVal = parseFloat(dWeight) || 0;
             const pct = (wVal * 100).toFixed(1);
             if (dName === "macro_breadth_thrust") {
                 const titleHtml = `<code style="color: #38bdf8;">🚀 宏观动量冲力预部署 (Macro Breadth Thrust)</code><div class="text-muted" style="font-size: 11px; margin-top: 2px;">大盘动量冲力 ≥ 60% 时，将闲置资金自动配置于 20日 ROC 强势龙头，杜绝现金拖累。</div>`;
-                const tag = '<span class="badge badge-go">牛市冲力扫单</span>';
+                const tag = '<span class="badge badge-go">冲力预部署</span>';
                 dTable += `<tr><td>${titleHtml}</td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
             } else {
                 const tag = wVal > 0.05
-                    ? '<span class="badge badge-go">积极做多</span>'
-                    : (wVal > 0.0 ? '<span class="badge badge-sweep">轻度配置</span>' : '<span class="badge badge-hold">空仓/防守</span>');
-                dTable += `<tr><td><code style="color: #cbd5e1;">${dName}</code></td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
+                    ? '<span class="badge badge-go">高配 (>5%)</span>'
+                    : (wVal > 0.0 ? '<span class="badge badge-sweep">轻配 (0-5%]</span>' : '<span class="badge badge-hold">未配置 (0%)</span>');
+                dTable += `<tr><td><code style="color: #cbd5e1;">${safeName}</code></td><td class="font-mono"><strong>${pct}%</strong></td><td>${tag}</td></tr>`;
             }
         });
         dTable += '</tbody></table>';
@@ -3486,16 +3494,16 @@
         // 2. Summary Reason
         if (el.modalSummaryReason) {
             const summary = dr.summary_reason || ticket.summary_reason || ticket.reason || "最优目标权重维持";
-            el.modalSummaryReason.innerHTML = `<div style="font-weight: 600; color: #38bdf8; font-size: 13px;">${summary}</div>`;
+            el.modalSummaryReason.innerHTML = `<div style="font-weight: 600; color: #38bdf8; font-size: 13px;">${escapeHtml(summary)}</div>`;
         }
 
         // 3. Strategy Version
         if (el.modalStrategyVersion) {
             const stratVer = ticket.strategy_version || "1.0.0";
             const baseVer = ticket.base_version;
-            let vHtml = `<span class="badge badge-go font-mono">策略版本: v${stratVer}</span>`;
+            let vHtml = `<span class="badge badge-go font-mono">策略版本: v${escapeHtml(stratVer)}</span>`;
             if (baseVer) {
-                vHtml += ` <span class="badge badge-sweep font-mono ms-2">基类版本: v${baseVer}</span>`;
+                vHtml += ` <span class="badge badge-sweep font-mono ms-2">基类版本: v${escapeHtml(baseVer)}</span>`;
             }
             el.modalStrategyVersion.innerHTML = vHtml;
         }

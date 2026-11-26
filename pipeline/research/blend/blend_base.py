@@ -232,9 +232,13 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     REMOVES names from a retention shortlist -- no state layout or "who writes the row"
     moves. It is UNCONDITIONAL (no flag): retention is a churn-suppression courtesy for
     qualifying incumbents, never a way to keep a disqualified one alive. See §54.
+
+    `BASE_VERSION 2.4.0` (2026-11-26) fixes post-warmup denominator dilution in
+    `consolidation_density` (CQ2) by masking both numerator and denominator with
+    `va_available`, eliminating ~19 bars of artificial dilution following warmup.
     """
 
-    BASE_VERSION: str = "2.3.0"
+    BASE_VERSION: str = "2.4.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -254,7 +258,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.3.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.4.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",

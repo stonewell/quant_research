@@ -671,10 +671,11 @@ def consolidation_density(
     bar_len = high_val[normal_bar] - low_val[normal_bar] + 1e-8
     overlap_ratio[normal_bar] = np.clip(inter_len / bar_len, 0.0, 1.0)
 
-    overlapped_vol = pd.Series(overlap_ratio * vol_val, index=bars.index)
-    total_vol = pd.Series(vol_val, index=bars.index)
+    va_mask = va_available.astype(float)
+    overlapped_vol = pd.Series(overlap_ratio * vol_val * va_mask, index=bars.index)
+    avail_vol = pd.Series(vol_val * va_mask, index=bars.index)
     density = overlapped_vol.rolling(window, min_periods=1).sum() / (
-        total_vol.rolling(window, min_periods=1).sum() + 1e-8
+        avail_vol.rolling(window, min_periods=1).sum() + 1e-8
     )
     density = density.clip(0.0, 1.0)
     # CQ2: mask bars whose value area is unavailable -> float NaN (never None).

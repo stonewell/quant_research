@@ -1944,6 +1944,16 @@ def test_chan_trend_third_buy_vp_filter():
         spy_def = w_default["SPY"].fillna(0.0)
         assert (spy_strict <= spy_def).all()
 
+    # 3. When min_density <= 0.0, vp_filter does not veto entries (including bars with NaN density during warmup)
+    w_zero_vp = strat_default.generate_weights(
+        universe,
+        params={
+            "chan_b3_enable_vp_filter": True,
+            "chan_vp_min_consolidation_density": 0.0,
+        },
+    )
+    pd.testing.assert_frame_equal(w_default, w_zero_vp)
+
 
 def test_chan_mrd_entry_modes_and_backward_compatibility():
     universe = create_mock_universe(300)
