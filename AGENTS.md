@@ -277,20 +277,31 @@ available in the current shell.
     - In multi-agent/swarm workflows, workers must immediately post an alert to `@coordinator`
       (e.g., `@coordinator [alert] ...`) upon any failure, stall, or restart, and the coordinator
       must immediately relay it to the user before continuing background execution.
-13. **End-to-End Dry-Run / Smoke Verification Before Long-Running Temporary Scripts**:
+13. **End-to-End Same-Path Dry-Run / Smoke Verification Before Long-Running Temporary Scripts**:
     - Before launching any newly generated or modified temporary/scratch script expected to run
       for more than a few minutes (e.g., multi-arm ablations, walkforward folds, ERS loops, or
       batch data syncs), the agent **must first execute a fast end-to-end smoke run on a small
-      data slice** (e.g., 1–2 arms, 1–2 folds including edge folds such as Fold 1 with pre-IPO
-      missing symbols, `n_random=2` for ERS, and full report serialization + downstream checker
-      invocation).
-    - The smoke run must exercise **every stage and code path** of the script — data loading,
-      all evaluation arms, fold slicing, ERS/statistical gates, checkpoint save/load, JSON/MD
-      rendering, and CLI post-checks — so signature mismatches, key errors, or serialization bugs
-      fail in seconds rather than after long compute runs.
-    - Multi-stage or long-running scripts must also persist **incremental atomic checkpoints**
-      (e.g., per-stage and per-batch fold caches) before entering later stages so completed
-      compute is never lost on a late failure.
+      data slice** (e.g., baseline + 1 candidate arm, 1–2 folds including edge folds such as
+      Fold 1 with pre-IPO missing symbols, `n_random=2` for ERS, `top_k=1` for LOO).
+    - **Same-path invariant (no shortcut/mock smoke functions)**: `--smoke` must execute the
+      **exact same `main()` pipeline, statistical helpers, and report renderers** as the full
+      run — differing **only** in scale parameters (arm subset, fold subset, ERS draw count,
+      isolated smoke output directory). Writing a separate `_run_smoke()` shortcut that exits
+      early (`if args.smoke: return 0`) or substitutes dummy/duplicated metric calls is strictly
+      prohibited, because it leaves the real downstream code paths unexercised.
+    - **Full downstream coverage**: the smoke run must execute every real stage to completion —
+      data loading, all arm builders, fold slicing, statistical gates (Option B, DSR, ERS, LOO,
+      MS5, lot-rounding), incremental checkpoint save **and** reload round-trip, real JSON +
+      Markdown report rendering, DuckDB MD5 verification, and every external CLI post-checker
+      (e.g., `deep_review_toolkit.py --check-rule10 <smoke_json>`) — writing into a dedicated
+      smoke temp directory so full-run artifacts/checkpoints are never clobbered.
+    - **Incremental atomic checkpoints**: multi-stage or long-running scripts must persist
+      incremental atomic checkpoints (write to `.tmp` then `os.replace`) after each expensive
+      stage (precomputed weights, fold batches, raw JSON **before** report rendering) so
+      completed compute is never lost on a late failure.
+    - **Re-smoke after any edit**: any modification to the script after `--smoke` passes — even
+      a 1-line fix to a report template, dict key, or argument name — invalidates the smoke
+      pass and requires re-running `--smoke` to green before launching the full compute run.
 
 
 
