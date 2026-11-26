@@ -490,7 +490,8 @@ def test_wyckoff_spring_boundary_inputs_and_strict_causality():
 
 def test_consolidation_density_matches_row_loop_reference():
     """M5: the overlap-ratio volume density matches an independent per-row
-    Python loop, stays inside [0, 1], and NaN pivots degrade to 0.0."""
+    Python loop, stays inside [0, 1], and NaN pivots degrade to NaN
+    ("insufficient data", not "no consolidation" — Task CQ2)."""
     bars = _walk(90, seed=12)
     zd = bars["Low"].rolling(20, min_periods=1).min() * 0.99
     zg = bars["High"].rolling(20, min_periods=1).max() * 1.01
@@ -513,7 +514,10 @@ def test_consolidation_density_matches_row_loop_reference():
     assert np.all((got >= 0.0) & (got <= 1.0))
 
     nan_pivots = consolidation_density(bars, pd.Series(np.nan, index=bars.index), pd.Series(np.nan, index=bars.index))
-    assert np.all(nan_pivots.to_numpy() == 0.0) and not nan_pivots.isna().any()
+    # CQ2: an all-NaN value area is "insufficient history", NOT "no consolidation" —
+    # it must be NaN so the anchor-2 gate's `pd.notna` guard passes instead of vetoing.
+    # (The old `== 0.0 and not isna()` contract was exactly the defect this task fixes.)
+    assert np.all(nan_pivots.isna())
 
     empty = consolidation_density(
         pd.DataFrame({"High": [], "Low": [], "Close": []}), pd.Series(dtype=float), pd.Series(dtype=float)

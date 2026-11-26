@@ -615,7 +615,11 @@ def consolidation_density(
     Returns
     -------
     pd.Series
-        Series named 'consolidation_density' in [0.0, 1.0].
+        Series named 'consolidation_density' in [0.0, 1.0], with NaN on bars
+        whose value area is unavailable (NaN `ZD`/`ZG`, i.e. the warm-up of
+        `compute_rolling_poc_series`). A genuine ``0.0`` therefore always means
+        "the value area WAS known and the bar's range did not overlap it",
+        never "insufficient data" (Task CQ2).
     """
     high = bars["High"].astype(float)
     low = bars["Low"].astype(float)
@@ -638,6 +642,19 @@ def consolidation_density(
 
     valid_z = (~np.isnan(zd_val)) & (~np.isnan(zg_val)) & (zg_val > zd_val)
 
+    # Task CQ2 (Defect: "insufficient data" masquerading as "no consolidation").
+    # A missing value area (NaN ZD/ZG -- exactly the first `lookback-1` bars of
+    # `compute_rolling_poc_series`) is NOT evidence of no consolidation. The
+    # aggregation below still treats those bars as zero overlap so that every
+    # window that reaches the post-warm-up region stays byte-identical to the
+    # pre-fix computation, but the OUTPUT is masked to NaN at exactly the bars
+    # whose value area is unknown. That lets the anchor-2 gate's
+    # `pd.notna(c_dens)` guard (`blend_base.py`) distinguish "insufficient
+    # history -> do not veto" from a genuine `0.0` (price fully outside a valid
+    # [ZD, ZG]). Note this is deliberately NOT `valid_z`: a degenerate pivot
+    # (ZG <= ZD) is still "available", and keeps its historical 0.0.
+    va_available = (~np.isnan(zd_val)) & (~np.isnan(zg_val))
+
     flat_bar = valid_z & (high_val <= low_val)
     overlap_ratio[flat_bar] = np.where(
         (close_val[flat_bar] >= zd_val[flat_bar]) & (close_val[flat_bar] <= zg_val[flat_bar]),
@@ -659,7 +676,10 @@ def consolidation_density(
     density = overlapped_vol.rolling(window, min_periods=1).sum() / (
         total_vol.rolling(window, min_periods=1).sum() + 1e-8
     )
-    return density.clip(0.0, 1.0).rename("consolidation_density")
+    density = density.clip(0.0, 1.0)
+    # CQ2: mask bars whose value area is unavailable -> float NaN (never None).
+    density = density.where(pd.Series(va_available, index=bars.index), np.nan)
+    return density.rename("consolidation_density")
 
 
 def _pregroup_intraday_5m_for_cyq(

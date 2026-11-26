@@ -1527,6 +1527,18 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                                     # configured value inert on this, the only blend-side
                                     # veto consumer, and silently disagreed with the
                                     # declared 0.45.
+                                    # Task CQ2 (naming + NaN semantics): this leg is
+                                    # Volume-Profile value-area overlap
+                                    # (`common.structural_factors.consolidation_density`,
+                                    # fed `zd`/`zg` = VAL/VAH on the blend path, see
+                                    # structural_factors.py's enrichment block) — it is
+                                    # NOT the CYQ chip-distribution quantity. The gate's
+                                    # "cyq quality" name covers only the
+                                    # `cyq_winner_ratio` leg above; `cyq_cost_concentration`
+                                    # is not consulted here. `consolidation_density` now
+                                    # emits NaN while the value area is unavailable
+                                    # (warm-up), so `pd.notna` means "insufficient
+                                    # history -> do not veto". A genuine 0.0 still vetoes.
                                     if pd.notna(c_dens) and float(c_dens) < min_consolidation_density:
                                         raw_w[s] = 0.0
 

@@ -25,6 +25,7 @@ if _REPO_ROOT not in sys.path:
 from common.structural_factors import (
     CURVATURE_KAPPA_BOUND_WINDOW5,
     DEFAULT_REACHABLE_MIN_CURVATURE,
+    consolidation_density,
     enrich_universe_with_structural_features,
     compute_rolling_poc_series,
     extremum_curvature,
@@ -818,3 +819,107 @@ def test_cyq_5m_pregrouped_kernel_matches_legacy_reference_and_edge_cases():
     _ = cyq_cost_deviation(b_daily, n_bins=50, intraday_5m_bars=b_5m, turn_mode="relative")
     elapsed = time.perf_counter() - t0
     assert elapsed < 2.0, f"Pre-grouped 5m CYQ took {elapsed:.3f}s (expected < 2.0s)"
+
+
+# ---------------------------------------------------------------------------
+# Task CQ2: `consolidation_density` must report "insufficient data" (NaN) on
+# its warm-up instead of a genuine-looking 0.0, while keeping a real 0.0 for a
+# valid value area the price sat entirely outside of.
+# ---------------------------------------------------------------------------
+
+
+def test_cq2_consolidation_density_warmup_is_nan_not_zero():
+    """The first `lookback-1` bars have no value area -> NaN, never 0.0.
+
+    `compute_rolling_poc_series` leaves VAL/VAH NaN for its warm-up; the old
+    implementation turned every such bar into `0.0`, which the anchor-2 gate
+    read as "no consolidation" and vetoed.
+    """
+    np.random.seed(20261125)
+    n = 140
+    bars = _build_test_bars(n)
+    _poc, val, vah = compute_rolling_poc_series(bars, lookback=60)
+    density = consolidation_density(
+        bars, pd.Series(val, index=bars.index), pd.Series(vah, index=bars.index)
+    )
+
+    assert density.dtype.kind == "f", "NaN must be float NaN, not object/None"
+    assert density.iloc[:59].isna().all(), "warm-up bars must be NaN, not 0.0"
+    assert density.iloc[59:].notna().all(), "post-warm-up bars must be finite"
+    assert np.isfinite(density.iloc[59:].to_numpy()).all()
+
+    # A frame shorter than the lookback has no value area at all.
+    short = _build_test_bars(40)
+    _p2, v2, vh2 = compute_rolling_poc_series(short, lookback=60)
+    d_short = consolidation_density(short, pd.Series(v2, index=short.index), pd.Series(vh2, index=short.index))
+    assert len(d_short) == 40 and d_short.isna().all()
+
+
+def test_cq2_consolidation_density_keeps_genuine_zero_with_valid_value_area():
+    """A VALID [ZD, ZG] the bar range never touches must still yield 0.0."""
+    n = 30
+    zd = pd.Series(90.0, index=range(n))
+    zg = pd.Series(110.0, index=range(n))
+    bars_out = pd.DataFrame(
+        {
+            "High": np.full(n, 125.0),
+            "Low": np.full(n, 115.0),
+            "Close": np.full(n, 120.0),
+            "Volume": np.full(n, 1000.0),
+        }
+    )
+    d_out = consolidation_density(bars_out, zd, zg, window=10)
+    assert not d_out.isna().any(), "genuine zero must survive; only missing value areas are NaN"
+    np.testing.assert_allclose(d_out, 0.0)
+
+    # The flat-bar branch keeps its 0.0 too (close outside [ZD, ZG]).
+    bars_flat = pd.DataFrame(
+        {
+            "High": np.full(n, 120.0),
+            "Low": np.full(n, 120.0),
+            "Close": np.full(n, 120.0),
+            "Volume": np.full(n, 1000.0),
+        }
+    )
+    d_flat = consolidation_density(bars_flat, zd, zg, window=10)
+    assert not d_flat.isna().any()
+    np.testing.assert_allclose(d_flat, 0.0)
+
+
+def test_cq2_consolidation_density_post_warmup_is_bit_identical_to_prefix_reference():
+    """Zero-drift side of CQ2: every bar with a known value area must match the
+    pre-fix computation bit-for-bit (same window=20 / min_periods=1 volume
+    weighting / clip(0,1)). The inline reference below IS the pre-fix body, with
+    NaN pivots contributing zero overlap and no NaN masking."""
+    np.random.seed(7)
+    bars = _build_test_bars(180)
+    warm = 59
+    zd = (bars["Low"].rolling(20, min_periods=1).min() * 0.985).copy()
+    zg = (bars["High"].rolling(20, min_periods=1).max() * 1.015).copy()
+    zd.iloc[:warm] = np.nan
+    zg.iloc[:warm] = np.nan
+
+    window = 20
+    got = consolidation_density(bars, zd, zg, window=window)
+
+    h = bars["High"].to_numpy(dtype=float)
+    l = bars["Low"].to_numpy(dtype=float)
+    c = bars["Close"].to_numpy(dtype=float)
+    v = bars["Volume"].to_numpy(dtype=float)
+    a = zd.to_numpy(dtype=float)
+    b = zg.to_numpy(dtype=float)
+    ratio = np.zeros(len(bars), dtype=float)
+    for i in range(len(bars)):
+        if np.isnan(a[i]) or np.isnan(b[i]) or not (b[i] > a[i]):
+            ratio[i] = 0.0
+        elif h[i] <= l[i]:
+            ratio[i] = 1.0 if (a[i] <= c[i] <= b[i]) else 0.0
+        else:
+            inter = max(0.0, min(h[i], b[i]) - max(l[i], a[i]))
+            ratio[i] = float(np.clip(inter / (h[i] - l[i] + 1e-8), 0.0, 1.0))
+    num = pd.Series(ratio * v, index=bars.index).rolling(window, min_periods=1).sum()
+    den = pd.Series(v, index=bars.index).rolling(window, min_periods=1).sum()
+    expected = np.clip(num / (den + 1e-8), 0.0, 1.0)
+
+    assert got.iloc[:warm].isna().all()
+    np.testing.assert_array_equal(got.to_numpy()[warm:], expected.to_numpy()[warm:])
