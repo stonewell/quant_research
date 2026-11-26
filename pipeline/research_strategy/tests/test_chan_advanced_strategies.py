@@ -1988,4 +1988,289 @@ def test_chan_mrd_entry_modes_and_backward_compatibility():
     assert not w_comb.empty
 
 
+# --- Unit Tests: WU1 ChanVaaCompoundStrategy v1.1.0 Multi-Market & Parity ----
+
+def _make_multi_asset_universe(specs: dict, n_days: int = 360) -> dict:
+    """Helper to generate deterministic multi-asset synthetic universes."""
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    t = np.arange(n_days)
+    universe = {}
+    for sym, drift in specs.items():
+        closes = 100.0 + drift * t + 3.0 * np.sin(t / 8.0)
+        df = make_ohlcv_from_closes(closes)
+        df.index = dates
+        universe[sym] = df
+    return universe
+
+
+def test_chan_vaa_us_etf_zero_drift_with_baseline():
+    """Verify bit-identical zero-drift between v1.1.0 ('auto') and legacy 'in_universe'."""
+    specs = {
+        "SPY": 0.15,
+        "QQQ": 0.20,
+        "EFA": 0.10,
+        "EEM": 0.08,
+        "IEF": 0.02,
+        "BIL": 0.001,
+    }
+    universe = _make_multi_asset_universe(specs, n_days=380)
+    cfg = StrategyConfig()
+    strat = ChanVaaCompoundStrategy(cfg)
+
+    w_auto = strat.generate_weights(universe, params={"chan_vaa_canary_mode": "auto"})
+    diag_auto = getattr(strat, "_last_vaa_diagnostics", {})
+    assert diag_auto.get("canary_tier") == "in_universe"
+
+    w_in_univ = strat.generate_weights(universe, params={"chan_vaa_canary_mode": "in_universe"})
+    diag_in = getattr(strat, "_last_vaa_diagnostics", {})
+    assert diag_in.get("canary_tier") == "in_universe"
+
+    pd.testing.assert_frame_equal(w_auto, w_in_univ)
+    assert not w_auto.empty
+
+
+def test_chan_vaa_market_resolution_precedence_and_safety():
+    """Verify market resolution order, cash proxy filtering, synthetic safety, and invalid error."""
+    from common.market_profile import resolve_strategy_market
+    from common.market_holidays import UnknownMarketError
+
+    # 1. Precedence: params["market"] > cfg.market > trading flags > infer_market_from_symbols
+    cfg_us = StrategyConfig(market="us")
+    assert resolve_strategy_market(params={"market": "china"}, cfg=cfg_us) == "china"
+    assert resolve_strategy_market(params={}, cfg=cfg_us) == "us"
+
+    cfg_flags = StrategyConfig(china_trading=True)
+    assert resolve_strategy_market(params={}, cfg=cfg_flags) == "china"
+    assert resolve_strategy_market(params={"hk_trading": True}, cfg=cfg_flags) == "hk"
+
+    # 2. Cash proxy stripped: ["600000.SH", "BIL"] -> "china" (no false MixedMarketUniverseError)
+    assert resolve_strategy_market(symbols=["600000.SH", "BIL"], cash_proxy="BIL") == "china"
+    assert resolve_strategy_market(symbols=["0700.HK", "3199.HK"], cash_proxy="3199.HK") == "hk"
+
+    # 3. Synthetic symbols safely fallback to None without crashing
+    assert resolve_strategy_market(symbols=["STOCK_A", "ASSET_0", "BIL"], cash_proxy="BIL") is None
+
+    # 4. Unknown market raises UnknownMarketError
+    with pytest.raises(UnknownMarketError):
+        resolve_strategy_market(params={"market": "mars"})
+
+
+def test_chan_vaa_three_tiers_and_chan_unlock_across_markets():
+    """Verify Tier 1 (in_universe), Tier 2 (external + chan_unlock), and Tier 3 (breadth)."""
+    # --- A. Tier 1: China & HK ETF Pools ---
+    china_etf_specs = {
+        "510300.SH": 0.15,
+        "510500.SH": 0.18,
+        "159915.SZ": 0.22,
+        "510050.SH": 0.12,
+        "511010.SH": 0.02,
+        "511880.SH": 0.001,
+    }
+    u_china_etf = _make_multi_asset_universe(china_etf_specs, n_days=380)
+    strat = ChanVaaCompoundStrategy(StrategyConfig())
+    w_cn_t1 = strat.generate_weights(u_china_etf, params={"market": "china"})
+    assert strat._last_vaa_diagnostics["canary_tier"] == "in_universe"
+    assert not w_cn_t1.empty
+
+    hk_etf_specs = {
+        "2800.HK": 0.15,
+        "2828.HK": 0.18,
+        "3033.HK": 0.25,
+        "3199.HK": 0.01,
+    }
+    u_hk_etf = _make_multi_asset_universe(hk_etf_specs, n_days=380)
+    w_hk_t1 = strat.generate_weights(u_hk_etf, params={"market": "hk"})
+    assert strat._last_vaa_diagnostics["canary_tier"] == "in_universe"
+    assert not w_hk_t1.empty
+
+    # --- B. Tier 2: Pure Stock Pools with External Canary Bars ---
+    # China pure stocks + cash proxy
+    china_stocks_specs = {
+        "600519.SH": 0.20,
+        "000858.SZ": 0.25,
+        "000333.SZ": 0.15,
+        "511880.SH": 0.001,
+    }
+    u_china_stocks = _make_multi_asset_universe(china_stocks_specs, n_days=380)
+
+    # Bullish external canary bars (3 indices with positive momentum)
+    ext_bull_specs = {
+        "000300.SH": 0.20,
+        "000905.SH": 0.22,
+        "399006.SZ": 0.25,
+    }
+    ext_bull_bars = _make_multi_asset_universe(ext_bull_specs, n_days=380)
+
+    w_cn_t2 = strat.generate_weights(
+        u_china_stocks,
+        params={
+            "market": "china",
+            "chan_vaa_canary_bars": ext_bull_bars,
+            "chan_vaa_bull_alloc_mode": "chan_unlock",
+        },
+    )
+    diag_t2 = strat._last_vaa_diagnostics
+    assert diag_t2["canary_tier"] == "external"
+    assert diag_t2["bull_days"] > 0
+    # External symbols must NEVER leak into output columns
+    assert set(w_cn_t2.columns) == set(u_china_stocks.keys())
+    assert "000300.SH" not in w_cn_t2.columns
+
+    # Verify chan_unlock: in bull regime, equity weight sum can exceed old 0.30 cap
+    rebal_cn_t2 = w_cn_t2.dropna(how="all")
+    risky_cn_t2 = rebal_cn_t2.drop(columns=["511880.SH"], errors="ignore")
+    max_equity_sum = float(risky_cn_t2.sum(axis=1).max())
+    assert max_equity_sum > 0.30
+
+    # Bearish external canary bars (negative drift) -> falls back to defensive (<= 0.30 equity)
+    ext_bear_specs = {
+        "000300.SH": -0.20,
+        "000905.SH": -0.25,
+        "399006.SZ": -0.30,
+    }
+    ext_bear_bars = _make_multi_asset_universe(ext_bear_specs, n_days=380)
+    w_cn_bear = strat.generate_weights(
+        u_china_stocks,
+        params={
+            "market": "china",
+            "chan_vaa_canary_bars": ext_bear_bars,
+            "chan_vaa_bull_alloc_mode": "chan_unlock",
+        },
+    )
+    rebal_bear = w_cn_bear.dropna(how="all")
+    risky_bear = rebal_bear.drop(columns=["511880.SH"], errors="ignore")
+    # In defensive mode with defensive_boost=True, equity allocation is capped at 0.30
+    assert (risky_bear.sum(axis=1) <= 0.30 + 1e-6).all()
+
+    # --- C. Tier 3: Breadth Fallback (No External Canary) ---
+    w_cn_t3 = strat.generate_weights(
+        u_china_stocks,
+        params={
+            "market": "china",
+            "chan_vaa_canary_mode": "breadth",
+            "chan_vaa_breadth_bull_thresh": 0.50,
+        },
+    )
+    diag_t3 = strat._last_vaa_diagnostics
+    assert diag_t3["canary_tier"] == "breadth"
+    assert diag_t3["bull_days"] > 0
+    assert not w_cn_t3.empty
+
+
+def test_chan_vaa_strict_causality_external_canary():
+    """Verify mutating future external canary prices causes ZERO historical weight change."""
+    china_stocks_specs = {
+        "600519.SH": 0.20,
+        "000858.SZ": 0.25,
+        "511880.SH": 0.001,
+    }
+    u_stocks = _make_multi_asset_universe(china_stocks_specs, n_days=380)
+
+    ext_specs = {
+        "000300.SH": 0.15,
+        "000905.SH": 0.18,
+        "399006.SZ": 0.20,
+    }
+    ext_bars1 = _make_multi_asset_universe(ext_specs, n_days=380)
+    strat = ChanVaaCompoundStrategy(StrategyConfig())
+
+    w1 = strat.generate_weights(
+        u_stocks,
+        params={"market": "china", "chan_vaa_canary_bars": ext_bars1},
+    )
+
+    # Add 50 future days to external canaries with wild prices (future data leak test)
+    ext_bars_future = _make_multi_asset_universe(ext_specs, n_days=430)
+    for sym in ext_bars_future:
+        ext_bars_future[sym].loc[ext_bars_future[sym].index > ext_bars1[sym].index[-1], "Close"] *= 10.0
+
+    w2 = strat.generate_weights(
+        u_stocks,
+        params={"market": "china", "chan_vaa_canary_bars": ext_bars_future},
+    )
+
+    pd.testing.assert_frame_equal(w1, w2)
+
+
+def test_chan_vaa_rule3_sparse_contract_and_diagnostics():
+    """Verify sparse weights contract (explicit 0.0, all-NaN non-rebal) and complete diagnostics."""
+    china_stocks_specs = {
+        "600519.SH": 0.20,
+        "000858.SZ": 0.25,
+        "000333.SZ": -0.10,
+        "511880.SH": 0.001,
+    }
+    universe = _make_multi_asset_universe(china_stocks_specs, n_days=380)
+    strat = ChanVaaCompoundStrategy(StrategyConfig())
+
+    weights = strat.generate_weights(universe, params={"market": "china"})
+    assert not weights.empty
+
+    rebal_dates = weights.dropna(how="all").index
+    assert len(rebal_dates) > 0
+
+    # Rule 3: No NaN cells inside rebalance rows!
+    rebal_df = weights.loc[rebal_dates]
+    assert not rebal_df.isna().any().any(), "Rebalance rows must not contain any NaN cells"
+
+    # Non-rebalance rows must be completely NaN
+    non_rebal_df = weights.drop(index=rebal_dates)
+    if not non_rebal_df.empty:
+        assert non_rebal_df.isna().all().all(), "Non-rebalance rows must be all NaN"
+
+    # Total weight sum per rebalance row <= 1.0 + 1e-6 and >= -1e-6
+    row_sums = rebal_df.sum(axis=1)
+    assert (row_sums <= 1.0 + 1e-6).all(), f"Max weight sum exceeded 1.0: {row_sums.max()}"
+    assert (rebal_df >= -1e-6).all().all(), "Weights must be non-negative"
+
+    # Check diagnostic fields
+    diag = getattr(strat, "_last_vaa_diagnostics", {})
+    required_keys = {
+        "resolved_market",
+        "canary_tier",
+        "canary_symbols",
+        "bull_days",
+        "defensive_days",
+        "total_days",
+        "bull_frac",
+        "rebal_bull_count",
+        "rebal_total_count",
+        "bull_alloc_mode",
+    }
+    assert required_keys.issubset(diag.keys())
+    assert diag["total_days"] > 0
+    assert diag["bull_days"] + diag["defensive_days"] == diag["total_days"]
+
+
+def test_chan_vaa_defensive_reindex_late_start_and_explain_weights():
+    """Verify defensive assets with late starts or missing bars reindex safely without KeyError,
+    and explain_weights outputs Market=auto by default and Market=<market> when specified."""
+    dates_full = pd.bdate_range("2020-01-01", periods=380)
+    universe = {
+        "600519.SH": _make_multi_asset_universe({"600519.SH": 0.20}, n_days=380)["600519.SH"],
+        "000858.SZ": _make_multi_asset_universe({"000858.SZ": 0.25}, n_days=380)["000858.SZ"],
+    }
+    # Defensive asset 511880.SH starts 100 bars late
+    def_df = _make_multi_asset_universe({"511880.SH": 0.001}, n_days=280)["511880.SH"]
+    def_df.index = dates_full[100:]
+    universe["511880.SH"] = def_df
+
+    strat = ChanVaaCompoundStrategy(StrategyConfig())
+
+    # Must not raise KeyError when reindexing defensive scores
+    w = strat.generate_weights(universe, params={"market": "china"})
+    assert not w.empty
+    assert "511880.SH" in w.columns
+
+    # explain_weights must default to Market=auto and not contain Market=None
+    exp_default = strat.explain_weights()
+    assert "Market=auto" in exp_default
+    assert "Market=None" not in exp_default
+
+    exp_china = strat.explain_weights({"market": "china"})
+    assert "Market=china" in exp_china
+    assert "Market=None" not in exp_china
+
+
+
 

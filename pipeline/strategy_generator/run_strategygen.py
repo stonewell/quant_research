@@ -25,9 +25,11 @@ import pandas as pd
 
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_market_cli_arg,
     build_data_kwargs,
     default_results_dir,
     load_universe_with_banner,
+    resolve_market_and_trading_flags,
     shared_data_dir,
 )
 from common import plotting
@@ -135,14 +137,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Apply US equity market trading rules (1-share lots, SEC Section 31 sell fee, T+0 margin trading).")
     p.add_argument("--hk-trading", action="store_true",
                    help="Apply Hong Kong equity market trading rules (board lot sizing, 0.1085%% dual-sided stamp duty/levies, T+0 trading).")
+    add_market_cli_arg(p)
     add_data_provider_cli_args(p)
     return p
 
 
 def main():
     args = build_arg_parser().parse_args()
-    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
-        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
+    resolved_market = resolve_market_and_trading_flags(args)
     gen_config = GeneratorConfig(
         n_random_search=args.n_random_search,
         ers_percentile_threshold=args.ers_percentile_threshold,

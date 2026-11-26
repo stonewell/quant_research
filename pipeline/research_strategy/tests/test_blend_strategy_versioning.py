@@ -114,6 +114,7 @@ def test_blend_version_info_structure():
     assert "chan_four_state" in info["sub_strategies"]
     assert "chan_three_type" in info["sub_strategies"]
     assert "chan_vaa_compound" in info["sub_strategies"]
+    assert info["sub_strategies"]["chan_vaa_compound"]["version"] == "1.1.0"
     assert info["sub_strategies"]["chan_three_type"]["version"] == "1.0.0"
     # Regression: the chan_four_state leg must resolve to the four-state execution
     # machine, not the global WorldQuantAlphaStrategy #101 (see docs/version.md).

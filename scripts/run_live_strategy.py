@@ -103,12 +103,15 @@ from common.allocation_backtester import CASH_PROXY_SYMBOLS, _get_hk_board_lot
 from common.cli_utils import (
     add_data_provider_cli_args,
     add_market_clock_cli_args,
+    add_vaa_canary_cli_args,
     build_data_kwargs,
     load_live_universe,
+    load_universe_with_banner,
     persist_run_metadata,
     resolve_live_clock_context,
     shared_data_dir,
 )
+from common.market_profile import MARKET_VAA_PROFILES, template_needs_vaa_canary
 from common.financial_api import check_missing_trading_days, get_trading_days_calendar
 from common.intraday_drawdown_derisk import evaluate_intraday_drawdown
 from common.r1_derisk_report import apply_r1_intraday_derisk
@@ -2327,6 +2330,7 @@ def parse_args(args: Optional[List[str]] = None):
     # flags from design §8. Declared through the shared helper so Stage 1, Stage 2 and
     # the multi-strategy netting runner cannot drift apart.
     add_market_clock_cli_args(parser, stage="stage2")
+    add_vaa_canary_cli_args(parser)
     parsed = parser.parse_args(args)
 
     # Reconcile guard_latency_bars with backward compatibility overrides
@@ -6816,6 +6820,7 @@ def main(cli_args: Optional[List[str]] = None):
             # (Rule 11 / W1.2) Record opt-out when --no-include-turn was explicitly supplied;
             # omitted on default include_turn=True so summary.json stays byte-identical.
             **({"include_turn": False} if not bool(getattr(args, "include_turn", True)) else {}),
+            **({"enable_vaa_external_canary": False} if not bool(getattr(args, "enable_vaa_external_canary", True)) else {}),
         },
     )
 
@@ -7028,10 +7033,45 @@ def main(cli_args: Optional[List[str]] = None):
         default_bars=1,
     )
 
+    # Load external VAA canary data if needed
+    vaa_canary_bars = None
+    if getattr(args, "enable_vaa_external_canary", True) and template_needs_vaa_canary(
+        template, getattr(args, "_strategy_key", "") or getattr(args, "strategy", "")
+    ):
+        resolved_m = clock_ctx.market
+        if resolved_m in MARKET_VAA_PROFILES:
+            ext_syms = list(MARKET_VAA_PROFILES[resolved_m]["external_canary_symbols"])
+            vaa_canary_bars = {s: universe[s] for s in ext_syms if s in universe}
+            missing_ext = [s for s in ext_syms if s not in universe]
+            if missing_ext:
+                try:
+                    raw_ext = load_universe_with_banner(
+                        missing_ext,
+                        start_date,
+                        as_of_date,
+                        use_cache=not args.no_cache,
+                        cache_dir=cache_dir,
+                        data_kwargs=build_data_kwargs(args),
+                        require_nonempty=False,
+                        expected_last_session=clock_ctx.expected_last_session,
+                        include_turn=False,
+                    )
+                    if raw_ext:
+                        vaa_canary_bars.update(as_of_universe(raw_ext, as_of_date))
+                except Exception as e:
+                    print(f"[WARN] Failed to load VAA external canary bars: {e}")
+            if not vaa_canary_bars:
+                vaa_canary_bars = None
+
     # 3. Generate Weights & Extract Latest Rebalance
-    # (W1.3 / MS23) Pass raw 5m bars transiently to 5m-aware strategies (e.g. MS7)
+    # (W1.3 / MS23 / WU1) Pass raw 5m bars, market, and VAA canary bars transiently
     # without mutating `params` (which is serialized into effective_params.json).
-    _gen_params = {**params, "intraday_5m_universe": universe_5m} if universe_5m else params
+    _gen_params = dict(params)
+    if universe_5m:
+        _gen_params["intraday_5m_universe"] = universe_5m
+    _gen_params["market"] = clock_ctx.market
+    if vaa_canary_bars is not None:
+        _gen_params["chan_vaa_canary_bars"] = vaa_canary_bars
     sparse_weights = template.generate_weights(universe, _gen_params)
     rebalances = latest_rebalance_rows(sparse_weights)
     if rebalances.empty:

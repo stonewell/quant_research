@@ -36,6 +36,7 @@ All strategies inherit from `AllocationTemplate` and maximize code reuse from
 """
 
 from collections import defaultdict
+import math
 from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
@@ -48,6 +49,7 @@ from common.allocation_templates import (
     _sparse_from_daily,
 )
 from common.indicators import adx, macd, roc, sma
+from common.market_profile import MARKET_VAA_PROFILES, resolve_strategy_market
 from common.position_exits import run_stop_timeout_exit
 from common.scheduling import get_rebalance_dates as _get_rebalance_dates
 from common.structural_factors import (
@@ -68,7 +70,11 @@ from .chan_structure import (
     merge_inclusion,
 )
 from .chan_signals import compute_chan3_signals, compute_chan_pivot_macd_signals
-from .config import StrategyConfig
+from .config import (
+    DEFAULT_VAA_DEFENSIVE,
+    DEFAULT_VAA_OFFENSIVE,
+    StrategyConfig,
+)
 
 try:
     from pipeline.research.blend import (
@@ -1409,11 +1415,11 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
       or gating equity risk while strictly maintaining stop-losses.
     """
 
-    version: str = "1.0.0"
+    version: str = "1.1.0"
 
     def __init__(self, config: StrategyConfig = None, version: Optional[str] = None):
         self.config = config or StrategyConfig()
-        strat_version = version or getattr(self.__class__, "version", "1.0.0")
+        strat_version = version or getattr(self.__class__, "version", "1.1.0")
         super().__init__(name="chan_vaa_compound", param_grid={}, version=strat_version)
 
     def generate_weights(self, universe: Dict[str, pd.DataFrame], params: dict = None) -> pd.DataFrame:
@@ -1424,7 +1430,11 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
         if not symbols:
             return pd.DataFrame()
 
+        resolved_market = resolve_strategy_market(p, cfg, symbols, cash_proxy=p.get("cash_proxy", cfg.cash_proxy))
         cash_proxy = p.get("cash_proxy", cfg.cash_proxy)
+        if cash_proxy not in symbols and resolved_market in MARKET_VAA_PROFILES and MARKET_VAA_PROFILES[resolved_market]["cash_proxy"] in symbols:
+            cash_proxy = MARKET_VAA_PROFILES[resolved_market]["cash_proxy"]
+
         chan_weight = float(p.get("chan_vaa_chan_weight", cfg.chan_vaa_chan_weight))
         mode = str(p.get("chan_vaa_mode", cfg.chan_vaa_mode))
         defensive_boost = bool(p.get("chan_vaa_defensive_boost", cfg.chan_vaa_defensive_boost))
@@ -1488,44 +1498,139 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
                 chan_scaled.loc[dt] = chan_daily.loc[dt] / c
 
         # 2. Compute VAA 13612W Momentum and Regime
-        offensive_universe = p.get("chan_vaa_offensive_universe", cfg.chan_vaa_offensive_universe)
-        defensive_universe = p.get("chan_vaa_defensive_universe", cfg.chan_vaa_defensive_universe)
+        if "chan_vaa_offensive_universe" in p or cfg.chan_vaa_offensive_universe != DEFAULT_VAA_OFFENSIVE:
+            offensive_universe = list(p.get("chan_vaa_offensive_universe", cfg.chan_vaa_offensive_universe))
+        elif resolved_market in MARKET_VAA_PROFILES:
+            offensive_universe = list(MARKET_VAA_PROFILES[resolved_market]["offensive_universe"])
+        else:
+            offensive_universe = list(DEFAULT_VAA_OFFENSIVE)
+
+        if "chan_vaa_defensive_universe" in p or cfg.chan_vaa_defensive_universe != DEFAULT_VAA_DEFENSIVE:
+            defensive_universe = list(p.get("chan_vaa_defensive_universe", cfg.chan_vaa_defensive_universe))
+        elif resolved_market in MARKET_VAA_PROFILES:
+            defensive_universe = list(MARKET_VAA_PROFILES[resolved_market]["defensive_universe"])
+        else:
+            defensive_universe = list(DEFAULT_VAA_DEFENSIVE)
+
+        canary_mode = str(p.get("chan_vaa_canary_mode", getattr(cfg, "chan_vaa_canary_mode", "auto")))
+        external_canary_rule = str(p.get("chan_vaa_external_canary_rule", getattr(cfg, "chan_vaa_external_canary_rule", "all")))
+        breadth_bull_thresh = float(p.get("chan_vaa_breadth_bull_thresh", getattr(cfg, "chan_vaa_breadth_bull_thresh", 0.50)))
+        bull_alloc_mode = str(p.get("chan_vaa_bull_alloc_mode", getattr(cfg, "chan_vaa_bull_alloc_mode", "chan_unlock")))
+
+        ext_bars_raw = p.get("chan_vaa_canary_bars") or p.get("vaa_canary_bars")
+        valid_ext_bars = {
+            sym: df for sym, df in ext_bars_raw.items()
+            if isinstance(df, pd.DataFrame) and "Close" in df.columns
+        } if isinstance(ext_bars_raw, dict) else {}
 
         offensive_symbols = [s for s in offensive_universe if s in symbols]
         defensive_symbols = [s for s in defensive_universe if s in symbols]
-        all_tracked = list(dict.fromkeys(offensive_symbols + defensive_symbols))
 
-        def score_13612w(sym: str) -> pd.Series:
-            close = universe[sym]["Close"]
-            return 12 * roc(close, 21) + 4 * roc(close, 63) + 2 * roc(close, 126) + roc(close, 252)
+        if canary_mode in ("auto", "in_universe") and len(offensive_symbols) > 0:
+            canary_tier = "in_universe"
+        elif canary_mode in ("auto", "external") and len(valid_ext_bars) > 0:
+            canary_tier = "external"
+        elif canary_mode in ("auto", "breadth"):
+            canary_tier = "breadth"
+        else:
+            canary_tier = "none_defensive"
 
-        scores = pd.DataFrame({sym: score_13612w(sym) for sym in all_tracked}) if all_tracked else pd.DataFrame()
+        def _score_13612w_series(close_series: pd.Series) -> pd.Series:
+            return 12 * roc(close_series, 21) + 4 * roc(close_series, 63) + 2 * roc(close_series, 126) + roc(close_series, 252)
+
+        def_scores_df = pd.DataFrame(
+            {s: _score_13612w_series(universe[s]["Close"]) for s in defensive_symbols}
+        ).reindex(master_index) if defensive_symbols else pd.DataFrame(index=master_index)
 
         rebalance_dates = _get_rebalance_dates(master_index, rebal_freq)
         vaa_rebal_weights = pd.DataFrame(index=rebalance_dates, columns=symbols, data=0.0)
         vaa_regime_series = pd.Series(index=rebalance_dates, dtype=object)
 
-        for date in rebalance_dates:
-            off_scores = scores.loc[date, offensive_symbols].dropna() if offensive_symbols else pd.Series(dtype=float)
-            # If not enough history yet, default to defensive/cash
-            if len(off_scores) < len(offensive_symbols) or off_scores.empty:
-                vaa_regime_series.loc[date] = "defensive"
-                def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
-                if not def_scores.empty:
-                    best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
-                    vaa_rebal_weights.loc[date, best_def] = 1.0
-                elif cash_proxy in symbols:
-                    vaa_rebal_weights.loc[date, cash_proxy] = 1.0
-                continue
+        if canary_tier == "in_universe":
+            all_tracked = list(dict.fromkeys(offensive_symbols + defensive_symbols))
+            scores = (
+                pd.DataFrame({sym: _score_13612w_series(universe[sym]["Close"]) for sym in all_tracked})
+                .reindex(master_index)
+                if all_tracked else pd.DataFrame(index=master_index)
+            )
 
-            # Check if all offensive assets have positive 13612W momentum
-            if (off_scores > 0).all():
-                vaa_regime_series.loc[date] = "bull"
-                best_off = max(off_scores.index, key=lambda s: (off_scores[s], s))
-                vaa_rebal_weights.loc[date, best_off] = 1.0
-            else:
+            for date in rebalance_dates:
+                off_scores = scores.loc[date, offensive_symbols].dropna() if offensive_symbols else pd.Series(dtype=float)
+                if len(off_scores) < len(offensive_symbols) or off_scores.empty:
+                    vaa_regime_series.loc[date] = "defensive"
+                    def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
+                    if not def_scores.empty:
+                        best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
+                        vaa_rebal_weights.loc[date, best_def] = 1.0
+                    elif cash_proxy in symbols:
+                        vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+                    continue
+
+                if (off_scores > 0).all():
+                    vaa_regime_series.loc[date] = "bull"
+                    best_off = max(off_scores.index, key=lambda s: (off_scores[s], s))
+                    vaa_rebal_weights.loc[date, best_off] = 1.0
+                else:
+                    vaa_regime_series.loc[date] = "defensive"
+                    def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
+                    if not def_scores.empty:
+                        best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
+                        vaa_rebal_weights.loc[date, best_def] = 1.0
+                    elif cash_proxy in symbols:
+                        vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+
+        elif canary_tier == "external":
+            ext_scores_dict = {}
+            for sym, df in valid_ext_bars.items():
+                sub_c = df.loc[df.index <= master_index[-1], "Close"]
+                s_series = _score_13612w_series(sub_c)
+                ext_scores_dict[sym] = s_series.reindex(master_index, method="ffill", limit=5)
+            ext_scores_df = pd.DataFrame(ext_scores_dict, index=master_index)
+
+            for date in rebalance_dates:
+                valid_vals = ext_scores_df.loc[date].dropna() if not ext_scores_df.empty else pd.Series(dtype=float)
+                if external_canary_rule == "all":
+                    is_bull = (len(valid_vals) == len(valid_ext_bars)) and bool((valid_vals > 0.0).all())
+                else:  # majority
+                    is_bull = (len(valid_vals) > 0) and bool((valid_vals > 0.0).sum() >= math.ceil(len(valid_vals) / 2))
+
+                if is_bull:
+                    vaa_regime_series.loc[date] = "bull"
+                    if cash_proxy in symbols:
+                        vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+                else:
+                    vaa_regime_series.loc[date] = "defensive"
+                    def_scores = def_scores_df.loc[date].dropna() if not def_scores_df.empty else pd.Series(dtype=float)
+                    if not def_scores.empty:
+                        best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
+                        vaa_rebal_weights.loc[date, best_def] = 1.0
+                    elif cash_proxy in symbols:
+                        vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+
+        elif canary_tier == "breadth":
+            breadth_scores_df = pd.DataFrame(
+                {s: _score_13612w_series(universe[s]["Close"].reindex(master_index)) for s in risky_symbols}
+            )
+            for date in rebalance_dates:
+                valid_scores = breadth_scores_df.loc[date].dropna() if not breadth_scores_df.empty else pd.Series(dtype=float)
+                is_bull = (len(valid_scores) > 0) and float((valid_scores > 0.0).mean()) >= breadth_bull_thresh
+                if is_bull:
+                    vaa_regime_series.loc[date] = "bull"
+                    if cash_proxy in symbols:
+                        vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+                else:
+                    vaa_regime_series.loc[date] = "defensive"
+                    def_scores = def_scores_df.loc[date].dropna() if not def_scores_df.empty else pd.Series(dtype=float)
+                    if not def_scores.empty:
+                        best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
+                        vaa_rebal_weights.loc[date, best_def] = 1.0
+                    elif cash_proxy in symbols:
+                        vaa_rebal_weights.loc[date, cash_proxy] = 1.0
+
+        else:  # none_defensive
+            for date in rebalance_dates:
                 vaa_regime_series.loc[date] = "defensive"
-                def_scores = scores.loc[date, defensive_symbols].dropna() if defensive_symbols else pd.Series(dtype=float)
+                def_scores = def_scores_df.loc[date].dropna() if not def_scores_df.empty else pd.Series(dtype=float)
                 if not def_scores.empty:
                     best_def = max(def_scores.index, key=lambda s: (def_scores[s], s))
                     vaa_rebal_weights.loc[date, best_def] = 1.0
@@ -1550,41 +1655,76 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
 
             if mode == "fixed_blend":
                 # Fixed proportion blend
-                w_chan = chan_scaled.loc[date] * chan_weight if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                w_chan = (chan_scaled.loc[date].fillna(0.0) * chan_weight) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
                 w_vaa = v_weights * (1.0 - chan_weight)
                 for sym in symbols:
-                    output_weights.loc[date, sym] = (w_chan.get(sym, 0.0) if sym in w_chan else 0.0) + w_vaa.get(sym, 0.0)
+                    output_weights.loc[date, sym] = float(w_chan.get(sym, 0.0)) + float(w_vaa.get(sym, 0.0))
             else:
                 # Regime-adaptive blend
                 if regime == "bull":
-                    # Bull mode: Allocate chan_weight to Chan, remaining to VAA top offensive
-                    c_weights = chan_scaled.loc[date] if date in chan_scaled.index else pd.Series(0.0, index=symbols)
-                    c_sum = c_weights.sum()
-
-                    for sym in symbols:
-                        c_alloc = c_weights.get(sym, 0.0) * chan_weight
-                        v_alloc = v_weights.get(sym, 0.0) * (1.0 - chan_weight * c_sum)
-                        output_weights.loc[date, sym] = c_alloc + v_alloc
+                    if canary_tier in ("external", "breadth") and bull_alloc_mode == "chan_unlock":
+                        c_weights = chan_scaled.loc[date].fillna(0.0) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                        c_sum = float(c_weights.sum())
+                        rem = max(0.0, 1.0 - c_sum)
+                        for sym in symbols:
+                            c_val = float(c_weights.get(sym, 0.0))
+                            v_val = float(v_weights.get(sym, 0.0))
+                            output_weights.loc[date, sym] = c_val + v_val * rem
+                    else:
+                        c_weights = chan_scaled.loc[date].fillna(0.0) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                        c_sum = float(c_weights.sum())
+                        for sym in symbols:
+                            c_alloc = float(c_weights.get(sym, 0.0)) * chan_weight
+                            v_alloc = float(v_weights.get(sym, 0.0)) * (1.0 - chan_weight * c_sum)
+                            output_weights.loc[date, sym] = c_alloc + v_alloc
                 else:
                     # Defensive / Bear mode: Crash protection
                     if gate_in_defensive:
-                        # Zero out Chan entirely; 100% in VAA defensive asset
                         output_weights.loc[date] = v_weights
                     elif defensive_boost:
-                        # Scale down Chan exposure by 50% (or cap at 30%) and allocate balance to defensive asset
-                        c_weights = (chan_scaled.loc[date] * 0.5) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
-                        c_sum = c_weights.sum()
+                        c_weights = (chan_scaled.loc[date].fillna(0.0) * 0.5) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                        c_sum = float(c_weights.sum())
                         if c_sum > 0.30:
                             c_weights = c_weights * (0.30 / c_sum)
                             c_sum = 0.30
                         def_alloc = max(0.0, 1.0 - c_sum)
                         for sym in symbols:
-                            output_weights.loc[date, sym] = c_weights.get(sym, 0.0) + v_weights.get(sym, 0.0) * def_alloc
+                            output_weights.loc[date, sym] = float(c_weights.get(sym, 0.0)) + float(v_weights.get(sym, 0.0)) * def_alloc
                     else:
-                        c_weights = chan_scaled.loc[date] if date in chan_scaled.index else pd.Series(0.0, index=symbols)
-                        c_sum = c_weights.sum()
+                        c_weights = chan_scaled.loc[date].fillna(0.0) if date in chan_scaled.index else pd.Series(0.0, index=symbols)
+                        c_sum = float(c_weights.sum())
                         for sym in symbols:
-                            output_weights.loc[date, sym] = c_weights.get(sym, 0.0) * chan_weight + v_weights.get(sym, 0.0) * (1.0 - chan_weight * c_sum)
+                            output_weights.loc[date, sym] = float(c_weights.get(sym, 0.0)) * chan_weight + float(v_weights.get(sym, 0.0)) * (1.0 - chan_weight * c_sum)
+
+        # Record Rule 10 diagnostics
+        bull_days = int((vaa_regimes == "bull").sum())
+        defensive_days = int((vaa_regimes == "defensive").sum())
+        total_days = len(vaa_regimes)
+        bull_frac = float(bull_days / total_days) if total_days > 0 else 0.0
+        rebal_bull = int((vaa_regime_series == "bull").sum())
+        rebal_total = len(vaa_regime_series)
+
+        if canary_tier == "in_universe":
+            canary_symbols = list(offensive_symbols)
+        elif canary_tier == "external":
+            canary_symbols = list(valid_ext_bars.keys())
+        elif canary_tier == "breadth":
+            canary_symbols = list(risky_symbols)
+        else:
+            canary_symbols = []
+
+        self._last_vaa_diagnostics = {
+            "resolved_market": resolved_market,
+            "canary_tier": canary_tier,
+            "canary_symbols": canary_symbols,
+            "bull_days": bull_days,
+            "defensive_days": defensive_days,
+            "total_days": total_days,
+            "bull_frac": bull_frac,
+            "rebal_bull_count": rebal_bull,
+            "rebal_total_count": rebal_total,
+            "bull_alloc_mode": bull_alloc_mode,
+        }
 
         # Scale down if total allocation exceeds 1.0, and route unallocated capital to cash_proxy
         risky_cols = [s for s in symbols if s != cash_proxy]
@@ -1612,11 +1752,13 @@ class ChanVaaCompoundStrategy(AllocationTemplate):
         chan_w = p.get("chan_vaa_chan_weight", cfg.chan_vaa_chan_weight)
         mode = p.get("chan_vaa_mode", cfg.chan_vaa_mode)
         def_boost = p.get("chan_vaa_defensive_boost", cfg.chan_vaa_defensive_boost)
+        canary_mode = p.get("chan_vaa_canary_mode", getattr(cfg, "chan_vaa_canary_mode", "auto"))
+        market = p.get("market") or getattr(cfg, "market", None) or "auto"
         return (
             "Chan Pivot Shift MACD + VAA Optimal Compound Strategy (缠论中枢MACD与VAA动量混合最优策略): "
             f"blends ChanPivotShiftMACD (trend structural breakout, base weight={chan_w:.0%}) "
             f"with Vigilant Asset Allocation (VAA-G4 dual momentum regime crash protection). "
-            f"Mode={mode}, Defensive Boost={def_boost}."
+            f"Mode={mode}, Defensive Boost={def_boost}, Canary Mode={canary_mode}, Market={market}."
         )
 
     def warmup_bars(self, params: dict = None) -> int:

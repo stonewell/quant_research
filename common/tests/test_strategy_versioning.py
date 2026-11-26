@@ -233,7 +233,7 @@ def test_research_strategies_versioning():
 
     expected_versions = {
         ChanThreeTypeStrategy: "1.0.0",
-        ChanVaaCompoundStrategy: "1.0.0",
+        ChanVaaCompoundStrategy: "1.1.0",
         ChanFourStateExecutionStrategy: "1.0.0",
         ChanCompositeStrategy: "1.0.0",
         WorldQuantAlphaStrategy: "1.0.0",

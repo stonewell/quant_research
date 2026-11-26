@@ -51,6 +51,8 @@ from .market_clock import (
     MARKET_US,
     MarketClock,
     MixedMarketUniverseError,
+    SUPPORTED_MARKETS,
+    UnknownMarketError,
     UnknownSymbolMarketError,
     format_run_window,
     market_now,
@@ -467,6 +469,93 @@ class LiveClockContext:
         )
 
 
+def parse_market_arg(value: str) -> str:
+    """Parse and normalize --market CLI argument."""
+    try:
+        return normalize_market(value)
+    except UnknownMarketError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def add_market_cli_arg(parser: argparse.ArgumentParser) -> None:
+    """Add standard --market CLI argument to a parser."""
+    parser.add_argument(
+        "--market",
+        type=parse_market_arg,
+        choices=SUPPORTED_MARKETS,
+        default=None,
+        metavar="{us,china,hk}",
+        help=(
+            "Authoritative market identifier (us/china/hk, case-insensitive alias). "
+            "Selects trading rules, benchmark, and regime canary profiles."
+        ),
+    )
+
+
+def add_vaa_canary_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add VAA external canary CLI arguments (--vaa-external-canary / --no-vaa-external-canary)."""
+    parser.add_argument(
+        "--vaa-external-canary",
+        action=argparse.BooleanOptionalAction,
+        dest="enable_vaa_external_canary",
+        default=True,
+        help="Enable external market regime canary for ChanVaaCompoundStrategy (default: True).",
+    )
+
+
+def resolve_market_and_trading_flags(args: Any) -> Optional[str]:
+    """Resolve and synchronize --market with legacy --*-trading flags on an argparse Namespace.
+
+    Rules:
+    - If more than one of --china-trading, --us-trading, --hk-trading is enabled -> raise ValueError.
+    - If --market is provided and conflicts with an enabled legacy flag -> raise ValueError.
+    - If --market is provided without legacy flags -> automatically synchronize args.<market>_trading = True.
+    - If legacy flag is provided without --market -> automatically infer args.market.
+    - If neither is provided -> args.market remains None and all trading flags remain False.
+    """
+    market = getattr(args, "market", None)
+    if market is not None and str(market).strip() != "":
+        market = normalize_market(str(market))
+    else:
+        market = None
+
+    china_trading = bool(getattr(args, "china_trading", False))
+    us_trading = bool(getattr(args, "us_trading", False))
+    hk_trading = bool(getattr(args, "hk_trading", False))
+
+    trading_count = sum([china_trading, us_trading, hk_trading])
+    if trading_count > 1:
+        raise ValueError("At most one of --china-trading, --us-trading, --hk-trading may be specified")
+
+    if market is not None:
+        if china_trading and market != MARKET_CHINA:
+            raise ValueError(f"Conflicting market options: --market {market} with --china-trading")
+        if us_trading and market != MARKET_US:
+            raise ValueError(f"Conflicting market options: --market {market} with --us-trading")
+        if hk_trading and market != MARKET_HK:
+            raise ValueError(f"Conflicting market options: --market {market} with --hk-trading")
+
+        if hasattr(args, "china_trading"):
+            setattr(args, "china_trading", market == MARKET_CHINA)
+        if hasattr(args, "us_trading"):
+            setattr(args, "us_trading", market == MARKET_US)
+        if hasattr(args, "hk_trading"):
+            setattr(args, "hk_trading", market == MARKET_HK)
+        setattr(args, "market", market)
+        return market
+    else:
+        if china_trading:
+            market = MARKET_CHINA
+        elif us_trading:
+            market = MARKET_US
+        elif hk_trading:
+            market = MARKET_HK
+
+        if market is not None:
+            setattr(args, "market", market)
+        return market
+
+
 def add_market_clock_cli_args(parser: argparse.ArgumentParser, *, stage: str) -> None:
     """Add the market-clock flags shared by every live entrypoint (design §8).
 
@@ -483,8 +572,10 @@ def add_market_clock_cli_args(parser: argparse.ArgumentParser, *, stage: str) ->
     window_hint = "估值日收盘 + 日线发布宽限 → 次日开盘（A 股示例：15:30 → 次日 09:30）"
     parser.add_argument(
         "--market",
-        choices=(MARKET_CHINA, MARKET_HK, MARKET_US),
+        type=parse_market_arg,
+        choices=SUPPORTED_MARKETS,
         default=None,
+        metavar="{us,china,hk}",
         help=(
             "Authoritative market of this book (china/hk/us). Selects the timezone, session table and "
             "holiday calendar used to resolve the as-of date. Default: inferred from the universe file's "

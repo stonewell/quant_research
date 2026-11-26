@@ -46,12 +46,20 @@ from common.allocation_templates import ALLOCATION_TEMPLATES
 from common.duckdb_cache import is_synthetic_provider
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_market_cli_arg,
     add_output_dir_override_args,
+    add_vaa_canary_cli_args,
     bootstrap_project_paths,
     build_data_kwargs,
     default_results_dir,
     load_universe_with_banner,
+    resolve_market_and_trading_flags,
     shared_data_dir,
+)
+from common.market_profile import (
+    MARKET_VAA_PROFILES,
+    resolve_strategy_market,
+    template_needs_vaa_canary,
 )
 
 # research_strategy and fundamental_screener live under pipeline/,
@@ -209,6 +217,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = _PositionLifecycleArgumentParser(description="Standalone Basket Allocation Backtester")
     p.add_argument("--strategy-file", required=True, help="Path to strategy.json file exported by strategy_generator")
     add_universe_cli_args(p)
+    add_market_cli_arg(p)
+    add_vaa_canary_cli_args(p)
     p.add_argument("--start", default="2015-01-01")
     p.add_argument("--end", default="2024-12-31")
     p.add_argument("--interval", default="1d")
@@ -687,7 +697,21 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
             fold_metrics = _nan_fold_metrics()
         else:
             fold_5m = _slice_intraday_universe_for_range(ctx.get("intraday_5m_universe"), fold_dates)
-            _gen_params = {**params, "intraday_5m_universe": fold_5m} if fold_5m else params
+            fold_canary = None
+            raw_canary = ctx.get("vaa_canary_bars")
+            if raw_canary and isinstance(raw_canary, dict):
+                fold_canary = {
+                    sym: df.loc[df.index <= fold_dates[-1]]
+                    for sym, df in raw_canary.items()
+                    if isinstance(df, pd.DataFrame)
+                }
+            _gen_params = dict(params)
+            if fold_5m:
+                _gen_params["intraday_5m_universe"] = fold_5m
+            if ctx.get("market"):
+                _gen_params["market"] = ctx["market"]
+            if fold_canary is not None:
+                _gen_params["chan_vaa_canary_bars"] = fold_canary
             full_weights = template.generate_weights(buffered_universe, _gen_params)
             if full_weights.empty:
                 fold_metrics = _nan_fold_metrics()
@@ -1111,6 +1135,7 @@ def run_standard(
     params: dict,
     args,
     intraday_5m_universe: dict | None = None,
+    vaa_canary_bars: dict | None = None,
 ) -> dict:
     master_calendar, effective_start = _resolve_master_calendar(
         universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
@@ -1118,11 +1143,13 @@ def run_standard(
     if master_calendar.empty:
         raise ValueError("Universe contains no valid trading dates.")
 
-    _gen_params = (
-        {**params, "intraday_5m_universe": intraday_5m_universe}
-        if intraday_5m_universe
-        else params
-    )
+    _gen_params = dict(params)
+    if intraday_5m_universe:
+        _gen_params["intraday_5m_universe"] = intraday_5m_universe
+    if getattr(args, "market", None):
+        _gen_params["market"] = args.market
+    if vaa_canary_bars is not None:
+        _gen_params["chan_vaa_canary_bars"] = vaa_canary_bars
     raw_target_weights = template.generate_weights(universe, _gen_params)
     if raw_target_weights.empty:
         raise ValueError("Template generated empty weights.")
@@ -1273,6 +1300,7 @@ def run_walkforward(
     params: dict,
     args,
     intraday_5m_universe: dict | None = None,
+    vaa_canary_bars: dict | None = None,
 ) -> list:
     master_calendar, effective_start = _resolve_master_calendar(
         universe, getattr(args, "start", None), getattr(args, "end", None), min_coverage=0.20
@@ -1342,6 +1370,8 @@ def run_walkforward(
     ctx = {
         "universe": universe,
         "intraday_5m_universe": intraday_5m_universe,
+        "vaa_canary_bars": vaa_canary_bars,
+        "market": getattr(args, "market", None),
         "template": template,
         "params": params,
         "args": args,
@@ -1383,15 +1413,15 @@ def run_walkforward(
     return folds
 
 
-def _standard_score_fn(universe, args, intraday_5m_universe=None):
+def _standard_score_fn(universe, args, intraday_5m_universe=None, vaa_canary_bars=None):
     def score_fn(template, params):
-        return run_standard(universe, template, params, args, intraday_5m_universe=intraday_5m_universe)
+        return run_standard(universe, template, params, args, intraday_5m_universe=intraday_5m_universe, vaa_canary_bars=vaa_canary_bars)
     return score_fn
 
 
-def _walkforward_score_fn(universe, args, intraday_5m_universe=None):
+def _walkforward_score_fn(universe, args, intraday_5m_universe=None, vaa_canary_bars=None):
     def score_fn(template, params):
-        folds = run_walkforward(universe, template, params, args, intraday_5m_universe=intraday_5m_universe)
+        folds = run_walkforward(universe, template, params, args, intraday_5m_universe=intraday_5m_universe, vaa_canary_bars=vaa_canary_bars)
         sharpes = [f["sharpe_ratio"] for f in folds if np.isfinite(f["sharpe_ratio"])]
         mean_sharpe = float(np.mean(sharpes)) if sharpes else float("-inf")
         # Mean-fold reductions for cagr/max_drawdown/calmar_ratio, same
@@ -1839,6 +1869,7 @@ def _dump_run_manifest(
     enable_position_lifecycle: bool = True,
     position_lifecycle_config: dict | None = None,
     include_turn: bool = True,
+    enable_vaa_external_canary: bool = True,
 ) -> str:
     """Phase 1: persist the reproducibility fingerprint skeleton *before* the
     backtest runs, so a mid-run crash still leaves an auditable run_manifest.json behind."""
@@ -1892,6 +1923,8 @@ def _dump_run_manifest(
     }
     if not include_turn:
         manifest["include_turn"] = False
+    if not enable_vaa_external_canary:
+        manifest["enable_vaa_external_canary"] = False
     manifest_path = os.path.join(results_dir, "run_manifest.json")
     write_json_report(manifest, manifest_path)
     return manifest_path
@@ -1955,8 +1988,7 @@ def _finalize_run_manifest(
 
 def main():
     args = build_arg_parser().parse_args()
-    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
-        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
+    resolved_market = resolve_market_and_trading_flags(args)
     results_dir = args.results_dir or RESULTS_DIR
     cache_dir = args.cache_dir or DATA_DIR
 
@@ -2022,6 +2054,9 @@ def main():
     if not universe_symbols:
         raise ValueError("No universe symbols provided or resolved. Pass --universe, --universe-file, or --universe-provider.")
 
+    if resolved_market is None:
+        resolved_market = resolve_strategy_market(params, None, universe_symbols)
+
     warmup_template = get_template(
         template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec
     )
@@ -2038,6 +2073,34 @@ def main():
                                           data_kwargs=data_kwargs, require_nonempty=True,
                                           expected_last_session=backtest_expected_last_session(),
                                           include_turn=include_turn)
+
+    vaa_canary_bars = None
+    if getattr(args, "enable_vaa_external_canary", True) and template_needs_vaa_canary(warmup_template, template_name):
+        canary_market = resolved_market
+        if canary_market and canary_market in MARKET_VAA_PROFILES:
+            ext_syms = list(MARKET_VAA_PROFILES[canary_market]["external_canary_symbols"])
+            vaa_canary_bars = {s: universe[s] for s in ext_syms if s in universe}
+            missing_ext = [s for s in ext_syms if s not in universe]
+            if missing_ext:
+                try:
+                    loaded = load_universe_with_banner(
+                        missing_ext,
+                        fetch_start,
+                        args.end,
+                        args.interval,
+                        use_cache=not args.no_cache,
+                        cache_dir=cache_dir,
+                        data_kwargs=data_kwargs,
+                        require_nonempty=False,
+                        expected_last_session=backtest_expected_last_session(),
+                        include_turn=False,
+                    )
+                    if loaded:
+                        vaa_canary_bars.update(loaded)
+                except Exception as exc:
+                    print(f"[WARN] Failed to load external VAA canary bars in backtester: {exc}")
+            if not vaa_canary_bars:
+                vaa_canary_bars = None
 
     intraday_5m_universe = None
     if bool(getattr(args, "enable_intraday_5m", False)):
@@ -2100,9 +2163,9 @@ def main():
             bnn_spec,
         )
         score_fn = (
-            _standard_score_fn(universe, args, intraday_5m_universe=intraday_5m_universe)
+            _standard_score_fn(universe, args, intraday_5m_universe=intraday_5m_universe, vaa_canary_bars=vaa_canary_bars)
             if args.mode == "standard"
-            else _walkforward_score_fn(universe, args, intraday_5m_universe=intraday_5m_universe)
+            else _walkforward_score_fn(universe, args, intraday_5m_universe=intraday_5m_universe, vaa_canary_bars=vaa_canary_bars)
         )
 
         original_result = score_fn(optimize_template_instance, params)
@@ -2205,6 +2268,7 @@ def main():
         enable_position_lifecycle=enable_pl,
         position_lifecycle_config=pl_cfg_dict,
         include_turn=include_turn,
+        enable_vaa_external_canary=getattr(args, "enable_vaa_external_canary", True),
     )
 
     wf_summary: dict | None = None
@@ -2219,6 +2283,7 @@ def main():
                 get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec),
                 params, args,
                 intraday_5m_universe=intraday_5m_universe,
+                vaa_canary_bars=vaa_canary_bars,
             )
 
         print(f"\n=== Strategy: {strategy_name} ===")
@@ -2350,6 +2415,7 @@ def main():
                 get_template(template_name, pattern_spec, research_strategy_spec, composite_spec, params, fundamental_spec, bnn_spec),
                 params, args,
                 intraday_5m_universe=intraday_5m_universe,
+                vaa_canary_bars=vaa_canary_bars,
             )
 
         all_wf_trades = []

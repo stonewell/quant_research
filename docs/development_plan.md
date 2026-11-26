@@ -3291,7 +3291,7 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 报告场景复核仍为 `{nav_effective: 198739.52, cash: 69033.52}` → `cash 69033.52`，
 `source = "authoritative_run"`。
 
-### 2.28 2026-11-24 CFSB 宽截面（N=100）适配、A 股 VAA 进攻金丝雀与 Rule 10 未裁决反事实复验批次（`WU1`–`WU3`，共 3 项 = 1 `[x]` + 2 `[ ]`）
+### 2.28 2026-11-24 CFSB 宽截面（N=100）适配、A 股 VAA 进攻金丝雀与 Rule 10 未裁决反事实复验批次（`WU1`–`WU3`，共 3 项 = 2 `[x]` + 1 `[ ]`）
 
 > **编号与 Rule 8 交叉对照说明（2026-11-24 登记，只追加、零生产代码改动）**：
 > 本独立子表基于 2026-11-23 `CFSB v1.8.0 [base: v2.3.0]` 在 `core_satellite_200k_stocks.txt`（`N=100`）
@@ -3302,9 +3302,102 @@ Track MS 确立**零存量污染、零 `BASE_VERSION = 2.0.0` 变更、零 58 �
 
 | 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
 | :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
-| **`WU1`** | `[ ]` | 修复 `ChanVaaCompoundStrategy` `DEFAULT_VAA_OFFENSIVE` 均为美股 ETF 导致 A 股永久防御态上限 `30%` 缺陷 | `pipeline/research_strategy/rs/chan_advanced_strategies.py`（`ChanVaaCompoundStrategy.generate_weights`, `L1490–1588`）<br>`pipeline/research_strategy/rs/config.py`（`DEFAULT_VAA_OFFENSIVE` `L51`, `chan_vaa_offensive_universe` `L404`）<br>`pipeline/research/blend/chan_four_state_blend.py`（`L174`）及其他 5 个 Blend 调用方<br>`scripts/run_live_strategy.py` | 1. **Rule 8 交叉对照**：排查 `docs/development_plan.md`、`docs/development_plan_archive.md` 与 `docs/version.md` 无 `DEFAULT_VAA_OFFENSIVE` / `13612W` A 股适配记录（`LV8` `[x]` 仅观测过腿重 `0.05~0.06`），属净新增缺陷；<br>2. **根因与架构设计**：A 股标的池与美股 ETF `["SPY","QQQ","EFA","EEM"]` 交集为空，`L1508–1519` 100% 锁死 `"defensive"`，将 `chan_vaa_compound`（占 CFSB 30% 基础权重）折半并封顶 `30%`（`N=100` 下叠加内部 `2%` 惰性后均权和仅 `3.5%`、`>=5%` 占比 `0.0%`）；且 `L1511` 要求全员 `13612W > 0`，须设计小篮子 A 股市场金丝雀（如 3–4 只宽基指数/ETF `000300.SH`/`000905.SH`/`399006.SZ`/`000016.SH` 或可配置广度比例门槛），并满足 Rule 11 回测/实盘默认同源传参；<br>3. **准出门禁（Rule 9/10/11 + Rule 7）**：须先经 `WU3` 确认非零差分，再于 `N=20` 与 `N=100` 通过 `backtest-deep-review` 6 项门禁（Option B、单次 ERS、2× 成本、真实 LOO、Rule 10 探针），获批落地时同步升版并更新 `--dump-strategies` 与 `docs/version.md`。 | `pipeline/research_strategy/tests/test_chan_advanced_strategies.py`<br>`pipeline/research_strategy/tests/test_blend_strategy_versioning.py` | **M** | `WU3` |
+| **`WU1`** | `[x]` | 修复 `ChanVaaCompoundStrategy` `DEFAULT_VAA_OFFENSIVE` 均为美股 ETF 导致 A 股永久防御态上限 `30%` 缺陷 | `pipeline/research_strategy/rs/chan_advanced_strategies.py`（`ChanVaaCompoundStrategy.generate_weights`, `L1490–1588`）<br>`pipeline/research_strategy/rs/config.py`（`DEFAULT_VAA_OFFENSIVE` `L51`, `chan_vaa_offensive_universe` `L404`）<br>`pipeline/research/blend/chan_four_state_blend.py`（`L174`）及其他 5 个 Blend 调用方<br>`scripts/run_live_strategy.py` | 1. **Rule 8 交叉对照**：排查 `docs/development_plan.md`、`docs/development_plan_archive.md` 与 `docs/version.md` 无 `DEFAULT_VAA_OFFENSIVE` / `13612W` A 股适配记录（`LV8` `[x]` 仅观测过腿重 `0.05~0.06`），属净新增缺陷；<br>2. **根因与架构设计**：A 股标的池与美股 ETF `["SPY","QQQ","EFA","EEM"]` 交集为空，`L1508–1519` 100% 锁死 `"defensive"`，将 `chan_vaa_compound`（占 CFSB 30% 基础权重）折半并封顶 `30%`（`N=100` 下叠加内部 `2%` 惰性后均权和仅 `3.5%`、`>=5%` 占比 `0.0%`）；且 `L1511` 要求全员 `13612W > 0`，须设计小篮子 A 股市场金丝雀（如 3–4 只宽基指数/ETF `000300.SH`/`000905.SH`/`399006.SZ`/`000016.SH` 或可配置广度比例门槛），并满足 Rule 11 回测/实盘默认同源传参；<br>3. **准出门禁（Rule 9/10/11 + Rule 7）**：须先经 `WU3` 确认非零差分，再于 `N=20` 与 `N=100` 通过 `backtest-deep-review` 6 项门禁（Option B、单次 ERS、2× 成本、真实 LOO、Rule 10 探针），获批落地时同步升版并更新 `--dump-strategies` 与 `docs/version.md`；<br>4. **2026-11-25 WU1 闭环结案（详见 `docs/version.md` §60）**：全市场 US/CHINA/HONGKONG 矩阵与统一 `--market` 及 `--vaa-external-canary` 接线落地；`ChanVaaCompoundStrategy` 升级至 `v1.1.0`（`BASE_VERSION = 2.3.0` 维持不变，`CFSB v1.8.0` 自动透传升级子策略版本并保留 `regime_ic_ir_hybrid` 模式）；360 项离线单测 100% 通过；全量 18 折 6-Gate 准出复审审计中，单次 ERS（96.0th pct trusted）、2× 成本（50 bps SR 0.8486/0.8643）、真实 LOO（最大脆弱性 18.59%）、整手阶梯（N=20 单调平滑，N=100 稳赢 B0 无资金死锁）及 Rule 10 探针（diff cells 2774/2698 彻底消灭未裁决零差分）全数 PASS；诚实披露 Option B 受制于 `WU2` 1/K 稀释撞 5% 入场门禁（N=20 paired-t=2.2003, pos=10/18; N=100 paired-t=0.5566, pos=12/18 未达 ≥14/18 门禁），按规划先行闭环代码与全市场接线，并作为 `WU2` 联动前置依赖在 `WU2` 修复后重跑联动复验；两座 DuckDB 研究库 MD5 运行前后严格零改动。 | `pipeline/research_strategy/tests/test_chan_advanced_strategies.py`<br>`pipeline/research_strategy/tests/test_blend_strategy_versioning.py`<br>`common/tests/test_market_cli_and_vaa_parity.py` | **M** | `WU3` |
 | **`WU2`** | `[ ]` | 修复 `1/K` 权重稀释撞上固定 `5%` 入场清零门禁 — 子策略或 `post_ortho` 后 Top-K（`K <= 8–12`）截面精选集中研究与修复 | `pipeline/research/blend/blend_base.py`（`L1844`, `L1870`, `post_ortho`, `PortfolioSequencer`）<br>`pipeline/research_strategy/rs/strategy.py`（`ChanThreeTypeStrategy` `L872–885`）<br>`pipeline/research_strategy/rs/chan_advanced_strategies.py`（`ChanFourStateExecutionStrategy` `L1804–1812`, `ChanVaaCompoundStrategy` `L1574–1607`）<br>`pipeline/research_strategy/rs/config.py` | 1. **Rule 8 交叉对照与已证伪反例**：全库无宽池 `1/K` 稀释或 `post_ortho` Top-K 任务（净新增）；严格遵守 `L2.52` `[x]`（禁抬高 `entry_threshold`）、`docs/version.md` §2866/§3550（维持实盘 `5%` 入场下限与回测齐平）、`MS28` `[x]` 🔴 NO-GO（禁融合 `MS7` 入 `CFSB`）与 `LV20` `[x]`（禁引入 `reversal` 腿）；且 2026-11-23 审计 `CF2`/`CF3` 已证伪“简单将 `entry_thresh` 降至 `2%` / 子策略惰性降至 `1%`”（200k Sharpe `0.8759 → 0.8417 / 0.7346`），`CF4` 已证实外层生命周期不可拆除（`0.8759 → 0.6552`）；<br>2. **研究与修复方案**：针对 `N=100` 下 `chan_three_type`（`K=33.6`, 中位 `2.44%`, 仅 `2.9% >= 5%`）与 `chan_vaa_compound`（`0.0% >= 5%`）在 `blend_base.py:1844` 被硬清零 `19,107` 格信号（日均 `-33.30%` 权重，交付仓位跌至 `27.05%` / 闲置现金 `72.95%`）的主瓶颈，对比消融在子策略输出侧或 `post_ortho` 之后引入 **Top-K（`K <= 8–12`）截面精选集中与重归一**，使入选单票自然落入 **`8%–15%`**（同时跨过 `5%` 入场/惰性门禁与 20 万 100 股整手门槛）；<br>3. **准出门禁**：未过门禁零生产改动；须在 `N=20` 维持零退化并在 `N=100`（200k RMB）通过 `backtest-deep-review` 6 项门禁与整手截断审计后，再按 Rule 7 升版落地。<br>4. **修复后必跑 `WU3` 联动复验**：2026-11-24 初轮 `WU3` 已实证在未解除 `1/K` 稀释前，即使解锁 VAA 多头，standalone VAA 单票 `>=5%` 仅 `1.64%–2.89%`、`CFSB N=100` `AvgExp` 仍卡死 `~27%`；故 **`WU2` 修复落地或进入验收时，必须重跑 `WU3`（联动复验 `CF1` 全量 `G=13` 行业表与 `CF5` VAA 金丝雀在解除 `5%` 稀释瓶颈后的真实增益、18 折 Option B、单次 ERS 与 Rule 10 探针）**，再基于重跑结果裁决 `WU1` 与全量行业表是否合入。 | `pipeline/research_strategy/tests/test_blend_strategy_versioning.py`<br>新增宽截面 Top-K 离线单测 | **L** | WU3（初轮已结案；WU2 修复后须重跑 WU3 联动复验） |
 | **`WU3`** | `[x]` | 复验 `CFSB N=100` 两项 Rule 10 未裁决反事实（`CF1` 全量 `G=13` 行业表与 `CF5` 真正可区分的 A 股 VAA 进攻金丝雀） | 只读复验脚本（先在 scratch / `backtest-deep-review` 工具链执行，零生产改动）；<br>涉及目标机制：`pipeline/research/blend/blend_base.py`（`CHINA_EQUITY_SECTORS` `L83–106`, `_get_symbol_sector`, `max_assets_per_sector=2`）<br>`pipeline/research_strategy/rs/chan_advanced_strategies.py`（`L1491`, `L1511–1522`） | 1. **问题背景（Rule 10 `UNADJUDICATED_ZERO_DELTA`）**：2026-11-23 `CFSB N=100` 深度审计中 `CF1` 与 `CF5` 均返回 `n_changed_weight_cells = 0`，严格依 Rule 10 判为未裁决而非“无效”：(a) `CF1` 因脚本在 `exec` 复制命名空间之后才 monkey-patch `_get_symbol_sector`，闭包仍绑定旧 15/100 映射（`thrust_sec_blocks` 仍为 `1,674`）；(b) `CF5` 将 100 只 A 股全量传入 `chan_vaa_offensive_universe`，触发 `L1511` 全员 `13612W > 0` 严苛条件（每日至少 1 股 `<= 0` 或未上市），导致 VAA 100% 锁死防御态（`vaa_mean_sum` 仍 `3.5%`）；<br>2. **只读复验方案**：(a) 修复 `CF1` 命名空间注入点，以全量 `G=13` 行业映射替换 15/100 硬编码表，实证裁决解除 85/100 股坍缩进 `sec_60/00/30/68` 后对 `thrust_sec_blocks`、权重差分与 200k Sharpe/CAGR/MaxDD 的净影响；(b) 修复 `CF5` 复验口径，改用 3–4 只 A 股宽基指数（如 `000300.SH`/`000905.SH`/`399006.SZ`）或小篮子龙头金丝雀，实证检验 `vaa_regime_series` 牛市占比 > 0、`chan_vaa_compound` 权和突破 `30%` 时的净效应；<br>3. **验收标准**：两臂均经 `deep_review_toolkit.py --check-rule10` 判定为 `ADJUDICATED`（`n_changed_weight_cells > 0` 且内部探针变化，零 `UNADJUDICATED_ZERO_DELTA`），并输出裁决结论指导 `WU1` 与全量行业表接入。<br>4. **2026-11-24 初轮只读复验结案**：`deep_review_toolkit.py --check-rule10` 退出 `0`（`26/26` 臂 `ADJUDICATED`、`0` `UNADJUDICATED_ZERO_DELTA`），零漂移与因果误差 `0.00e+00`，受保护 DuckDB MD5 未改：(a) `CF1`（`G=13` 行业表）`cells=172`（`thrust_sec_blocks 1685→2135`），但 `N=100` 100k/200k 与 18 折因果 `ΔSR=+0.0000`（`0/18`, `t=0.00`, FAIL）→ 初轮负向收口；(b) `CF5`（A 股 VAA 金丝雀）`chan_unlock` 显著优于 `topk_offensive`（全线退化 `0.746–0.855`），`CF5a_idx3_all_unlock` 在 `N=100` 200k SR `0.912→1.068`（2xCost `0.704→0.864`、MDD `7.23%→6.07%`、单次 ERS `96th pct trusted`）、`N=20` 200k SR `0.957→1.091`（`CF5c_40_unlock` `1.176`, ERS `100th pct trusted`），但全部臂未过 18 折因果 Option B（最强 `+0.0508`, `12/18`, `t=0.56`）且 `N=100` `AvgExp` 仍卡在 `~27%`、`2S-Turn ~14.8x`（standalone VAA `>=5%` 仅 `1.64%–2.89%`）；(c) 已暂停 `WU1`，待 `WU2` 修复 `1/K` 稀释主瓶颈后按 `WU2` 联动条款重跑 `WU3`。 | 研究阶段零生产改动；`deep_review_toolkit.py --check-rule10` 校验通过 | **S** | 无（可直接开展只读复验） |
+
+---
+
+### 2.29 实盘 Web 界面展示「最终目标权重」及子策略归因（`WV1`，共 1 项 = 0 `[x]` + 1 `[ ]`）**（2026-11-25 闭环补记）**：`WV1` 已于同日交付并闭环（`[ ]` → `[x]`），本表现行 **1 项 = 1 `[x]` + 0 `[ ]`**；标题中的「0 `[x]` + 1 `[ ]`」为登记时点留痕、不回改。
+
+> **编号与 Rule 8 交叉对照说明（2026-11-25 登记，只追加、零生产代码改动）**：
+> 本子表登记的是只读展示层可读性缺口，编号取新族 `WV`（`WV` = Web Visibility），与既有
+> `L2.*`、`M*`、`MS*`、`NV*`、`LV*`、`AT*`、`HY*`、`W*`、`S*`、`D*`、`R*`、`C*`、`WU*` 族**零碰撞、不重编号**。
+> 登记前已执行交叉核对命令
+> `grep -n -E 'WV[0-9]|Web Visibility' docs/development_plan.md docs/development_plan_archive.md docs/version.md`，
+> 返回空结果（退出码 `1`，三份文档均无任何 `WV` 族或 `Web Visibility` 命中），确认净新增、无重复。
+
+> **闭环补记（2026-11-25，只记证据、零交易代码改动）**：交付限于展示层五个文件——
+> `web/livetrading/static/index.html`（新增 `模型目标%` / `交付目标%` 两列表头，空状态 `colspan` 11 → 13）、
+> `web/livetrading/static/js/app.js`（两列透传渲染、三处 `colspan` 同步 13、归因块抽为纯函数
+> `buildDimensionSignalsHtml` 并加标注）、`web/livetrading/static/css/style.css`（移动端两新列规则）、
+> `web/livetrading/storage.py`（仅在 CSV 数值强转列表补 `target_weight_model` /
+> `target_weight_effective` 两键）、`web/livetrading/tests/test_web_livetrading.py`（新增 5 条 `wv1` 用例）。
+> 列序为 `current_weight` → `target_weight_model` → `target_weight_effective` → `delta_weight`；
+> 缺失值渲染 `--`、真实零渲染 `0.0%`（两者不得混同，理由同 `ZR1` 的零语义问题）；归因表上方标注
+> 「权重份额，非方向信号」。
+>
+> **验收证据**：`uv run --project web/livetrading pytest web/livetrading/tests -q` → **448 passed, 1 skipped**
+> （该 skip 为既有的 `s` 标记用例，与本次无关）；新增用例经 `node -e` 执行**真实出货 JS**，
+> 且 `git show HEAD` 版本对 `target_weight_model` / `target_weight_effective` / `权重份额，非方向信号`
+> 的命中数为 **0**，故这些用例在回滚树上必挂（具判别力，非空转）。固定夹具
+> `2026-11-25/152522`：`600362.SH` 同时显示 `模型目标 0.0%` / `交付目标 0.0%` 与三路份额
+> `20.0% / 16.7% / 14.3%`；同一份产物渲染两次逐字相同（证明展示层不重算）。
+> 独立 review 判定 **GO**（七项 PASS），唯一 CONCERN 为 `dName` 经 `innerHTML` 未转义——
+> **既有行为、非本次引入**，键名来自策略运行器内部而非操作员输入，另作独立小清理处理，不计入本条。
+>
+> **遗留（不阻塞）**：无 node 运行时的机器上，`test_wv1_weight_cells_pass_artifact_values_through_without_recomputation`
+> 会以裸 `return` 平凡通过（非假阳性，但丧失判别力），后续建议改为 `pytest.skip`。
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`WV1`** | `[x]` | 实盘 Web 界面展示「最终目标权重」及子策略归因（只读展示层任务） | `web/livetrading/` 持仓/工单展示页面与其服务层（读取 `live_trading_ticket.json` / `live_trading_ticket.csv`）；<br>已有数据列：`target_weight`、`target_weight_model`、`target_weight_effective`、`delta_weight`（表头见 2026-11-25 运行 `.../2026-11-25/152522/live_trading_ticket.csv:1`）；<br>归因字段：`detail_reason.dimension_signals`，语义为「子策略在已持仓组合内的权重份额」，非方向信号，见 `common/signal_snapshot.py:14` | 1. 登记背景：2026-11-25 `chan_four_state_blend` 运行中 `600362.SH`（江西铜业）被清仓，工单 CSV 第 4 行 `target_weight`/`target_weight_model`/`target_weight_effective` 均为 `0.0`，而 `detail_reason.dimension_signals` 三路为正（`0.2 / 0.1667 / 0.1429`），操作员在 Web 界面上看不到「模型最终目标权重 = 0」这一决定性证据，误读为「三维度同向看多却被清仓」；本任务只做展示层可读性，不改任何下单、权重或信号逻辑（Rule 9 不适用：零信号/权重变更）。<br>2. Rule 8 交叉对照：`LV8`（`[x]`，已归档于 `docs/development_plan_archive.md`）已确证 `dimension_signals` 是子策略权重份额、不是候选池排序分（「权重≠排序」「持仓子集≠候选池」），本条复用之、**不重开 `LV8`**；`LV25`/`LV6` 等票据字段类任务已于 2026-11-18 归档 deprecated，本条不复活、不重复其现金腿自洽口径。<br>3. 交付内容：Web 实盘页每只标的行展示四项 —— `target_weight_model`（blend 合成后的模型最终目标）、`target_weight_effective`（过惰性与确认带后的生效目标）、`current_weight`（券商实仓）、`delta_weight`；该行提供可展开的子策略归因（`dimension_signals` 逐路份额），并在界面上标注「权重份额，非方向信号」。数据一律取自现有工单/账本产物，展示层**禁止重算权重**。<br>4. 验收标准：以 2026-11-25 `152522` 运行目录为固定回归夹具，界面须在 600362.SH 行同时显示 `target_weight_model = 0.0` 与三路份额 `0.2 / 0.1667 / 0.1429`；新增离线单测断言展示层只透传不重算（同一产物两次渲染结果一致，且与 CSV 原值逐字段相等）。零生产交易代码改动，无版本号变更需求（Rule 7 不适用）。 | `web/livetrading/tests/` 新增展示层透传用例（须用该目录自带 venv 解释器运行，见仓库 AGENTS.md 测试策略） | `S` | 无 |
+
+---
+
+### 2.30 2026-11-25 零请求语义（entry-pending/阈值下与否决不可区分，致出场确认带误推进 + 前置值被清零）登记（`ZR1`，共 1 项 = 0 `[x]` + 1 `[ ]`）
+
+> **任务编号与 Rule 8 交叉对照说明（2026-11-25，只追加、零生产代码改动）**：`ZR1` 为净新增，
+> 不与既有任务重复。缺陷分三层：blend 在 `pipeline/research/blend/blend_base.py` 的十处去风险/否决
+> 零写点（`:1409,1473,1489,1520,1531,1827,1870,1880,1884,1920`）把三种上游态坍缩为一个 `0.0` ——
+> (i) 前置合成 >= `entry_thresh`(0.05) 但 `min_entry_bars` 确认未满；(ii) 0 < 前置合成 < 0.05
+> （1/K 稀释或低确信）；(iii) 真否决/负动量/回撤/止损。**本夹具 600362 @ 2026-11-25 已离线实测
+> 证实为 (iii) VETO：上游唯一零写点为 `blend_base.py:1520` CYQ 质量门（`cyq_winner_ratio`
+> `=0.002204901055 < min_cyq_winner_ratio=0.2`、`is_exempt=False`、`prev_w_s=0.0` 见 `:1494`），
+> 门禁前 `raw_blend` = **0.13819947**，故该笔 `exit_streak` 1→2 合法、SELL **正确-by-design、非误杀**。
+> 仅 (iii) 应推进出场确认，但三者都经
+> `common/position_policy.py:1383`（gate 6，`_is_zero_request` 于 `:386`）以字面 `0.0` 到达，
+> 不可区分，故 `exit_streak += 1` 会在模型仍想要的名字上推进。该前置值在十个零写点**全部被就地丢弃**
+> （`blend_base.py:1836` 先 `target_w = float(raw_w[s])`，`1870/1884` 再 `raw_w[s]=0.0`，local 不落盘；
+> 唯一侧通道 `incumbent_forced_exit_df`（`:1477`）只记"是否强制退出"的**标志**、不记数值）。对比
+> `docs/position_policy_consolidation_design.md:33`（0.0 三义）、`position_policy.py:1425-1439`
+> （L2.63 ADDITIVE-ONLY `raw_target_weight` 证据）、`LV8`（dimension_signals=权重非分数）、
+> `L2.52`/`WU2`（threshold 行为负结果，不禁止本项）、`docs/version.md` §53.5/§53.6
+> （实盘门 6 先于 `inertia_step` 截住字面零目标，零目标只落 `EXIT_CONFIRMING`/`TENURE_LOCKED` 两闸；
+> §53.5 的「判别性证据（实盘行）」为 **2026-11-20** 的 `600362.SH`——`blocked_action: full_exit` +
+> `TENURE_LOCKED`、detail 无 `full_exit` 键——**非本案例 2026-11-25**）。本案例 11-25 的 600362 行为
+> `SELL`、`blocking_reason=NONE`、`lifecycle_decision={exit_streak:2, guard_latency_bars:2,
+> state_before:PENDING_EXIT, state_after:COOLDOWN}` 且**无 `raw_target_weight` 键**（`exit_streak` 1→2
+> 跨两次被评估的运行 11-23、11-25）；SELL 分支（`position_policy.py:1395-1399`）不写 pre-policy 目标，
+> 故被清零的前置值无法从该行恢复。
+> **延后同族发现（不单独成行，落地后建议升级第二行）**：`exit_streak` 计**运行实例**而非连续
+> 交易日（`position_policy.py:1385` 每次 `step_position_lifecycle` 调用 `+=1`，无"上一交易日连续"
+> 校验；2026-11-23→11-25 缺 11-24 运行目录仍 1→2）。本行不实现该修复。
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`ZR1`** | `[ ]` | 零请求语义：禁止"非否决类 0"推进出场确认，并保留/暴露前置合成值 | `pipeline/research/blend/blend_base.py`<br>十处零写点 `:1409,1473,1489,1520,1531,1827,1870,1880,1884,1920`；前置值捕获 `:1836`；`_last_forced_exits` 侧通道先例 `:825,2022-2027`<br>`common/position_policy.py` gate 6 `:1383-1413`、`_is_zero_request` `:386`、`st.exit_streak=0`/恢复 HELD_ACTIVE `:1468-1470`<br>`common/position_lifecycle.py` `step_position_lifecycle` `:712`、`_decision_to_lifecycle` `:536`<br>`scripts/run_live_strategy.py` `raw_tgt_w` 冻结 `:7893`、`step_position_lifecycle` 调用 `:8080`、`dimension_signals` 写 `:8556-8588` | 1. **三态分类（测量无关地成立）**：把上游态记为 `request_semantics` 枚举 `{ENTRY_PENDING, SUB_THRESHOLD, VETO, LIQUIDATION, HOLD}` + `pre_gate_weight`（保留零写点**丢弃的**前置合成值）与 `veto_reason`（cyq/consolidation/incumbent/cooldown/require_asset_trend/spring）。仅 `VETO`/`LIQUIDATION` 推进 gate 6 的 `exit_streak`；`ENTRY_PENDING`/`SUB_THRESHOLD` 触发 `:1468` 的 `exit_streak=0` 复位路径。**「非否决 0 会误推进 `exit_streak`」这一半在本夹具上为未证实的假设**——本夹具已证实为 (iii) VETO，须另行构造 (i)/(ii) 合成夹具方可裁定，不得据本夹具宣称成立。<br>2. **证据（600362.SH @ 2026-11-25，固定夹具）**：三 sleeve 份额 0.2/0.1667/0.1429 全正，但工单 `target_weight`/`target_weight_model`/`target_weight_effective` 三列**全为 0.0**（前置值被清零的直接物证）。<br>3. **准出门禁**：Rule 9 非退化（非受影响路径零权重漂移，字节级对照）；Rule 10 判别性探针——两臂间必须出现**可观测差异**（记录到的 `pre_gate_weight` 与/或 `exit_streak` 计数，而非仅最终权重），600362@11-25 为夹具；**零增量臂 = UNADJUDICATED，绝不当 closure**；Rule 11 回测/实盘 parity——语义通道在 `simulate_position_lifecycle`（回测）与 `run_live_strategy.py`（实盘）同源落地 + 合成夹具双路径一致测试；Rule 7——`BASE_VERSION`/`version` 升版 + `--dump-strategies` + `docs/version.md` 中文变更记录。<br>4. **与 `WU2` 不重复**：`WU2`（`:3306`）修 5% 门槛硬清零 1/K 稀释标的（**行为**修复）；`ZR1` 修 (a) 非否决零不得推进出场确认、(b) 前置值不得销毁（**可观测性 + 语义**修复）。若 `WU2` 先落地，(ii) 子情形频率下降，但 (i) 与可观测性要求仍存，`ZR1` 不被 moot。<br>5. **测量已结案、只定证据子情形、不定任务有效性**：离线测量已完成，证实 600362 为 (iii) VETO（CYQ 门 `blend_base.py:1520`）、非 (i)/(ii)——本条改引 (iii) 作为实锤；任务有效性此后**仅由可观测性这一半承载**（前置值 0.13819947 在门处被就地清零已实锤），「非否决 0 误推进 `exit_streak`」仍为未证实的假设。 | `common/tests/test_position_policy.py`<br>新增 `test_entry_pending_zero_does_not_advance_exit_streak`、`test_pre_gate_weight_preserved`<br>（合成三态夹具：ENTRY_PENDING/SUB_THRESHOLD/VETO）<br>parity 夹具对齐回测/实盘两路径 | **M** | 无硬前置；离线测量已完成（夹具定性 (iii) VETO） |
+
+---
+
+### 2.31 2026-11-25 CYQ 质量硬门禁的边际价值实证与替换方案（`CQ1`，共 1 项 = 0 `[x]` + 1 `[ ]`）
+
+> **编号与 Rule 8 交叉对照说明（2026-11-25 登记，只追加、零生产代码改动）**：编号取新族 `CQ`（`CQ` = CyQ gate），
+> 与既有 `L2.*`、`M*`、`MS*`、`NV*`、`LV*`、`AT*`、`HY*`、`W*`、`S*`、`D*`、`R*`、`C*`、`WU*`、`WV*`、`ZR*` 族
+> **零碰撞、不重编号**。登记前已执行
+> `grep -n -E 'CQ[1-9]' docs/development_plan.md docs/development_plan_archive.md docs/version.md`，返回空（退出码 `1`）。
+>
+> 依据 `docs/backtest_research.md:3`（该文档明示「设计规格，**尚未执行**」）：`no_cyq` 消融臂已在 `:504`/`:523`
+> 设计完毕（`{"blend_enable_cyq_quality_gate": false}`，三策略全部完全可达），但**从未运行**；`false→true`
+> 的默认翻转随 `BASE_VERSION 1.4.0` 落地时仅配单测、无回测证据；现有 CYQ 实证（`docs/version.md` §58.5/§59、
+> `MS27`/`MS28`）测得的是 `MicrostructureAlphaCompositeStrategy`（`MS7`），**并非本门禁本身**；该门禁在 6/6
+> Blend 全开（`C6.1`，`docs/version.md:3748`）。本表任务分两阶段：阶段 1 纯测量（执行已设计的 `no_cyq` 臂
+> + 阈值网格），阶段 2 依实测裁决真实解方向；两者均严格受 `docs/development_plan.md:2869`（禁向存量策略注入
+> 新硬门槛）与 `:2870`（硬否决会误杀占 91% 时间的动量龙头）约束。
+
+| 任务编号 | 状态 | 任务名称 | 涉及核心文件与符号 | 核心交付内容与验收标准 | 配套离线单测 | 规模 | 前置依赖 |
+| :--- | :---: | :--- | :--- | :--- | :--- | :---: | :--- |
+| **`CQ1`** | `[ ]` | 实证 CYQ 质量硬门禁的边际价值，并以经验证的机制替换（默认 6/6 Blend 全开、从未经回测验证的硬否决） | `pipeline/research/blend/blend_base.py:1492-1520`（CYQ 门；`enable_cyq_quality_gate` 默认 `True` `:928`、`min_cyq_winner_ratio` 默认 `0.20` `:929`；spring 豁免 `:1513-1518`）<br>`common/structural_factors.py:726-977`（`_run_cyq_recurrence`）<br>`common/structural_factors.py:771-778`（τ 代理裁剪 `clip(lower=0.002, upper=0.50)`）<br>`common/structural_factors.py:1137`（`enrich_universe_with_structural_features` 的 `use_real_turn=False` 默认）<br>`docs/backtest_research.md:504,523`（`no_cyq` 消融臂规格） | 1. **阶段 1（纯测量，零生产改动）**：执行已设计的 `no_cyq` 臂（`blend_enable_cyq_quality_gate=false`）与阈值网格 `0.10/0.15/0.20/0.25`，在 `N=20` 与 `N=100`、200k、18 折 Option B、单次 ERS、2× 成本、真实 LOO 上跑，报告 on/off 的 ΔSharpe/ΔCAGR/ΔMDD/ΔTurnover。<br>**预注册期望（已实测，不重推）**：600362@2026-11-25 的 `cyq_winner_ratio=0.002204901055`（`< 0.20`、`is_exempt=False`）触发 `:1520` 否决，前置 `raw_blend`=0.13819947 被就地清零；τ（体积代理）min/median/max=0.004335/0.017542/0.095723 → 半衰期 39.17 交易日、5% 存活 169.27 日；筹码质量按年龄 >250 bars 0.838%、>500 bars 0.002%、>1000 bars 0%；0.0022 完全由 <1% 的旧残余承载（250-bar 截断 → 恰为 0.0）；门禁纯比率通过率 pooled 83.13%（qfq）/80.25%（raw），600362 为 78.10%、末次通过 2026-09-23（距决策 39 交易日）；截面 Spearman vs close/max=0.8586、vs 60d return=0.8797、vs 250d return=0.2602。<br>2. **阶段 2（裁决方向，须实测支持）**：四个候选修复——(a) 有界记忆 / 抬高 0.002 地板；(b) blend 路径改真换手 `use_real_turn=True` 替换体积代理；(c) 百分位归一阈值以消除上市年龄偏差；(d) 硬否决降级为连续特征（与 `:2869` 最一致）。其中 **(a)/(b) 改变指标量级，(c)/(d) 属重标定**；方向须由阶段 1 实测裁决，不得先验定案。<br>3. **必须记录的风险**：0.0022 量级值依赖 <1% 旧残余（250-bar 截断 → 恰为 0.0），**近阈值读数数值不可靠**；门禁为 ~60d 价格位置代理（Spearman vs 60d return=0.8797）与 ROC60/thrust 功能重叠；spring 豁免结构性不可达；无 reversal 腿且 `LV8`/`LV20` 禁新增（故「放行下跌票」**不是**可选答案）。<br>4. **准出门禁**：Rule 8（已交叉对照，见 `docs/backtest_research.md:3`）；Rule 9（正向/非退化证据，或显式 opt-in 默认关闭）；Rule 10（探针必须可判别——gate 开/关必须改变权重格或交易计数，**零增量 = UNADJUDICATED，绝不当 closure**）；Rule 11（任何阈值或路径变更须回测/实盘 parity）；Rule 7（`BASE_VERSION`/`version` 升版 + `--dump-strategies` + `docs/version.md` 中文变更记录）。 | `pipeline/research_strategy/tests/` 新增：`test_cyq_gate_no_cyq_arm_parity`（`no_cyq` 臂与基线在合成夹具上权重格可判别）、`test_cyq_threshold_grid`（0.10/0.15/0.20/0.25 逐档断言否决次数单调）、`test_cyq_use_real_turn_path`（`use_real_turn=True` vs 代理路径输出可判别）；<br>复用 `common/tests/test_structural_factors.py` 既有 CYQ 夹具 | **L** | 无硬前置；阶段 2 依赖阶段 1 实测；与 `ZR1`（`§2.30`）不重复——`ZR1` 修语义/前置值暴露（可观测性），`CQ1` 修门禁本身 |
 
 ---
 

@@ -23,7 +23,12 @@ REPO_ROOT = os.path.dirname(PIPELINE_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from common.cli_utils import default_results_dir
+from common.cli_utils import (
+    add_market_cli_arg,
+    add_vaa_canary_cli_args,
+    default_results_dir,
+    resolve_market_and_trading_flags,
+)
 from common.reporting import utc_timestamp, write_json_report
 
 RESULTS_DIR = default_results_dir(__file__)
@@ -109,6 +114,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "execution discipline everywhere.")
     p.add_argument("--no-lifecycle-compare", action="store_true",
         help="backtester --no-lifecycle-compare passthrough (step 5) -- skip lifecycle A/B comparison arm.")
+    add_market_cli_arg(p)
+    add_vaa_canary_cli_args(p)
     p.add_argument("--dry-run", action="store_true",
         help=f"Print the {N_STEPS} resolved commands without executing anything.")
     return p
@@ -155,8 +162,7 @@ def _write_manifest(started_at, args, step_records, status):
 
 def main():
     args = build_arg_parser().parse_args()
-    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
-        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
+    resolved_market = resolve_market_and_trading_flags(args)
     started_at = utc_timestamp()
     step_records = []
 
@@ -248,6 +254,15 @@ def main():
         step1_args += ["--hk-trading"]
         step4_args += ["--hk-trading"]
         step5_args += ["--hk-trading"]
+
+    if args.market:
+        step1_args += ["--market", args.market]
+        step4_args += ["--market", args.market]
+        step5_args += ["--market", args.market]
+
+    if not getattr(args, "enable_vaa_external_canary", True):
+        step1_args.append("--no-vaa-external-canary")
+        step5_args.append("--no-vaa-external-canary")
 
     do_step(1, "research_strategy (factor research)", "research_strategy", step1_args)
     do_step(2, "instrument_selection (universe screening)", "instrument_selection", step2_args)

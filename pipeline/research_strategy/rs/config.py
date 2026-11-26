@@ -403,6 +403,10 @@ class StrategyConfig:
     chan_vaa_min_weight_change: float = 0.02
     chan_vaa_offensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_OFFENSIVE))
     chan_vaa_defensive_universe: List[str] = field(default_factory=lambda: list(DEFAULT_VAA_DEFENSIVE))
+    chan_vaa_canary_mode: str = "auto"
+    chan_vaa_external_canary_rule: str = "all"
+    chan_vaa_breadth_bull_thresh: float = 0.50
+    chan_vaa_bull_alloc_mode: str = "chan_unlock"
 
     # --- Chan Pivot Shift (MACD) Advanced (ChanPivotShiftMACDAdvStrategy):
     # an enhanced SIBLING of Chan Pivot Shift (MACD) above -- that strategy/
@@ -1027,6 +1031,7 @@ class StrategyConfig:
     commission_pct: float = 0.0005          # 5 bps
     slippage_pct: float = 0.0005            # 5 bps
     min_shares: int = 1
+    market: Optional[str] = None             # Authoritative market identifier ('china', 'hk', 'us', or None)
     china_trading: bool = False              # Apply China A-share trading rules (T+1, price limits, stamp duty, 100-share lot)
     us_trading: bool = False                 # Apply US market rules (1-share lot, SEC sell fee, T+0 margin)
     hk_trading: bool = False                 # Apply HK market rules (board lot, 0.1085% dual-sided stamp/levies, T+0)
@@ -1056,8 +1061,39 @@ class StrategyConfig:
         over all ~60 fields; enum-like string fields (e.g. `ensemble_mode`,
         `rsi_method`) are left unvalidated since their strategies already
         handle an unrecognized value with an explicit fallback/error."""
+        if self.market is not None:
+            from common.market_holidays import normalize_market
+            norm_m = normalize_market(str(self.market))
+            object.__setattr__(self, "market", norm_m)
+            if self.china_trading and norm_m != "china":
+                raise ValueError(f"StrategyConfig conflict: market={norm_m} but china_trading=True")
+            if self.us_trading and norm_m != "us":
+                raise ValueError(f"StrategyConfig conflict: market={norm_m} but us_trading=True")
+            if self.hk_trading and norm_m != "hk":
+                raise ValueError(f"StrategyConfig conflict: market={norm_m} but hk_trading=True")
+
         if sum([bool(self.china_trading), bool(self.us_trading), bool(self.hk_trading)]) > 1:
             raise ValueError("Only one of china_trading, us_trading, hk_trading may be enabled.")
+        if self.chan_vaa_canary_mode not in {"auto", "in_universe", "external", "breadth"}:
+            raise ValueError(
+                f"StrategyConfig.chan_vaa_canary_mode must be one of {{'auto', 'in_universe', 'external', 'breadth'}}, "
+                f"got {self.chan_vaa_canary_mode!r}"
+            )
+        if self.chan_vaa_external_canary_rule not in {"all", "majority"}:
+            raise ValueError(
+                f"StrategyConfig.chan_vaa_external_canary_rule must be one of {{'all', 'majority'}}, "
+                f"got {self.chan_vaa_external_canary_rule!r}"
+            )
+        if not (0.0 < self.chan_vaa_breadth_bull_thresh <= 1.0):
+            raise ValueError(
+                f"StrategyConfig.chan_vaa_breadth_bull_thresh must be in (0.0, 1.0], "
+                f"got {self.chan_vaa_breadth_bull_thresh!r}"
+            )
+        if self.chan_vaa_bull_alloc_mode not in {"chan_unlock", "classic"}:
+            raise ValueError(
+                f"StrategyConfig.chan_vaa_bull_alloc_mode must be one of {{'chan_unlock', 'classic'}}, "
+                f"got {self.chan_vaa_bull_alloc_mode!r}"
+            )
         if self.rebalance_freq_days <= 0:
             raise ValueError(f"StrategyConfig.rebalance_freq_days must be > 0, got {self.rebalance_freq_days}")
         if self.top_k <= 0:

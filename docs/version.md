@@ -7997,3 +7997,93 @@ lifecycle_market_breadth(universe, breadth_lookback=50, thrust_lookback=10,
 
 - `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies`（59 份重导）。
 - `pipeline/.venv/bin/python -m pytest common/tests/test_structural_factors.py common/tests/test_turn_col_end_to_end.py common/tests/test_strategy_versioning.py pipeline/research_strategy/tests/test_blend_strategy_versioning.py pipeline/research_strategy/tests/test_microstructure_alpha_strategy.py pipeline/tests/test_config_wiring.py -q --import-mode=importlib` → **57 passed**（含新增 `test_ms27_relative_turn_mode_scale_invariance_and_raw_divergence`）。
+
+## 60. 全市场（A 股/美股/港股）VAA 进攻金丝雀与多头仓位解锁（`WU1`，`ChanVaaCompoundStrategy` `1.0.0 → 1.1.0`，`BaseBlendAllocationStrategy.BASE_VERSION` 维持 `2.3.0`，2026-11-25）
+
+> **本节编号**：落笔前实测现有最高节号为 **59**，故本节取 **60**，只追加在文件末尾；§1–§59 一字未改。
+> 对应台账见 [`docs/development_plan.md`](file:///home/stone/Work/github/quant/docs/development_plan.md) §2.28（`WU1` `[x]`）。
+
+### 60.1 版本轴与同步更新（AGENTS.md 第 7 条）
+
+| 项 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `ChanVaaCompoundStrategy.version` | `1.0.0` | **`1.1.0`** | 接入三层金丝雀状态机（`in_universe` / `external` / `breadth`）、`chan_unlock` 解锁 30% 锁死上限、严格因果无未来切片与 `_last_vaa_diagnostics` Rule 10 探针 |
+| `BaseBlendAllocationStrategy.BASE_VERSION` | `2.3.0` | **`2.3.0`（不变）** | `blend_base.py` 零修改；所有 6 个 Blend 子类对 `chan_vaa_compound` 的动态调度逻辑保持完全兼容 |
+| `ChanFourStateBlendStrategy.version` | `1.8.0` | **`1.8.0`（不变）** | 严格维持 `blend_weighting_mode="regime_ic_ir_hybrid"`，其子策略字典 `sub_strategies["chan_vaa_compound"]["version"]` 自动透传升级为 `1.1.0` |
+| 其余 5 个 Blend 子策略类 | 各自版本 | **各自版本（不变）** | `GenericBlendStrategy` 等子策略字典中的 `chan_vaa_compound` 自动透传升级为 `1.1.0` |
+| `VigilantAssetAllocation.version` | `1.0.0` | **`1.0.0`（不变）** | `pipeline/research_strategy/rs/taa_strategies.py` 独立 ETF 轮动策略保持原样，与复合策略正交解耦 |
+| `strategy_dumps/*.json` | `1.0.0` | **已重生成（59 份）** | `chan_vaa_compound_strategy.json` 升级 `strategy_version: "1.1.0"`，且 `chan_four_state_blend` 维持 `regime_ic_ir_hybrid` |
+
+### 60.2 根因与架构重构规范
+
+1. **缺陷根因与业务影响**：
+   - 原 `ChanVaaCompoundStrategy`（`rs/chan_advanced_strategies.py`）硬编码 `DEFAULT_VAA_OFFENSIVE = ["SPY", "QQQ", "EFA", "EEM"]`。在 A 股或港股等非美股股票池中，标的池与美股 ETF 交集为空，导致 `_evaluate_vaa_regime` 100% 永久锁定在 `defensive` 防御态。
+   - 在防御态下，策略将缠论趋势子策略权重折半并硬封顶在 `30%`；在宽截面（`N=100`）下，叠加内部 `2%` 再平衡惰性后均权和仅 `3.5%`，`>=5%` 占比 `0.0%`，无法释放缠论中枢 MACD 趋势 Alpha，导致非美股运行形态严重失真。
+
+2. **跨市场资产矩阵与解析规范（`common/market_profile.py`）**：
+   - 建立纯函数、零 I/O 权威配置模块 `MARKET_VAA_PROFILES`：
+     - **美股 (`us`)**：进攻 `["SPY", "QQQ", "EFA", "EEM"]`，外部金丝雀 `["SPY", "QQQ", "EFA", "EEM"]`，防御 `["IEF", "BIL"]`，现金代理 `BIL`；
+     - **A 股 (`china`)**：进攻 `["510300.SH", "510500.SH", "159915.SZ", "510050.SH"]`，外部金丝雀 `["000300.SH", "000905.SH", "399006.SZ"]`，防御 `["511010.SH", "511880.SH"]`，现金代理 `511880.SH`；
+     - **港股 (`hk`)**：进攻 `["2800.HK", "2828.HK", "3033.HK"]`，外部金丝雀 `["2800.HK", "2828.HK", "3033.HK"]`，防御 `["3199.HK", "3053.HK"]`，现金代理 `3199.HK`。
+   - **四级权威市场解析优先级（`resolve_strategy_market`）**：
+     `params.get("market")` > `getattr(cfg, "market", None)` > 既有 `china_trading`/`hk_trading`/`us_trading` 布尔标志 > 标的代码后缀纯股票自动推断（过滤现金代理）。跨市场或纯合成代码（如 `STOCK_A`）安全回退为 `None`。
+
+3. **统一 CLI 参数标准与双向同步（`common/cli_utils.py`）**：
+   - 提供 `add_market_cli_arg` 与 `parse_market_arg`，支持不区分大小写与主流别名（`US`, `CHINA`, `HONGKONG`, `cn`, `hk`, `us`, `hong_kong` 等）。
+   - `resolve_market_and_trading_flags` 实现 `--market` 与 `--china-trading` / `--us-trading` / `--hk-trading` 互斥冲突拦截（冲突抛 `ValueError`）与双向自动补齐。
+   - 提供 `add_vaa_canary_cli_args`（`--vaa-external-canary` / `--no-vaa-external-canary`，默认开启 `True`）。
+
+4. **三层金丝雀状态机与仓位解锁（`rs/chan_advanced_strategies.py`）**：
+   - **Tier 1 (`in_universe`)**：标的池内包含进攻 ETF 时沿用原生 VAA-G4 计算，美股 ETF 池逐位零漂移；
+   - **Tier 2 (`external`)**：标的池为纯股票时，消费外部指数金丝雀 `chan_vaa_canary_bars`；执行严格因果截断 `df.loc[df.index <= master_index[-1]]` 与 `ffill(limit=5)`（无 `bfill`），外部金丝雀绝不泄露到标的持仓列表；
+   - **Tier 3 (`breadth`)**：无外部金丝雀时，以股票池自身 13612W 动量广度 $\ge 50\%$ 判定牛态；
+   - **仓位解锁 (`chan_unlock`)**：牛市状态下解除旧版 0.6 乘数与 0.30 封顶限制（可达 100% 多头），熊市状态维持防御回落（$\le 0.30$）；
+   - **契约合规**：遵循 Rule 3 稀疏权重契约（无 `NaN` cell，显式 `0.0` 零权重），并在 `_last_vaa_diagnostics` 导出 Rule 10 探针状态。
+
+5. **全链路同源接线与 AST 护栏**：
+   - 覆盖 7 大入口：`run_live_strategy.py`、`run_live_multi_strategy.py`、`check_live_portfolio_health.py`、`backtester/run_backtest.py`、`run_research_strategy.py`、`run_pipeline.py`、`run_strategygen.py`。
+   - 严格遵守 `test_backtest_freshness_guard.py`（回测中调用 `expected_last_session=backtest_expected_last_session()` 零参数）与 `test_live_market_clock_wiring.py`（实盘透传时钟会话）AST 护栏；`chan_vaa_canary_bars` 浅拷贝瞬态注入，绝不污染持久化 `params` 或 `strategy_dump.json`。
+
+### 60.3 6-Gate 准出复审实证审计结论（DuckDB 严格只读保护，MD5 零改动）
+
+> **审计基线环境**：耗时 `2642.2s`，运行于 `data/cache_research_ms.duckdb`（MD5 `7d6a4f03f73d53bb50a44b472aacd22f`，WAL=False）与 `data/cache_research_ms28_200k.duckdb`（MD5 `0c82bbb54124553fdf284b494dc90205`，WAL=False），全量 18 折因果 Walk-Forward 运行前后校验和严格一致。
+
+#### 1. 6-Gate 核心门禁判定总表
+
+| 验证维度 | 门禁标准 | 实测结果 | 准出判定 | 核心发现与联动注记 |
+| :--- | :--- | :--- | :---: | :--- |
+| **Gate 1: Option B (N=20)** | 18 折 paired-t $\ge 2.0$ 且正折数 $\ge 14$ | $\Delta\mathrm{SR}=+0.1126$, $t=2.2003$, pos=10/18 | **FAIL（诚实披露）** | paired-t=2.2003 达标但正折数 10/18 未满 14，全期夏普与 CAGR 显著提升，按规如实披露判定 FAIL |
+| **Gate 1: Option B (N=100)** | 18 折 paired-t $\ge 2.0$ 且正折数 $\ge 14$ | $\Delta\mathrm{SR}=+0.0508$, $t=0.5566$, pos=12/18 | **FAIL（诚实披露）** | 全期 SR 与 MDD 显著改善，但受制于 `WU2` 1/K 稀释撞 5% 入场门禁，18 折 paired-t=0.5566，如实披露判定 FAIL |
+| **Gate 2: 单次 ERS (Rule 4)** | 优于 $\ge 95\%$ 随机权重基准 | N=20: 96.0th pct (True) / N=100: 96.0th pct (True) | **PASS** | 胜者在随机权重空间具显著统计有效性，单次调用零预算透支 |
+| **Gate 3: 2× 成本压力测试** | 50 bps (2x) 下夏普保持稳健非负 | N=20: 0bps=1.2572 $\to$ 2x=0.8486 / N=100: 0bps=1.1527 $\to$ 2x=0.8643 | **PASS** | 2× 极端佣金滑点下仍保持强劲稳健正收益 |
+| **Gate 4: 真实 LOO 脆弱性** | 剔除任意单资产夏普衰减 $< 35\%$ | max_fragility=18.59%, min_sr=0.888 | **PASS** | 无任何单一超级赢家依赖，剔除任意标的夏普均稳健 |
+| **Gate 5: 整手资金规模阶梯** | 100k vs 200k vs 1M RMB 实测 | N=20: SR 1.039 $\to$ 1.091 $\to$ 1.109 / N=100: SR 0.901 $\to$ 1.068 $\to$ 0.943 | **PASS** | N=20 单调平滑（1.039→1.091→1.109），N=100 三档（0.901 / 1.068 / 0.943）均稳定跑赢 B0（0.866 / 0.912 / 0.835），整手约束下无资金死锁 |
+| **Gate 6: Rule 10 探针区分度** | 探针值非零且差异显著 | N=20 diff cells=2774 / N=100 diff cells=2698 | **PASS** | 彻底消除 UNADJUDICATED 零差分，三层金丝雀状态完全可观测 |
+
+#### 2. A 股实测表现与参数对比
+
+- **Standalone `ChanVaaCompoundStrategy v1.1.0` (N=20)**：
+  - 200k CAGR 从 `6.50%` 翻倍提升至 **`13.18%`**，牛市天数从 `0/1165`（0.0%）提升至 **`399/1165`**（34.2%），再平衡牛态周期 `19/56`，2xCost SR **`1.020`**，Rule 10 探针差异单元格 `1790`。
+- **`CFSB v1.8.0` (N=20 狭窄池)**：
+  - 200k SR 从 `0.957` 提升至 **`1.091`**，200k CAGR 从 `11.46%` 提升至 **`14.02%`**，2xCost SR 从 `0.748` 提升至 **`0.849`**，18 折配对 $t=2.2003$。
+- **`CFSB v1.8.0` (N=100 宽池)**：
+  - 200k SR 从 `0.912` 提升至 **`1.068`**，200k CAGR 从 `6.84%` 提升至 **`7.99%`**，200k MDD 从 `7.43%` 改善降至 **`6.70%`**，2xCost SR 从 `0.704` 提升至 **`0.864`**。
+- **Option B 诚实披露与 `WU2` 联动前置依赖**：
+  - `CFSB N=100` 下由于多头选出的标的被均分稀释（$1/K \approx 2.44\%$），在进入 `blend_base.py:1844` 时撞上实盘与回测严格对齐的 `5%` 最小建仓门禁，导致大比例信号在最后一道闸门被就地清零（`AvgExp` 仍卡在 `~27%`），制约了 18 折逐折胜率（`12/18`, $t=0.5566$ 未达 $\ge 14/18$ 门禁）。
+  - 按规定如实记录 Option B 判定为 `FAIL`，不掩饰宽池稀释瓶颈；本修复作为解除底层永久防御态的必要前置先予落地，明确在 `WU2`（Top-K 截面精选集中）实施后联动重验 18 折全量效果。
+
+#### 3. 美股与港股离线合成验证（Rule 11 & Rule 10）
+
+- **美股 (US Market)**：
+  - ETF 池 (`SPY/QQQ/EFA/EEM/IEF/BIL`)：命中 Tier 1 (`in_universe`)，与旧版逐位零漂移断言 `zero_drift=True` (max_diff=0.0)。
+  - 22 纯股票池 + 外部指数 (`SPY/QQQ/EFA/EEM`)：命中 Tier 2 (`external`)，`bull_days=198`，Rule 10 探针差异单元格 `85`（ADJUDICATED）。
+  - 22 纯股票池无外部金丝雀：命中 Tier 3 (`breadth`)，`bull_days=105`。
+- **港股 (Hong Kong Market)**：
+  - ETF 池 (`2800.HK/2828.HK/3033.HK/3199.HK`)：命中 Tier 1 (`in_universe`)，`bull_days=198`。
+  - 22 纯股票池 + 外部指数 (`2800.HK/2828.HK/3033.HK`)：命中 Tier 2 (`external`)，`bull_days=198`，Rule 10 探针差异单元格 `85`（ADJUDICATED）。
+  - 22 纯股票池无外部金丝雀：命中 Tier 3 (`breadth`)，`bull_days=105`。
+
+### 60.4 离线验证状态（100% 离线、无网络）
+
+- `pipeline/.venv/bin/python pipeline/research_strategy/run_research_strategy.py --dump-strategies`（59 份重导完成，`chan_four_state_blend` 严格维持 `regime_ic_ir_hybrid`）。
+- `pipeline/.venv/bin/python -m pytest common/tests/test_strategy_versioning.py common/tests/test_market_clock.py common/tests/test_market_cli_and_vaa_parity.py pipeline/research_strategy/tests/test_chan_advanced_strategies.py pipeline/research_strategy/tests/test_blend_strategy_versioning.py pipeline/tests/test_live_market_clock_wiring.py pipeline/tests/test_config_wiring.py backtester/tests/test_backtest_freshness_guard.py backtester/tests/test_run_backtest.py -q --import-mode=importlib` → **360 passed, 53 warnings**。

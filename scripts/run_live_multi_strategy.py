@@ -84,12 +84,15 @@ for _group in ("pipeline", "ml"):
 from common.cli_utils import (
     add_data_provider_cli_args,
     add_market_clock_cli_args,
+    add_vaa_canary_cli_args,
     build_data_kwargs,
     load_live_universe,
+    load_universe_with_banner,
     persist_run_metadata,
     resolve_live_clock_context,
     shared_data_dir,
 )
+from common.market_profile import MARKET_VAA_PROFILES, template_needs_vaa_canary
 from common.data import get_data_provider
 from common.freshness import assert_fresh_universe, latest_close
 from common.live_execution_timing import resolve_execution_timing
@@ -323,6 +326,7 @@ def parse_args():
     add_data_provider_cli_args(parser)
     # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
     add_market_clock_cli_args(parser, stage="stage2")
+    add_vaa_canary_cli_args(parser)
     return parser.parse_args()
 
 
@@ -982,7 +986,12 @@ def main():
         clock_ctx,
         freshness_summary=freshness_summary,
         probe_attempts=probe_attempts,
-        extra={"date": val_date, "stage": "multi_strategy_netted", "run_mode": run_mode},
+        extra={
+            "date": val_date,
+            "stage": "multi_strategy_netted",
+            "run_mode": run_mode,
+            **({"enable_vaa_external_canary": False} if not bool(getattr(args, "enable_vaa_external_canary", True)) else {}),
+        },
     )
 
     # (B1) `persist_run_metadata` MERGES into the existing `summary.json`, and this round's
@@ -1047,6 +1056,40 @@ def main():
             # template). Recorded so "no switch to consult" is not read as "configured off".
             "intraday_5m_switch_present": template_has_switch,
         })
+
+    # (WU1) Pre-load external VAA canary bars once if any resolved sub-strategy needs it
+    vaa_canary_bars = None
+    if getattr(args, "enable_vaa_external_canary", True) and any(
+        template_needs_vaa_canary(
+            item.get("template"),
+            item.get("actual_key", "") or item.get("strategy_def", {}).get("template_name", ""),
+        )
+        for item in resolved_strategies
+    ):
+        resolved_m = clock_ctx.market
+        if resolved_m in MARKET_VAA_PROFILES:
+            ext_syms = list(MARKET_VAA_PROFILES[resolved_m]["external_canary_symbols"])
+            vaa_canary_bars = {s: universe[s] for s in ext_syms if s in universe}
+            missing_ext = [s for s in ext_syms if s not in universe]
+            if missing_ext:
+                try:
+                    raw_ext = load_universe_with_banner(
+                        missing_ext,
+                        start_date,
+                        val_date,
+                        use_cache=not args.no_cache,
+                        cache_dir=cache_dir,
+                        data_kwargs=build_data_kwargs(args),
+                        require_nonempty=False,
+                        expected_last_session=clock_ctx.expected_last_session,
+                        include_turn=False,
+                    )
+                    if raw_ext:
+                        vaa_canary_bars.update(as_of_universe(raw_ext, val_date))
+                except Exception as e:
+                    print(f"  [WARN] Failed to load VAA external canary bars: {e}")
+            if not vaa_canary_bars:
+                vaa_canary_bars = None
 
     # (2026-10-22 incident, Fix 2 / L2.3) Netting prices come from the SAME single
     # freshness owner as Stage 2 (`common.freshness.latest_close`), not `.iloc[-1]`.
@@ -1194,7 +1237,11 @@ def main():
             or s_key.replace("_", " ").title()
         )
 
-        sparse_weights = template.generate_weights(strategy_universe, params)
+        _gen_params = dict(params)
+        _gen_params["market"] = clock_ctx.market
+        if vaa_canary_bars is not None:
+            _gen_params["chan_vaa_canary_bars"] = vaa_canary_bars
+        sparse_weights = template.generate_weights(strategy_universe, _gen_params)
         rebalances = latest_rebalance_rows(sparse_weights)
         if rebalances.empty:
             print(f"  [WARN] Strategy {s_key} returned no rebalances. Defaulting to 0.")

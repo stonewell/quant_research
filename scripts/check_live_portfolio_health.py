@@ -64,6 +64,7 @@ from common.cli_utils import (
     CASH_PROXY_SYMBOLS,
     add_data_provider_cli_args,
     add_market_clock_cli_args,
+    add_vaa_canary_cli_args,
     build_data_kwargs,
     load_live_universe,
     persist_run_metadata,
@@ -570,6 +571,7 @@ def parse_args(args: Optional[List[str]] = None):
     add_data_provider_cli_args(parser, default_provider="synthetic")
     # (L2.3) as-of / market / run-window gate / strict freshness / probe retry limit.
     add_market_clock_cli_args(parser, stage="stage1")
+    add_vaa_canary_cli_args(parser)
     parsed = parser.parse_args(args)
 
     # Dynamically resolve output_dir and default account_state_file
@@ -4846,6 +4848,8 @@ def build_stage2_command(
         cmd.append("--allow-weighting-mode-override")
     if not getattr(args, "record_signal_snapshot", True):
         cmd.append("--no-record-signal-snapshot")
+    if not getattr(args, "enable_vaa_external_canary", True):
+        cmd.append("--no-vaa-external-canary")
     return cmd
 
 

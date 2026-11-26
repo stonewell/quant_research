@@ -41,11 +41,19 @@ import pandas as pd
 from common.allocation_backtester import run_allocation_backtest
 from common.cli_utils import (
     add_data_provider_cli_args,
+    add_market_cli_arg,
+    add_vaa_canary_cli_args,
     bootstrap_project_paths,
     build_data_kwargs,
     default_results_dir,
     load_universe_with_banner,
+    resolve_market_and_trading_flags,
     shared_data_dir,
+)
+from common.market_profile import (
+    MARKET_VAA_PROFILES,
+    resolve_strategy_market,
+    template_needs_vaa_canary,
 )
 from common.factor_taxonomy import FACTOR_CATEGORIES
 from common.reporting import format_weights_pct, write_dense_weights_csv, write_json_report
@@ -80,6 +88,8 @@ DEFAULT_UNIVERSE_SYMBOLS = [
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Researched Quantitative Trading Strategies CLI Runner")
     add_universe_cli_args(p, default_universe=DEFAULT_UNIVERSE_SYMBOLS)
+    add_market_cli_arg(p)
+    add_vaa_canary_cli_args(p)
     p.add_argument("--strategy",
                    default="all",
                    help="Strategy key from JSON config to evaluate, or 'all' (default: 'all')")
@@ -361,10 +371,10 @@ _VAA_MISSING_POOLS_MESSAGE = (
 
 def main():
     args = build_arg_parser().parse_args()
-    if sum([bool(args.china_trading), bool(args.us_trading), bool(args.hk_trading)]) > 1:
-        raise ValueError("Only one of --china-trading, --us-trading, --hk-trading may be enabled.")
+    resolved_market = resolve_market_and_trading_flags(args)
     cfg = StrategyConfig(
         min_shares=args.min_shares,
+        market=resolved_market,
         china_trading=args.china_trading,
         us_trading=args.us_trading,
         hk_trading=args.hk_trading,
@@ -458,6 +468,30 @@ def main():
     report_data = {}
     weights_summary = {}
 
+    vaa_canary_bars = None
+    if getattr(args, "enable_vaa_external_canary", True) and any(
+        template_needs_vaa_canary(strat_obj, strat_name) for strat_name, strat_obj in strategies_to_run.items()
+    ):
+        canary_market = resolve_strategy_market(cfg=cfg, symbols=list(universe.keys())) or resolved_market
+        if canary_market and canary_market in MARKET_VAA_PROFILES:
+            ext_syms = list(MARKET_VAA_PROFILES[canary_market]["external_canary_symbols"])
+            vaa_canary_bars = {s: universe[s] for s in ext_syms if s in universe}
+            missing_ext = [s for s in ext_syms if s not in universe]
+            if missing_ext:
+                try:
+                    loaded = load_universe_with_banner(
+                        missing_ext, start, end,
+                        use_cache=not args.no_cache, cache_dir=DATA_DIR,
+                        data_kwargs=data_kwargs, require_nonempty=False,
+                        include_turn=False,
+                    )
+                    if loaded:
+                        vaa_canary_bars.update(loaded)
+                except Exception as exc:
+                    print(f"[WARN] Failed to load external VAA canary bars in research_strategy: {exc}")
+            if not vaa_canary_bars:
+                vaa_canary_bars = None
+
     for strat_name, strat_obj in strategies_to_run.items():
         spec_summary = strat_obj.explain_weights()
         print("=" * 80)
@@ -466,7 +500,12 @@ def main():
         print("\nSECTION 2: BACKTEST RESULTS & TARGET WEIGHTS")
         print("=" * 80)
 
-        target_weights = strat_obj.generate_weights(universe)
+        gen_params = {}
+        if resolved_market:
+            gen_params["market"] = resolved_market
+        if vaa_canary_bars is not None:
+            gen_params["chan_vaa_canary_bars"] = vaa_canary_bars
+        target_weights = strat_obj.generate_weights(universe, gen_params) if gen_params else strat_obj.generate_weights(universe)
 
         backtest_res = run_allocation_backtest(
             universe,
