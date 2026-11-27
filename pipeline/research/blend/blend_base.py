@@ -243,9 +243,16 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
     published via `self._last_request_meta`, allowing position policy Gate 6 to distinguish
     non-exit zero allocations (`ENTRY_PENDING`, `SUB_THRESHOLD`) from true risk exits (`VETO`,
     `LIQUIDATION`) and prevent accidental inertia streak advancement or premature liquidation.
+
+    `BASE_VERSION 2.6.0` (2026-11-27) resolves inertia echo desynchronization (`VT3`,
+    `docs/development_plan.md` §2.36): instruments the daily inline inertia loop with
+    `bar_inertia_meta` published via `self._last_inertia_meta` side-channel, recording
+    pre-inertia/post-inertia weights, tenure lock, and carry reasons so external
+    execution/lifecycle engines can suppress spurious inertia-carried BUY echoes
+    when real holdings differ from model holdings (e.g. after voided tickets).
     """
 
-    BASE_VERSION: str = "2.5.0"
+    BASE_VERSION: str = "2.6.0"
     version: str = "1.0.0"
 
     def __init__(
@@ -265,7 +272,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             self.config = config
         self.param_prefix = param_prefix
         self.alt_param_prefixes = alt_param_prefixes or []
-        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.5.0")
+        self.base_version: str = base_version or getattr(self.__class__, "BASE_VERSION", "2.6.0")
         strat_version: str = version or getattr(self.__class__, "version", "1.0.0")
         tags = factor_tags or [
             "regime_trend_strength",
@@ -275,6 +282,7 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         ]
         super().__init__(name=name, param_grid={}, factor_tags=tags, version=strat_version)
         self._last_request_meta: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
+        self._last_inertia_meta: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
         # --- (2026-11-17, observability-only) Empty-style-bucket warning dedupe.
         # `_compute_adaptive_weights` used to emit the SAME warning on EVERY bar
         # with an incomplete style-bucket classification -- in practice on every
@@ -839,6 +847,10 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
         # metadata (`ZR1`). Reset on EVERY call so an earlier run cannot leak.
         self._last_request_meta: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
         request_meta_by_date: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
+        # (2026-11-27, `BASE_VERSION 2.6.0`) Side channel for inertia metadata (`VT3`).
+        # Reset on EVERY call so an earlier run cannot leak.
+        self._last_inertia_meta: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
+        inertia_meta_by_date: Dict[pd.Timestamp, Dict[str, Dict[str, Any]]] = {}
 
         # Core parameters with institutional defaults
         cash_proxy = self.resolve_param(p, "cash_proxy", getattr(cfg, "cash_proxy", "BIL"), str)
@@ -2010,6 +2022,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
                     # symbol is an explicit `0.0`, never `NaN`) and the frame below
                     # is never forward-filled here -- `SparseProjector.project`
                     # turns unchanged rows into `NaN` at the very end.
+                    pre_holding_age = {s: int(holding_age.get(s, 0)) for s in risky_symbols}
+                    pre_last_buy_bar = {s: int(last_buy_bar.get(s, -999)) for s in risky_symbols}
                     current_w = policy_sequencer.sequence(
                         raw_w,
                         prev_w_series,
@@ -2036,6 +2050,49 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             daily_weights.loc[date] = _apply_portfolio_deleverage(
                 desired_weights.loc[date], risky_symbols, cash_proxy, deleverage_scale
             )
+
+            if use_inertia and t > 0:
+                bar_inertia_meta: Dict[str, Dict[str, Any]] = {}
+                for sym in risky_symbols:
+                    pre_val = raw_w[sym] if sym in raw_w.index else 0.0
+                    pre_w = float(pre_val) if pd.notna(pre_val) and np.isfinite(pre_val) else 0.0
+                    post_val = current_w[sym] if sym in current_w.index else 0.0
+                    post_w = float(post_val) if pd.notna(post_val) and np.isfinite(post_val) else 0.0
+                    prev_val = prev_w_series[sym] if sym in prev_w_series.index else 0.0
+                    prev_w = float(prev_val) if pd.notna(prev_val) and np.isfinite(prev_val) else 0.0
+
+                    carried = bool(abs(post_w - pre_w) > 1e-6 and abs(post_w - prev_w) <= 1e-6)
+                    if carried:
+                        new_age = (pre_holding_age[sym] + 1) if prev_w > 1e-4 else 0
+                        tenure_locked = bool(
+                            policy_cfg.min_holding_bars > 0
+                            and (post_w > pre_w + 1e-6)
+                            and (
+                                new_age < policy_cfg.min_holding_bars
+                                or (pre_w > 1e-4 and (t - pre_last_buy_bar[sym]) < policy_cfg.min_holding_bars)
+                            )
+                        )
+                        dl_scale = float(deleverage_scale)
+                        scaled_post = (
+                            float(daily_weights.loc[date, sym])
+                            if pd.notna(daily_weights.loc[date, sym])
+                            else float(post_w * dl_scale)
+                        )
+                        bar_inertia_meta[sym] = {
+                            "symbol": str(sym),
+                            "inertia_carried": True,
+                            "pre_inertia_weight": float(pre_w * dl_scale),
+                            "post_inertia_weight": float(scaled_post),
+                            "prev_virtual_weight": float(prev_w * dl_scale),
+                            "pre_inertia_weight_unscaled": float(pre_w),
+                            "post_inertia_weight_unscaled": float(post_w),
+                            "deleverage_scale": float(dl_scale),
+                            "tenure_locked": bool(tenure_locked),
+                            "carry_reason": "TENURE_LOCKED" if tenure_locked else "INERTIA",
+                            "delta_w": float(abs(pre_w - prev_w)),
+                        }
+                if bar_inertia_meta:
+                    inertia_meta_by_date[pd.Timestamp(date)] = bar_inertia_meta
 
             # Cooldown Parity: Track normal strategic exits (when target drops to 0.0)
             # and enforce normal_cooldown_bars to prevent immediate 1-bar whipsaw re-entry.
@@ -2087,6 +2144,8 @@ class BaseBlendAllocationStrategy(AllocationTemplate):
             }
         # (2026-11-26, `BASE_VERSION 2.5.0`) Publish zero-request semantics metadata
         self._last_request_meta = request_meta_by_date
+        # (2026-11-27, `BASE_VERSION 2.6.0`) Publish inertia metadata side-channel (`VT3`)
+        self._last_inertia_meta = inertia_meta_by_date
         # (2026-11-17, observability-only) End-of-computation summary for the
         # empty-style-bucket guard. Logged AFTER the weights exist so the log path
         # can never influence them (it is also exception-guarded).

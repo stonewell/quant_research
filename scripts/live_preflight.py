@@ -908,9 +908,11 @@ def assert_state_version_not_clobbered(
 #      candidate, not a reason to jump to an older date (that implicit fallback is exactly
 #      what skipped 11-06/185016).
 #   2. A candidate is INADMISSIBLE when its run verdict is a recorded non-SUCCESS
-#      (`deploy_status` wins, else `health_status`), when the state's OWN `as_of_date` is
-#      not the directory's date (the orphan signature: an 11-05 book sitting in an 11-08
-#      directory), or when its `base_version` is from a DIFFERENT MAJOR than today's live
+#      (`deploy_status` wins, else `health_status`), when the run directory carries a
+#      voided-ticket marker (`live_trading_ticket.voided.json` or `netted_trading_ticket.voided.json`,
+#      matching `web/livetrading/storage.py` void semantics; `VT2`), when the state's OWN
+#      `as_of_date` is not the directory's date (the orphan signature: an 11-05 book sitting in an
+#      11-08 directory), or when its `base_version` is from a DIFFERENT MAJOR than today's live
 #      engine (a same-major bump stays admissible -- see `_version_majors_match` below).
 #   3. Among admissible candidates the winner is the NEWEST date, and within one date the
 #      NEWEST instance.  A failed newest instance falls back to the next-newest instance of
@@ -929,11 +931,187 @@ _INSTANCE_DIR_RE = re.compile(r"^\d{6}$")
 
 #: Machine-readable skip reasons (`prior_state_source["skipped"][*]["reason"]`).
 SKIP_STATUS_NOT_SUCCESS = "run_status_not_success"
+SKIP_TICKET_VOIDED = "ticket_voided"
 SKIP_AS_OF_MISMATCH = "as_of_date_does_not_match_the_run_date"
 SKIP_AS_OF_MISSING = "as_of_date_missing"
 SKIP_BASE_VERSION_MISMATCH = "base_version_mismatch"
 SKIP_BASE_VERSION_MISSING = "base_version_missing"
 SKIP_UNREADABLE = "account_state_unreadable_or_empty"
+
+VOIDED_TICKET_MARKERS: Tuple[str, ...] = (
+    "live_trading_ticket.voided.json",
+    "netted_trading_ticket.voided.json",
+)
+
+
+def _run_dir_has_voided_ticket(
+    run_dir: Optional[str],
+    markers: Tuple[str, ...] = VOIDED_TICKET_MARKERS,
+) -> bool:
+    """True if `run_dir` carries a `<name>.voided.json` marker for any marker in `markers`."""
+    if not run_dir or not os.path.isdir(run_dir):
+        return False
+    for marker in markers:
+        if os.path.exists(os.path.join(run_dir, marker)):
+            return True
+    return False
+
+
+def collect_recent_voided_buy_symbols(
+    session_root: Optional[str],
+    as_of_date: str,
+    *,
+    max_lookback_dates: int = 10,
+) -> Dict[str, Dict[str, Any]]:
+    """Collect symbols with recently voided BUY orders across past sessions.
+
+    Scans session archive backwards in time up to `max_lookback_dates`.
+    Prevents cross-day inertia echo re-emission when internal model inertia
+    still carries an asset that was voided by operator/veto in a prior session.
+
+    A symbol remains flagged as voided until a subsequent non-voided SUCCESS session
+    explicitly issues a BUY for it (resolving the position gap). If a subsequent
+    session does NOT issue a BUY (e.g. suppressed or holding), the symbol remains
+    protected against spurious inertia echo buys.
+    """
+    if not session_root or not os.path.isdir(str(session_root)) or not as_of_date:
+        return {}
+
+    cutoff_date = str(as_of_date)[:10]
+    try:
+        entries = os.listdir(str(session_root))
+    except OSError:
+        return {}
+
+    date_dirs = sorted(
+        (name for name in entries if _DATE_DIR_RE.match(name) and name < cutoff_date),
+        reverse=True,
+    )[:max_lookback_dates]
+
+    resolved_symbols: Set[str] = set()
+    voided_buys: Dict[str, Dict[str, Any]] = {}
+
+    for run_date in date_dirs:
+        date_dir = os.path.join(str(session_root), run_date)
+        if not os.path.isdir(date_dir):
+            continue
+
+        try:
+            sub_names = os.listdir(date_dir)
+        except OSError:
+            continue
+
+        instance_dirs = sorted(
+            (
+                os.path.join(date_dir, name)
+                for name in sub_names
+                if _INSTANCE_DIR_RE.match(name) and os.path.isdir(os.path.join(date_dir, name))
+            ),
+            key=_instance_sort_key,
+            reverse=True,
+        )
+
+        if not instance_dirs:
+            has_ticket_or_void = any(
+                os.path.exists(os.path.join(date_dir, f))
+                for f in (
+                    "live_trading_ticket.json",
+                    "netted_trading_ticket.json",
+                    "live_trading_ticket.voided.json",
+                    "netted_trading_ticket.voided.json",
+                )
+            )
+            if has_ticket_or_void:
+                instance_dirs = [date_dir]
+
+        for run_dir in instance_dirs:
+            is_voided = _run_dir_has_voided_ticket(run_dir)
+            if not is_voided:
+                summary_path = os.path.join(run_dir, "summary.json")
+                if os.path.exists(summary_path):
+                    summary_obj = _load_json_object(summary_path)
+                    if isinstance(summary_obj, dict):
+                        status = str(
+                            summary_obj.get("status")
+                            or summary_obj.get("deploy_status")
+                            or ""
+                        ).strip().upper()
+                        if status and status != "SUCCESS":
+                            continue
+
+                for ticket_file in ("live_trading_ticket.json", "netted_trading_ticket.json"):
+                    ticket_path = os.path.join(run_dir, ticket_file)
+                    if not os.path.exists(ticket_path):
+                        continue
+                    try:
+                        with open(ticket_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except Exception:
+                        continue
+                    orders = (
+                        data.get("orders", [])
+                        if isinstance(data, dict)
+                        else (data if isinstance(data, list) else [])
+                    )
+                    for r in orders:
+                        if not isinstance(r, dict):
+                            continue
+                        action = str(r.get("action", "")).strip().upper()
+                        if action == "BUY":
+                            has_shares = ("delta_shares" in r or "shares" in r)
+                            shares_int = 0
+                            if has_shares:
+                                try:
+                                    shares_int = int(r.get("delta_shares", r.get("shares", 0)) or 0)
+                                except (TypeError, ValueError):
+                                    shares_int = 0
+                            if (not has_shares) or shares_int > 0:
+                                sym = str(r.get("symbol", "")).strip()
+                                if sym:
+                                    resolved_symbols.add(sym)
+            else:
+                for ticket_file in ("live_trading_ticket.json", "netted_trading_ticket.json"):
+                    ticket_path = os.path.join(run_dir, ticket_file)
+                    if not os.path.exists(ticket_path):
+                        continue
+                    try:
+                        with open(ticket_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except Exception:
+                        continue
+                    orders = (
+                        data.get("orders", [])
+                        if isinstance(data, dict)
+                        else (data if isinstance(data, list) else [])
+                    )
+                    for r in orders:
+                        if not isinstance(r, dict):
+                            continue
+                        action = str(r.get("action", "")).strip().upper()
+                        if action == "BUY":
+                            has_shares = ("delta_shares" in r or "shares" in r)
+                            shares_int = 0
+                            if has_shares:
+                                try:
+                                    shares_int = int(r.get("delta_shares", r.get("shares", 0)) or 0)
+                                except (TypeError, ValueError):
+                                    shares_int = 0
+                            if (not has_shares) or shares_int > 0:
+                                sym = str(r.get("symbol", "")).strip()
+                                if sym and sym not in resolved_symbols and sym not in voided_buys:
+                                    try:
+                                        tgt_w = float(r.get("target_weight") or 0.0)
+                                    except (TypeError, ValueError):
+                                        tgt_w = 0.0
+                                    voided_buys[sym] = {
+                                        "voided_date": str(run_date),
+                                        "run_dir": str(run_dir),
+                                        "voided_shares": int(shares_int),
+                                        "voided_target_weight": float(tgt_w),
+                                    }
+
+    return voided_buys
+
 
 #: `X.Y.Z` (numeric components only), optionally with a `-prerelease` / `+build` tail.
 #: Deliberately STRICT: the engine only ever writes numeric triples, and a string this
@@ -1092,6 +1270,9 @@ def list_prior_state_candidates(
     MAJOR component -- a patch/minor bump must not cold-start the book (`NV8`; see
     `_version_majors_match`). A missing, different-major or unparsable recorded version is
     ineligible with the pre-existing reason codes.
+
+    A candidate whose run directory contains any voided ticket marker (`VOIDED_TICKET_MARKERS`,
+    see `VT2`) is marked ineligible with reason `ticket_voided` (`SKIP_TICKET_VOIDED`).
     """
     if not session_root or not os.path.isdir(str(session_root)) or not as_of_date:
         return []
@@ -1151,6 +1332,8 @@ def list_prior_state_candidates(
             eligible, reason = True, "eligible"
             if status is not None and status != "SUCCESS":
                 eligible, reason = False, SKIP_STATUS_NOT_SUCCESS
+            elif _run_dir_has_voided_ticket(run_dir):
+                eligible, reason = False, SKIP_TICKET_VOIDED
             elif as_of is None:
                 eligible, reason = False, SKIP_AS_OF_MISSING
             elif as_of != run_date:

@@ -437,6 +437,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "leg is inert, and every number is bit-identical to a historical run. "
                         "Any result produced under this flag is NOT comparable to a default "
                         "run -- label it with the differing input set.")
+    p.add_argument("--suppress-inertia-echo",
+                   dest="suppress_inertia_echo", action="store_true", default=True,
+                   help="Suppress inertia echo buy orders when internal model inertia carries a "
+                        "position higher than the raw model target. Default True.")
+    p.add_argument("--no-suppress-inertia-echo",
+                   dest="suppress_inertia_echo", action="store_false", default=True,
+                   help="Disable inertia echo buy suppression, allowing model inertia to force BUY orders.")
+    p.add_argument("--lifecycle-suppress-general-inertia-echo",
+                   dest="lifecycle_suppress_general_inertia_echo", action="store_true", default=None,
+                   help="Enable general inertia carry buy clamping across all assets in lifecycle simulation.")
+    p.add_argument("--no-lifecycle-suppress-general-inertia-echo",
+                   dest="lifecycle_suppress_general_inertia_echo", action="store_false", default=None,
+                   help="Disable general inertia carry buy clamping.")
     # Both fast-path toggles are ALWAYS ON since BASE_VERSION 2.0.0 (M4.4 stage
     # D3): the kernel has no field for them, and `step_position_lifecycle` now
     # calls `_require_kernel_step_supported(cfg)` unconditionally, so a resolved
@@ -803,6 +816,7 @@ def _evaluate_walkforward_fold(ctx: dict, spec: dict) -> tuple:
                         market_breadths=market_breadths,
                         forced_exits=getattr(template, "_last_forced_exits", None),
                         request_meta=getattr(template, "_last_request_meta", None),
+                        inertia_meta=getattr(template, "_last_inertia_meta", None),
                     )
                     eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)
                     seed_row = (
@@ -1236,6 +1250,7 @@ def run_standard(
             market_breadths=market_breadths,
             forced_exits=getattr(template, "_last_forced_exits", None),
             request_meta=getattr(template, "_last_request_meta", None),
+            inertia_meta=getattr(template, "_last_inertia_meta", None),
         )
         if has_warmup:
             eval_weights = warmed_weights.reindex(index=eval_index, columns=eval_symbols)

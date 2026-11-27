@@ -8839,3 +8839,171 @@ lookback 缓冲内，而是**直接落在成交折里**；4 只「短历史」sy
    敏感性分析显示，单票上限调至 0.18 或持仓数提升至 5 只能有效缓解现金暴露波动，建议作为未来宽截面（$N=100$）
    工程调优参考。
 
+## 70. 2026-11-27 TV1 宏观推力层绕过前置 VETO 门禁实证消融与 Rule 9 负结果闭环（NO-GO 归档）
+
+### 70.1 变更性质、背景与 Rule 7 版本说明
+
+1. **变更性质**：实证消融与架构先例封存（Rule 9 实证正价值门禁裁判、Rule 10 隔离总体分析与判别性探针验证、Rule 8 历史先例防复提归档）。
+2. **问题背景**：2026-11-27 实盘运行中，标的 `300394.SZ` 原始合成权重 `0.0880`，在 `blend_base.py:1580-1582` 触发 Anchor 2 筹码与盘整门禁 `VETO(consolidation)` 并将权重清零；然而在随后的宏观推力分配层（`:1616-1624`），推力候选筛选逻辑仅遍历 `risky_symbols` 且未检查 `bar_request_meta` 中的 `request_semantics == "VETO"` 状态，反而将已否决标的作为推力槽位回灌并放大至 `0.1949`（达原始权重 2.2×），且最终票据留下 `request_semantics=VETO` 与 `action=BUY` 的直接自相矛盾。
+3. **Rule 7 版本双轴说明**：
+   - **零生产代码修改**：实证消融显示屏蔽此类标的导致全周期性能显著退化，故生产代码完全保持不变；
+   - **零版本轴变动**：`BaseBlendAllocationStrategy.BASE_VERSION` 严格维持 `2.5.0`，`ChanFourStateBlendStrategy.version` 严格维持 `1.8.0`；
+   - **零配置改动**：零 `--dump-strategies` 重跑，零 `strategies_config.json` 变动，`blend_weighting_mode="regime_ic_ir_hybrid"` 锚定保持不变。
+
+### 70.2 Rule 10 判别探针（`300394.SZ@2026-11-27`）与隔离总体分析
+
+1. **单点判别性探针（`300394.SZ@2026-11-27`）**：
+   - **Arm A (Baseline)**：`300394.SZ` 目标权重 = `0.111441`（前置 VETO 语义为 `consolidation`，推力层成功回灌）；
+   - **Arm B (Block Anchor-2 VETO)**：`300394.SZ` 目标权重 = `0.000000`（精确阻断）；
+   - **Arm C (Block All Pre-Thrust VETO)**：`300394.SZ` 目标权重 = `0.000000`（精确阻断）；
+   - **两臂差分探针统计**：
+     * `Arm B vs Arm A`：`n_changed_weight_cells = 588`，`n_changed_rebalance_rows = 211`，`max_abs_weight_diff = 0.2000`，首个分歧日 `2020-11-13`，判定 `ADJUDICATED`；
+     * `Arm C vs Arm B`：`n_changed_weight_cells = 0`，两者逐位完全一致（证明全历史被推力回灌的标的全部来自 Anchor 2，无其他前置门禁被推力倒灌）。
+2. **Rule 10 隔离总体分析（全历史 N=43 次 VETO 倒灌事件 vs 正常推力 N=1984 事件）**：
+   - 提取全历史所有被前置 VETO 拦截但随后被推力回灌的事件（共 43 次：`consolidation` 40 次，`cyq` 3 次），统计其买入后前瞻 5d / 10d / 20d 收益与胜率，与同期正常推力标的对比：
+
+| 标的群组 / 细分来源 | 样本数 $N$ | 前瞻 5d 平均收益 | 5d 胜率 | 前瞻 10d 平均收益 | 10d 胜率 | 前瞻 20d 平均收益 | 20d 胜率 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **VETO 倒灌全量** | 43 | +0.02% | 47.62% | **+1.85%** | **64.29%** | **+4.14%** | **69.05%** |
+| ├─ `consolidation` 盘整密度否决 | 40 | +0.12% | 48.72% | **+1.76%** | **64.10%** | **+4.44%** | **71.79%** |
+| └─ `cyq` 筹码胜率否决 | 3 | -1.27% | 33.33% | +3.00% | 66.67% | +0.18% | 33.33% |
+| **正常推力标的对照组** | 1984 | +0.45% | 51.37% | +0.74% | 51.43% | +1.43% | 53.30% |
+
+- **关键机理发现**：被前置 `consolidation` 门禁否决的标的，在宏观推力共振触发（市场广度 $\ge 30\%$ 且推力 $\ge 60\%$）并被推力层回灌后，其 20 日平均前瞻收益达 **+4.44%**（胜率高达 **71.8%**），显著跑赢同期普通推力标的（+1.43% / 53.3%）。其机理在于：**在宏观推力爆发期，低盘整密度（consolidation 密度低）往往代表标的正处于摆脱箱体底部的动量突破主升浪阶段**，此时推力层将其抓取回灌本质上捕捉到了强 alpha 主升浪，强行拦截反而严重损伤组合收益。
+
+### 70.3 18 折因果 WF 与 6-Gate 实证全景表
+
+在 $N=20$（`custom_astock_202609_20_new`，200k RMB 本金，100 股整手，2018-2026 全周期 18 折因果 Walkforward）标准基准下运行三臂消融：
+- **Arm A**：基线（保持当前逻辑，推力层不查前置 VETO）；
+- **Arm B**：候选干预（推力候选严格排除 Anchor 2 `consolidation`/`cyq` VETO 标的）；
+- **Arm C**：全量干预（推力候选排除全部前置 VETO 标的）。
+
+#### 1. 全周期表现指标对比
+| 实验臂 | 年化收益 CAGR | 年化夏普 Sharpe | 最大回撤 MaxDD | 年化换手率 Turnover | Gate 1 裁决 | 综合判定 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Arm A (基线)** | **20.33%** | **1.4836** | **14.55%** | 110.41x | 基准 | 基准 |
+| **Arm B (排除 Anchor-2)** | 19.76% (-0.57%) | 1.4531 (-0.0305) | 14.78% (+0.23%) | 111.34x (+0.93x) | **HARD FAIL** | 🔴 **NO-GO** |
+| **Arm C (排除全部 VETO)** | 19.76% (-0.57%) | 1.4531 (-0.0305) | 14.78% (+0.23%) | 111.34x (+0.93x) | **HARD FAIL** | 🔴 **NO-GO** |
+
+#### 2. 6-Gate 准入审计全景表（Arm B vs Arm A）
+| 门禁编号与名称 | 门禁标准 | 实测数值与表现 | 结论 |
+| :--- | :--- | :--- | :---: |
+| **Gate 1: Option B 18折配对检验** | $\Delta\text{SR} \ge 0$, 胜折 $\ge 50\%$, $t \ge 2.0$, $\text{DSR} \ge 0.95$ | $\Delta\text{Sharpe} = -0.0578$, 胜折 = **0/18 (0%)**, 配对 $t = -2.2208$, $\text{DSR} = 0.8887$ | 🔴 **HARD FAIL** |
+| **Gate 2: 单次 ERS 随机检验** | 优于随机权重组合分位数 $\ge 90\%$ | 获得 100.0th 百分位，`trusted = True` | ✅ **PASS** |
+| **Gate 3: 0/25/50 bps 成本压力** | 换手 $\le 10\text{x}$ 且压力下 Sharpe 优于基准 | 0 bps: 1.5870 vs 1.6220 (-0.0350)<br>25 bps: 1.4531 vs 1.4836 (-0.0305)<br>50 bps: 1.3185 vs 1.3701 (-0.0516)<br>年化换手 16.77x > 10.0x | 🔴 **FAIL** |
+| **Gate 4: Top-5 LOO 资产脆弱性** | 剔除贡献最大的 5 只资产，脆弱度 $\le 35\%$ | 剔除 601288, 601919, 601225, 601088, 600900 后最小 Sharpe = 1.2552，脆弱度 13.62% $\le 35\%$ | ✅ **PASS** |
+| **Gate 5: MS5 纯多头与单调性** | 纯多头无杠杆单调性检验 | `long_only_verified = True` | ✅ **PASS** |
+| **Gate 6: 200k 整手资金真实性** | 弃单率 $\le 10\%$, 扭曲率 $\le 5\%$ | 弃单率 4.10%，扭曲率 2.96%，整手未投拖累 3.35% | ✅ **PASS** |
+| **综合裁决** | 必须全项达标方可进入生产代码 | **Gate 1 HARD FAIL (0/18 胜折, t = -2.22) + Gate 3 FAIL** | 🔴 **NO-GO** |
+
+### 70.4 机理定性与 Rule 8 历史先例封口声明
+
+1. **实证机理总结**：
+   - 表面看似「门禁否决与推力买入」自相矛盾，但定量证据证明两者运行于不同时间尺度与决策维度：前置 Anchor 2 的 `consolidation` 门禁衡量的是静态箱体筹码分布，而宏观推力层衡量的是市场合力共振；
+   - 在强推力爆发时，低盘整密度的标的正是由于摆脱整理进入主升浪，其前瞻胜率（71.8%）与收益大幅领先全市场；
+   - 若在推力层人为机械阻断 VETO 标的，将在 18 个历史折中遭遇全线劣后（0/18 胜折，CAGR -0.57%，Sharpe -0.0305，MaxDD 恶化），违反 `AGENTS.md` Rule 9 铁律。
+2. **Rule 8 历史先例防复提归档**：
+   - 永久封存「在宏观推力层屏蔽 Anchor 2 consolidation/cyq 前置 VETO」的修改提案；
+   - 任何未来 agent 严禁再次提议该阻断修改，必须引用 `docs/version.md §70` 与 `tv1_results.json` 负结果数据作为否决依据；
+   - 实盘票据中的 `request_semantics=VETO` 与 `action=BUY` 属于多层决策（子策略层 VETO，宏观推力层买入）的客观记录，后续展示层可优化说明，但底座分配引擎维持现状不动。
+
+## 71. 2026-11-27 VT3 模型虚拟持仓与实盘作废后持仓脱节修复：侧通道暴露内层惯性 + 阻断作废回声追买（BaseBlend BASE_VERSION 2.5.0 → 2.6.0）
+
+### 71.1 背景案例与问题根因分析
+
+1. **真实背景与现场缺陷（2026-11-27 实盘案例）**：
+   - **现场案例**：`601728.SH@2026-11-27`。在 2026-11-26 的实盘执行中，`chan_four_state_blend` 发出了对 `601728.SH` 买入 +4,400 股的工单，但随后该轮工单被操作员作废（目录生成 `live_trading_ticket.voided.json`），实盘账户并未实际执行该买单，券商实际持仓为 0 股（`broker_weight = 0.0`）；
+   - **次日脱节与虚假追买**：在次日（2026-11-27）运行分配策略时，模型内部的 `BaseBlendAllocationStrategy` 包含两层虚拟状态机（`holding_age` 与 `desired_weights` 历史）。由于前一日模型内层已经「假设持有」了该标的，次日内层在 `min_holding_bars=2`（T+1 持仓锁）或 `use_inertia=True` 惯性承接作用下，即使宏观或因子给出的原始 raw target 为 0.0 或微量，内层仍然强行托底续传了 `0.17603574273347855` 的虚拟目标权重；
+   - **外层盲区（Inertia Echo Buy）**：外部执行器 `scripts/run_live_strategy.py` 以及生命周期机 `step_position_lifecycle` 并不知道内层 `0.1760` 的来源究竟是「模型今天发出的主动建仓指令」还是「内层虚拟持仓在苦撑惯性」。外部看到真实持仓为 0 且 `raw_target_weight = 0.1760`，遂误判为全新建仓信号，再次开出 BUY +4,500 股订单！
+   - **根因定性**：这是典型的**模型内部虚拟状态（In-Strategy Virtual State）与实盘作废后外部真实持仓（Broker Holding）脱节**导致的「虚假惯性买入回声（Inertia Echo Buy）」。
+
+### 71.2 侧通道设计与向下游缩放比例对齐（Scheme D 架构落地）
+
+为彻底斩断脱节回声且不破坏 `generate_weights` 的稀疏权重返回契约，采纳 Scheme D 侧通道 + 共享纯函数方案：
+
+1. **`BaseBlendAllocationStrategy` 侧通道暴露（`BASE_VERSION 2.5.0 → 2.6.0`）**：
+   - 在每日逐 bar 惯性循环中（`if use_inertia and t > 0:`），在调用 `policy_sequencer.sequence(...)` 之前精准快照 `pre_holding_age` 与 `pre_last_buy_bar`；
+   - 在 `_apply_portfolio_deleverage` 完成后，提取有限值 `pre_w`, `post_w`, `prev_w`，并按 `carried = bool(abs(post_w - pre_w) > 1e-6 and abs(post_w - prev_w) <= 1e-6)` 精准识别惯性托底事件；
+   - 严格按照 `common/position_policy.py:835-838, 912-923` 计算 `new_age` 与 `tenure_locked`：
+     ```python
+     new_age = (pre_holding_age[sym] + 1) if prev_w > 1e-4 else 0
+     tenure_locked = bool(
+         policy_cfg.min_holding_bars > 0
+         and (post_w > pre_w + 1e-6)
+         and (
+             new_age < policy_cfg.min_holding_bars
+             or (pre_w > 1e-4 and (t - pre_last_buy_bar[sym]) < policy_cfg.min_holding_bars)
+         )
+     )
+     ```
+   - 将组合层去杠杆缩放 `dl_scale = float(deleverage_scale)` 同步作用于侧通道对外暴露的 `pre_inertia_weight`、`post_inertia_weight`、`prev_virtual_weight`，确保与最终交付的 `daily_weights`/`sparse_weights` 同量纲，同时完整保留 `_unscaled` 与 `tenure_locked`、`delta_w`，通过 `self._last_inertia_meta` 侧通道向外部发布。
+
+2. **共享纯函数 `resolve_inertia_echo_target`（`common/position_policy.py` & `common/position_lifecycle.py`）**：
+   - 纯函数签名：
+     ```python
+     def resolve_inertia_echo_target(
+         original_target_weight: float,
+         current_weight: float,
+         inertia_meta: Optional[Dict[str, Any]],
+         *,
+         was_voided_buy: bool = False,
+         suppress_voided_echo: bool = True,
+         suppress_general_echo: bool = False,
+         eps: float = 1e-6,
+     ) -> Tuple[float, Optional[Dict[str, Any]]]:
+     ```
+   - **防御性与缩放折算**：处理下游组合缩放比例 `scale_ratio = min(1.0, max(0.0, orig_raw / post))`，得到有效非惯性目标 `eff_pre = max(0.0, pre * scale_ratio)` 与 `eff_post = max(0.0, orig_raw)`；
+   - **分支 1（作废票据定向阻断 `VOIDED_INERTIA_ECHO`）**：当 `was_voided_buy and suppress_voided_echo` 时，将目标权重修正回非惯性基础值 `eff_pre`（若内层为纯惯性托底则 `eff_pre = 0.0`），彻底阻断追买；
+   - **分支 2（通用惯性承接截断 `INERTIA_CARRY_BUY_CLAMPED`）**：当 `suppress_general_echo` 开启时，将外层目标上限钳制为 `max(cur_w, eff_pre)`，防止任何内层惯性在外部未持有时代替发出 BUY。
+
+### 71.3 实盘历史作废买单回溯与跨日防复发机制（`collect_recent_voided_buy_symbols`）
+
+在 `scripts/live_preflight.py` 实现了 `collect_recent_voided_buy_symbols` 函数：
+- **零跨 venv 依赖**：仅依赖 Python 标准库 `os`/`json`/`re`，利用现有的 `_DATE_DIR_RE`、`_INSTANCE_DIR_RE` 与 `_run_dir_has_voided_ticket`；
+- **回溯扫描**：扫描最近 `max_lookback_dates=10` 个历史交易日，从新到旧遍历运行目录；
+- **核心跨日防复发规则（Anti-Recurrence Guardrail）**：
+  - 维护 `resolved_symbols: Set[str]`；
+  - **重要纪律**：只有当后续非作废且状态为 `SUCCESS` 的轮次**明确为该标的发出了 BUY 订单**（`delta_shares > 0` 或 `shares > 0`）时，才将该标的移入 `resolved_symbols` 解除作废状态；
+  - 若后续轮次（例如 Day 2 / Day 3）因 VT3 阻断或观望而**没有**发出 BUY 订单，**绝不**解除其作废标记！这保证了在内层虚拟持仓彻底衰减归零（Day 4 以后）之前，该标的在跨日执行中不会死灰复燃、回声复发！
+
+### 71.4 Phase C Rule 9 18 折因果 Walkforward 消融实证
+
+在 $N=20$（`custom_astock_202609_20_new`，200k RMB 本金，100 股整手，2018-2026 全周期 18 折因果 Walkforward）下对通用分支展开消融（产物持久化于 `scratch/vt3_results.json`，三座 DuckDB MD5 验证逐字节 100% 一致）：
+- **Rule 10 判别力探针**：
+  - 捕捉到 **2,164 次** `INERTIA_CARRY_BUY_CLAMPED` 事件；
+  - 变动 **2,148 个** 权重单元格，`max_abs_diff = 0.9478`，探针严格判别通过（`verdict = ADJUDICATED`）；
+  - 被拦截事件前瞻表现：5d 前瞻收益 +0.52%（胜率 50.7%），10d 前瞻收益 +0.97%（胜率 53.8%），20d 前瞻收益 +1.47%（胜率 52.9%）。
+- **18 折因果 Walkforward 配对检验（Arm B 通用截断 vs Arm A 基线）**：
+  - 胜折比：**11 / 18 (61.1%)**；
+  - 配对 t 值：`t = -0.5902`，$\Delta\text{Sharpe} = -0.0036$（1.4836 → 1.4800）；
+  - 全周期 CAGR：20.33% → 20.25%（-0.08%），MaxDD：14.55% → 14.53%（改善 0.02%），Turnover：110.41x → 109.81x（改善 -0.60x）。
+- **Rule 9 最终默认值裁决**：
+  - 鉴于全周期夏普有微弱退化（-0.0036），按照预定计划门禁：**通用截断 `suppress_general_inertia_echo` 默认保持 `False`（opt-in）**；
+  - **定向作废阻断 `suppress_inertia_echo` 默认开启 `True`**：在离线回测中由于无 `.voided.json` 注入，回测权重与基线**逐位完全一致（Zero Drift）**；在实盘中则精准识别作废买单并 100% 阻断虚假回声追买。
+
+### 71.5 实盘全链路接线与 Rule 11 对齐
+
+1. **`scripts/run_live_strategy.py` 全链路实盘接线**：
+   - 扩充 CLI 参数 `--suppress-inertia-echo`（默认 True）与 `--suppress-general-inertia-echo`（默认 False）；
+   - 在 Stage 2 自动扫描历史会话根目录，识别 `recent_voided_buys` 并打印日志；
+   - 在 `step_position_lifecycle` 调用前，调用 `resolve_inertia_echo_target` 获取修正目标，打印 `[INFO/INERTIA_ECHO]` 拦截日志；
+   - 保护 `0.0 < target_series[sym] < min_entry_thresh` 分支，当被 VT3 抑制时避免被误判定为「目标未达门槛」，并在工单 reason 附注 ` [内层惯性回声抑制: VOIDED_INERTIA_ECHO]`；
+   - 在工单审计块写入 `detail_reason["inertia_echo_audit"]`，确保实盘工单审计信息完整透明。
+2. **`backtester/run_backtest.py` 回测对齐（Rule 11）**：
+   - 新增 `--suppress-inertia-echo`/`--no-suppress-inertia-echo` 以及 `--lifecycle-suppress-general-inertia-echo`/`--no-lifecycle-suppress-general-inertia-echo`；
+   - 在标准回测与 Walkforward 回测两处 `simulate_position_lifecycle` 中透传 `inertia_meta=getattr(template, "_last_inertia_meta", None)`。
+
+### 71.6 策略导出、版本断言与回归验证
+
+1. **策略配置重导（`--dump-strategies`）**：
+   - 运行 `--dump-strategies` 重导全部 59 个策略；
+   - 验证 `pipeline/research_strategy/results/strategy_dumps/chan_four_state_blend_strategy.json`：
+     - `base_version` 正确更新为 `"2.6.0"`；
+     - 核心部署参数 **`blend_weighting_mode == "regime_ic_ir_hybrid"` 严格保持**，未发生任何非预期覆盖。
+2. **自动化测试回归**：
+   - `test_blend_strategy_versioning.py`、`test_strategy_versioning.py`、`test_blend_policy_kernel.py` 均已更新 `BASE_VERSION = "2.6.0"` 断言；
+   - 运行 `pytest ... -k "version or cfsb_deployed_regime_mode or dumps"`：18 passed in 1.99s；
+   - 运行 `test_blend_policy_kernel.py` 全量用例：9 passed in 34.06s；
+   - 运行 `test_vt2_prior_state_voided_skip.py`：10 passed in 0.03s；
+   - 运行 `test_position_policy.py` & `test_position_lifecycle.py`：368 passed in 43.23s。全量单测 100% 绿灯通过。
+

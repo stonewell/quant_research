@@ -606,10 +606,10 @@ def test_base_version_bumped_with_the_default_flip():
     bump -- a `1.9.0` stamp after D1 would let a dump advertise a two-path engine
     that cannot be reproduced, which is the 2026-11-02 "two version pairs" shape.
     """
-    assert BaseBlendAllocationStrategy.BASE_VERSION == "2.5.0"
+    assert BaseBlendAllocationStrategy.BASE_VERSION == "2.6.0"
     inst = GenericBlendStrategy()
-    assert inst.base_version == "2.5.0"
-    assert "base: v2.5.0" in inst.version_string
+    assert inst.base_version == "2.6.0"
+    assert "base: v2.6.0" in inst.version_string
 
 
 # ---------------------------------------------------------------------------

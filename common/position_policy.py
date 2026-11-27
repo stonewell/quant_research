@@ -144,9 +144,10 @@ INVARIANTS (design §5)
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -179,6 +180,7 @@ __all__ = [
     "PortfolioSequencer",
     "SparseProjector",
     "kernel_apply_asset_inertia",
+    "resolve_inertia_echo_target",
 ]
 
 
@@ -2327,3 +2329,112 @@ def kernel_apply_asset_inertia(
         filtered.iloc[t] = current_w
 
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# VT3 -- Resolving inertia echo target weights (pure function)
+# ---------------------------------------------------------------------------
+
+
+def resolve_inertia_echo_target(
+    original_target_weight: float,
+    current_weight: float,
+    inertia_meta: Optional[Dict[str, Any]],
+    *,
+    was_voided_buy: bool = False,
+    suppress_voided_echo: bool = True,
+    suppress_general_echo: bool = False,
+    eps: float = 1e-6,
+) -> Tuple[float, Optional[Dict[str, Any]]]:
+    """Resolve position target weight when internal inertia produces an echo buy.
+
+    When internal model inertia (or tenure lock) holds a position higher than the
+    underlying raw target (e.g. model raw wants 0.0 or 0.05, but internal inertia
+    holds at 0.11), an external lifecycle/broker that does not hold the asset
+    (current_weight == 0.0) would see target_weight = 0.11 and generate a BUY order
+    -- an 'inertia echo'.
+
+    If the previous bar's BUY order was voided by operator or risk veto
+    (`was_voided_buy` and `suppress_voided_echo`), or under general inertia echo
+    suppression (`suppress_general_echo`), this function resolves the target back to
+    the un-inertial pre-inertia target or clamps it to avoid spurious entries.
+
+    Returns:
+        (resolved_target_weight, audit_dict_or_None)
+    """
+    try:
+        orig_raw = float(original_target_weight)
+        cur_w = float(current_weight)
+    except (TypeError, ValueError):
+        return (float(original_target_weight) if original_target_weight is not None else 0.0, None)
+
+    if not math.isfinite(orig_raw) or not math.isfinite(cur_w):
+        return (orig_raw, None)
+
+    if not isinstance(inertia_meta, dict) or not bool(inertia_meta.get("inertia_carried")):
+        return (orig_raw, None)
+
+    try:
+        pre = float(inertia_meta.get("pre_inertia_weight", 0.0) or 0.0)
+        post = float(inertia_meta.get("post_inertia_weight", 0.0) or 0.0)
+        dl_scale = float(inertia_meta.get("deleverage_scale", 1.0) or 1.0)
+        carry_reason = str(inertia_meta.get("carry_reason") or "INERTIA")
+    except (TypeError, ValueError):
+        return (orig_raw, None)
+
+    if not (math.isfinite(pre) and math.isfinite(post) and math.isfinite(dl_scale)):
+        return (orig_raw, None)
+
+    # If pre >= post - eps, internal inertia did not lift or support the position upward
+    if pre >= post - eps:
+        return (orig_raw, None)
+
+    # Downstream scaling accommodation (e.g. portfolio deleverage or volatility scaling)
+    scale_ratio = min(1.0, max(0.0, orig_raw / post)) if post > eps else 1.0
+    eff_pre = max(0.0, pre * scale_ratio)
+    eff_post = max(0.0, orig_raw)
+
+    # If external holding already matches or exceeds eff_post, no echo buy occurs
+    if cur_w >= eff_post - eps:
+        return (orig_raw, None)
+
+    # Branch 1: Voided buy echo suppression
+    if was_voided_buy and suppress_voided_echo:
+        resolved = float(eff_pre)
+        if resolved < eff_post - eps:
+            audit_dict = {
+                "action_taken": "VOIDED_INERTIA_ECHO",
+                "suppressed": True,
+                "was_voided_buy": True,
+                "carry_reason": carry_reason,
+                "original_target": orig_raw,
+                "resolved_target": resolved,
+                "pre_inertia_weight": pre,
+                "post_inertia_weight": post,
+                "effective_pre_inertia_weight": eff_pre,
+                "current_weight": cur_w,
+                "deleverage_scale": dl_scale,
+            }
+            return (resolved, audit_dict)
+
+    # Branch 2: General carry buy clamping
+    elif suppress_general_echo:
+        clamped = float(max(cur_w, eff_pre))
+        if clamped < eff_post - eps:
+            audit_dict = {
+                "action_taken": "INERTIA_CARRY_BUY_CLAMPED",
+                "suppressed": True,
+                "was_voided_buy": False,
+                "carry_reason": carry_reason,
+                "original_target": orig_raw,
+                "resolved_target": clamped,
+                "pre_inertia_weight": pre,
+                "post_inertia_weight": post,
+                "effective_pre_inertia_weight": eff_pre,
+                "current_weight": cur_w,
+                "deleverage_scale": dl_scale,
+            }
+            return (clamped, audit_dict)
+
+    return (orig_raw, None)
+

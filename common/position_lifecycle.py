@@ -146,6 +146,7 @@ from common.position_policy import (  # noqa: E402  (re-export, not a new use)
     coerce_blocking_reason,
     coerce_request_semantics,
     is_liquidation_event,
+    resolve_inertia_echo_target,
 )
 
 
@@ -229,6 +230,10 @@ class PositionLifecycleConfig:
     # into the pre-alignment behaviour, where `market_breadths=None` keeps every
     # historical number bit-identical.
     enable_market_breadth: bool = True
+    # (VT3) Suppress echo buy orders caused by model internal inertia/tenure lock
+    # when live/broker position was flat or voided.
+    suppress_inertia_echo: bool = True
+    suppress_general_inertia_echo: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         from dataclasses import asdict
@@ -1110,6 +1115,10 @@ def resolve_position_lifecycle_config(
     # `--no-lifecycle-enable-market-breadth` or a strategy JSON) restores the
     # pre-alignment `market_breadths=None` exactly.
     enable_market_breadth = bool(_get("enable_market_breadth", True, "enable_market_breadth"))
+    suppress_inertia_echo = bool(_get("suppress_inertia_echo", True, "suppress_inertia_echo"))
+    suppress_general_inertia_echo = bool(
+        _get("suppress_general_inertia_echo", False, "suppress_general_inertia_echo")
+    )
 
     return PositionLifecycleConfig(
         guard_latency_bars=guard_latency_bars,
@@ -1133,6 +1142,8 @@ def resolve_position_lifecycle_config(
         price_reentry_pct=price_reentry_pct,
         reentry_vwap_lookback=reentry_vwap_lookback,
         enable_market_breadth=enable_market_breadth,
+        suppress_inertia_echo=suppress_inertia_echo,
+        suppress_general_inertia_echo=suppress_general_inertia_echo,
     )
 
 
@@ -1561,6 +1572,8 @@ def simulate_position_lifecycle(
     atrs: Optional[pd.DataFrame] = None,
     forced_exits: Optional[Union[Dict[Any, Set[str]], pd.Series]] = None,
     request_meta: Optional[Dict[Any, Dict[str, Dict[str, Any]]]] = None,
+    inertia_meta: Optional[Dict[Any, Dict[str, Dict[str, Any]]]] = None,
+    voided_buy_events: Optional[Union[Dict[Any, Set[str]], pd.Series]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """Pure causal simulation of position lifecycle state machine across time.
 
@@ -1730,6 +1743,27 @@ def simulate_position_lifecycle(
                     bar_request_meta = request_meta.get(pd.Timestamp(t))
                 except Exception:
                     bar_request_meta = None
+
+        bar_inertia_meta = None
+        if isinstance(inertia_meta, dict):
+            bar_inertia_meta = inertia_meta.get(t)
+            if bar_inertia_meta is None:
+                try:
+                    bar_inertia_meta = inertia_meta.get(pd.Timestamp(t))
+                except Exception:
+                    bar_inertia_meta = None
+
+        bar_voided_buys: Set[str] = set()
+        if voided_buy_events is not None:
+            resolved_voided = _forced_exits_for_bar(voided_buy_events, t)
+            if resolved_voided is None:
+                try:
+                    resolved_voided = _forced_exits_for_bar(voided_buy_events, pd.Timestamp(t))
+                except Exception:
+                    resolved_voided = None
+            if resolved_voided:
+                bar_voided_buys = resolved_voided
+
         for sym in risky_symbols:
             st = states[sym]
             tgt_w = float(raw_targets.loc[t, sym]) if (t in raw_targets.index and sym in raw_targets.columns) else 0.0
@@ -1737,6 +1771,19 @@ def simulate_position_lifecycle(
             sym_request_meta = None
             if isinstance(bar_request_meta, dict):
                 sym_request_meta = bar_request_meta.get(sym)
+
+            # (VT3) Resolve inertia echo target weight before lifecycle evaluation
+            echo_audit = None
+            if cfg.suppress_inertia_echo and isinstance(bar_inertia_meta, dict) and sym in bar_inertia_meta:
+                cur_sim_w = float(st.current_weight) if st.is_holding() else 0.0
+                tgt_w, echo_audit = resolve_inertia_echo_target(
+                    tgt_w,
+                    cur_sim_w,
+                    bar_inertia_meta.get(sym),
+                    was_voided_buy=(sym in bar_voided_buys),
+                    suppress_voided_echo=True,
+                    suppress_general_echo=bool(cfg.suppress_general_inertia_echo),
+                )
 
             # Resolve price
             p_series = closes.get(sym)
@@ -1821,6 +1868,8 @@ def simulate_position_lifecycle(
             rec = dec.to_dict()
             rec["date"] = str(t)
             rec["symbol"] = sym
+            if echo_audit is not None:
+                rec["inertia_echo_audit"] = echo_audit
             lifecycle_records.append(rec)
 
         # Check if any asset triggered an actionable trade (BUY or SELL)

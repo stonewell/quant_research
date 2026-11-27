@@ -155,6 +155,7 @@ from common.position_lifecycle import (
     derive_lifecycle_context_from_frame,
     is_liquidation_event,
     lifecycle_context_at,
+    resolve_inertia_echo_target,
     resolve_position_policy_config,
     step_position_lifecycle,
 )
@@ -181,6 +182,7 @@ from scripts.live_preflight import (
     assert_account_state_version_parity,
     assert_dump_version_parity,
     assert_state_version_not_clobbered,
+    collect_recent_voided_buy_symbols,
     derive_session_root,
     select_prior_state,
     verify_live_strategy_dump_preflight,
@@ -2323,6 +2325,34 @@ def parse_args(args: Optional[List[str]] = None):
         action="store_false",
         default=True,
         help="(AT3) Opt out of emitting <output-dir>/signal_snapshot.json.",
+    )
+    parser.add_argument(
+        "--suppress-inertia-echo",
+        dest="suppress_inertia_echo",
+        action="store_true",
+        default=True,
+        help="(VT3) Suppress echo buy orders caused by model internal inertia/tenure lock when live/broker position was flat or voided. Default True.",
+    )
+    parser.add_argument(
+        "--no-suppress-inertia-echo",
+        dest="suppress_inertia_echo",
+        action="store_false",
+        default=True,
+        help="(VT3) Opt out of inertia echo suppression.",
+    )
+    parser.add_argument(
+        "--suppress-general-inertia-echo",
+        dest="suppress_general_inertia_echo",
+        action="store_true",
+        default=False,
+        help="(VT3) Enable general inertia carry buy clamping across all assets. Default False.",
+    )
+    parser.add_argument(
+        "--no-suppress-general-inertia-echo",
+        dest="suppress_general_inertia_echo",
+        action="store_false",
+        default=False,
+        help="(VT3) Disable general inertia carry buy clamping.",
     )
     add_data_provider_cli_args(parser, default_provider="synthetic")
     # (L2.3) --market / --allow-intraday / --strict-market-clock / --strict-freshness /
@@ -6397,6 +6427,20 @@ def main(cli_args: Optional[List[str]] = None):
                 f"{prior_state_log} {_applicability}" if prior_state_log else f"{PRIOR_STATE_LOG_PREFIX} {_applicability}"
             )
 
+    # (VT3) Scan prior sessions for voided BUY orders to prevent spurious inertia echo buys
+    recent_voided_buys: Dict[str, Dict[str, Any]] = {}
+    if bool(getattr(args, "suppress_inertia_echo", True)) and _prior_session_root:
+        try:
+            recent_voided_buys = collect_recent_voided_buy_symbols(_prior_session_root, as_of_date)
+            if recent_voided_buys:
+                _sym_list = ", ".join(
+                    f"{s} (voided on {v.get('voided_date', '')}, shares={v.get('voided_shares', 0)})"
+                    for s, v in sorted(recent_voided_buys.items())
+                )
+                print(f"[INFO/INERTIA_ECHO] 近期作废买入未恢复标的 ({len(recent_voided_buys)} 个): {_sym_list}")
+        except Exception as exc:
+            print(f"[WARN] (VT3) 近期作废买单采集失败（跳过作废回声拦截）: {exc}")
+
     # Track streak counters, historical entry prices, and UPLSM lifecycle states from account_state
     entry_signal_streak: Dict[str, int] = dict(account_state.get("entry_signal_streak", {}))
     zero_target_streak: Dict[str, int] = dict(account_state.get("zero_target_streak", {}))
@@ -6663,6 +6707,8 @@ def main(cli_args: Optional[List[str]] = None):
         price_reentry_gate=_policy_cfg.price_reentry_gate,
         price_reentry_pct=_policy_cfg.price_reentry_pct,
         reentry_vwap_lookback=_policy_cfg.reentry_vwap_lookback,
+        suppress_inertia_echo=bool(getattr(args, "suppress_inertia_echo", True)),
+        suppress_general_inertia_echo=bool(getattr(args, "suppress_general_inertia_echo", False)),
     )
 
     # Build descriptive engine banner information
@@ -7107,6 +7153,15 @@ def main(cli_args: Optional[List[str]] = None):
             live_request_meta = _last_request_meta.get(rebalances.index[-1]) or None
         except Exception:  # pragma: no cover - defensive: never fail a live run on this
             live_request_meta = None
+
+    # (2026-11-27, `BASE_VERSION 2.6.0`) VT3 inertia metadata side channel
+    _last_inertia_meta = getattr(template, "_last_inertia_meta", None)
+    live_inertia_meta = None
+    if _last_inertia_meta:
+        try:
+            live_inertia_meta = _last_inertia_meta.get(rebalances.index[-1]) or None
+        except Exception:  # pragma: no cover - defensive: never fail a live run on this
+            live_inertia_meta = None
 
     # ------------------------------------------------------------------ #
     # (`R6`, rule r6.3) OVERNIGHT DE-RISKING -- decided here, applied here
@@ -8092,6 +8147,33 @@ def main(cli_args: Optional[List[str]] = None):
                     f"疑似离场后残仓，请核对账本。"
                 )
 
+            # (VT3) Resolve inertia echo target weight before lifecycle evaluation
+            echo_audit: Optional[Dict[str, Any]] = None
+            if (
+                lifecycle_cfg.suppress_inertia_echo
+                and isinstance(live_inertia_meta, dict)
+                and sym in live_inertia_meta
+            ):
+                resolved_tgt, echo_audit = resolve_inertia_echo_target(
+                    tgt_w,
+                    cur_w,
+                    live_inertia_meta.get(sym),
+                    was_voided_buy=(sym in recent_voided_buys),
+                    suppress_voided_echo=True,
+                    suppress_general_echo=bool(lifecycle_cfg.suppress_general_inertia_echo),
+                )
+                if echo_audit is not None:
+                    if sym in recent_voided_buys:
+                        v_src = recent_voided_buys[sym]
+                        echo_audit["voided_date"] = str(v_src.get("voided_date", ""))
+                        echo_audit["voided_shares"] = int(v_src.get("voided_shares", 0))
+                    tgt_w = resolved_tgt
+                    print(
+                        f"[INFO/INERTIA_ECHO] {sym}: {echo_audit['action_taken']} ({echo_audit['carry_reason']}) "
+                        f"pre={echo_audit['effective_pre_inertia_weight']:.4f} "
+                        f"post={echo_audit['original_target']:.4f} cur={cur_w:.4f} -> target={tgt_w:.4f}"
+                    )
+
             decision = step_position_lifecycle(
                 state=state,
                 raw_target_weight=tgt_w,
@@ -8144,12 +8226,18 @@ def main(cli_args: Optional[List[str]] = None):
                 and cur_w == 0.0
                 and 0.0 < target_series[sym] < min_entry_thresh
             ):
-                action = "HOLD_FILTERED"
-                tgt_w = 0.0
-                delta_w = 0.0
-                abs_delta = 0.0
-                blocking_reason = BlockingReason.MIN_ENTRY_THRESHOLD
-                reason = f"目标仓位未达最低建仓/调仓门槛 (目标 {target_series[sym]:.1%} < 门槛 {min_entry_thresh:.0%}，防微量试错损耗)"
+                if not (echo_audit is not None and echo_audit.get("suppressed")):
+                    action = "HOLD_FILTERED"
+                    tgt_w = 0.0
+                    delta_w = 0.0
+                    abs_delta = 0.0
+                    blocking_reason = BlockingReason.MIN_ENTRY_THRESHOLD
+                    reason = f"目标仓位未达最低建仓/调仓门槛 (目标 {target_series[sym]:.1%} < 门槛 {min_entry_thresh:.0%}，防微量试错损耗)"
+
+            if echo_audit is not None and echo_audit.get("suppressed"):
+                suppress_tag = f" [内层惯性回声抑制: {echo_audit.get('action_taken', 'INERTIA_ECHO')}]"
+                if suppress_tag not in reason:
+                    reason = f"{reason}{suppress_tag}"
 
             if decision.fast_path_triggered:
                 fast_path_badge = f"⚡[{decision.fast_path_triggered}]"
@@ -8744,6 +8832,8 @@ def main(cli_args: Optional[List[str]] = None):
         # uses `json.dump(..., ensure_ascii=False)` without `default=str` /
         # `allow_nan=False`.
         detail_reason["advisory"] = advisory_block
+        if echo_audit is not None:
+            detail_reason["inertia_echo_audit"] = echo_audit
         if fast_path_badge:
             detail_reason["fast_path_badge"] = fast_path_badge
             detail_reason["fast_path_triggered"] = decision.fast_path_triggered
