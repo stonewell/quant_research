@@ -826,6 +826,19 @@ def _same_book(left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) 
     return True
 
 
+def _run_dir_has_voided_ticket(
+    run_dir: Optional[str],
+    ticket_names: Tuple[str, ...] = ("live_trading_ticket", "netted_trading_ticket"),
+) -> bool:
+    """True if `run_dir` carries a `<name>.voided.json` marker for any name in `ticket_names`."""
+    if not run_dir or not os.path.isdir(run_dir):
+        return False
+    for name in ticket_names:
+        if os.path.exists(os.path.join(run_dir, f"{name}.voided.json")):
+            return True
+    return False
+
+
 def plan_post_holdings_meta_backfill(
     run_dir: Optional[str],
     *,
@@ -864,17 +877,17 @@ def plan_post_holdings_meta_backfill(
     if not status.get("file_exists"):
         plan["reason"] = POST_HOLDINGS_REASON_NO_BOOK
         return plan
+
+    if _run_dir_has_voided_ticket(run_dir, ticket_names):
+        plan["reason"] = POST_HOLDINGS_REASON_TICKET_VOIDED
+        return plan
+
     if status.get("meta_present"):
         if status.get("complete") is True:
             plan.update(action="skip", reason=POST_HOLDINGS_REASON_ALREADY)
         else:
             plan["reason"] = POST_HOLDINGS_REASON_META_INCOMPLETE
         return plan
-
-    for name in ticket_names:
-        if os.path.exists(os.path.join(run_dir, f"{name}.voided.json")):
-            plan["reason"] = POST_HOLDINGS_REASON_TICKET_VOIDED
-            return plan
 
     ticket = _load_ticket_from_run_dir(run_dir, ticket_names)
     if ticket is None:
@@ -2631,22 +2644,23 @@ class StorageManager:
         if not run_dir or not os.path.isdir(run_dir):
             return None
 
-        # 1. Check if post_holdings.json exists
-        # (D5) Through the sidecar, so an EMPTY book (`{}` = all cash) is returned as `{}`
-        # while a missing/incomplete one falls through instead of masquerading as "flat".
-        post_status = self.post_holdings_meta_status(run_dir)
-        if post_status.get("available") and isinstance(post_status.get("book"), dict):
-            return post_status["book"]
+        if not _run_dir_has_voided_ticket(run_dir):
+            # 1. Check if post_holdings.json exists
+            # (D5) Through the sidecar, so an EMPTY book (`{}` = all cash) is returned as `{}`
+            # while a missing/incomplete one falls through instead of masquerading as "flat".
+            post_status = self.post_holdings_meta_status(run_dir)
+            if post_status.get("available") and isinstance(post_status.get("book"), dict):
+                return post_status["book"]
 
-        # 2. Check ticket for target_shares
-        ticket = self._load_json(os.path.join(run_dir, "live_trading_ticket.json"))
-        if not ticket:
-            csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
-            if os.path.exists(csv_path):
-                ticket = parse_ticket_csv(csv_path)
-        target_holdings = post_holdings_from_ticket(ticket)
-        if target_holdings is not None:
-            return target_holdings
+            # 2. Check ticket for target_shares
+            ticket = self._load_json(os.path.join(run_dir, "live_trading_ticket.json"))
+            if not ticket:
+                csv_path = os.path.join(run_dir, "live_trading_ticket.csv")
+                if os.path.exists(csv_path):
+                    ticket = parse_ticket_csv(csv_path)
+            target_holdings = post_holdings_from_ticket(ticket)
+            if target_holdings is not None:
+                return target_holdings
 
         # 3. Fallback to holdings.json or current_holdings.json in the run dir
         for fname in ("holdings.json", "current_holdings.json"):
@@ -3041,6 +3055,14 @@ class StorageManager:
             run_dir, book, as_of=as_of, source=source, note=note
         )
 
+    @staticmethod
+    def _run_dir_has_voided_ticket(
+        run_dir: Optional[str],
+        ticket_names: Tuple[str, ...] = ("live_trading_ticket", "netted_trading_ticket"),
+    ) -> bool:
+        """True if `run_dir` carries a `<name>.voided.json` marker for any name in `ticket_names`."""
+        return _run_dir_has_voided_ticket(run_dir, ticket_names)
+
     def _planned_book_from_run_dir(
         self,
         run_dir: Optional[str],
@@ -3066,6 +3088,8 @@ class StorageManager:
         semantics and is logged as `legacy_post_holdings_no_meta`.
         """
         if not run_dir or not os.path.isdir(run_dir):
+            return None
+        if _run_dir_has_voided_ticket(run_dir, ticket_names):
             return None
         post_status = self.post_holdings_meta_status(run_dir)
         if post_status.get("available") and isinstance(post_status.get("book"), dict):

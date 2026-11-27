@@ -8559,3 +8559,63 @@ lookback 缓冲内，而是**直接落在成交折里**；4 只「短历史」sy
 
 - **裁决结论**：全面维持基线结构，**严格否决将缺乏滞后带的静态 Top-K 截断机制并入策略代码或配置**；
 - **Rule 8 红线确立**：未来任何关于宽截面单票集中化或稀释治理的提案，**严禁再次提出无滞后缓冲的硬 Top-K 排名截断**；若要探索集中度优化，必须设计带进出阈值缓冲带（如 Top-8 进入、Drop-15 退出）或长周期动量平滑的机制，并必须证明其换手率严格受控在 $10\times/\text{yr}$ 以内。
+
+## 67. 2026-11-27 实盘作废票据次日种子排除与 Sidecar 覆盖闭环（`VT1`，Option 1 落地）
+
+### 67.1 变更背景与缺陷机理
+
+2026-11-26 盘后发生 `601728.SH` 仓位异常买入（400 → 4800 股），操作员于当日生成
+`live_trading_ticket.voided.json` 作废该票据。然而随后的代码审计与实测暴露两项严重机制缺陷：
+1. **种子解析未感知作废（`void` 语义不可达）**：`StorageManager._planned_book_from_run_dir`
+   与 `_earlier_runs` 无任何作废判断；次日（11-27）调用 `get_previous_post_holdings`
+   时仍将 11-26 目录的 `post_holdings.json`（4800 股）视作有效基准，迫使操作员只能通过前端手工覆写
+   绕过。
+2. **回填早退阻断作废分支**：`plan_post_holdings_meta_backfill` 中对 `.voided.json` 的检查
+   排在 `status.get("meta_present")` 且 `complete: true` 的早退逻辑之后，导致任何已写入完整 sidecar
+   的票据均直接返回 `skip / post_holdings_meta_already_complete`，作废检查分支在物理上不可达。
+
+### 67.2 业主核准裁决：Option 1（作废 run 完全排除于种子解析）
+
+经方案论证与业主终裁（板上 #82 第二部分），选定 **Option 1**：
+- **语义定义**：`void` 严格优先于 `complete: true`。作废的含义是“该交易指令已被撤回、相关成交未发生，
+  该 run 不得作为后续任何一日的种子或基准”。
+- **不变量保全**：`_planned_book_from_run_dir` 对作废 run 直接返回 `None`。`get_previous_post_holdings`
+  在遍历历史 run 时自然跳过该目录，回退至上一有效未作废 run 的计划后账本（11-25 的 400 股）；严禁将
+  盘前未经验证的 `holdings.json` 伪造为 planned book 返回，坚决捍卫 `storage.py:3057, 3099` 处
+  `D5`/`D8`/`D9` 的一本账三副本核心不变式。
+
+### 67.3 涉及核心文件与修改内容
+
+- **策略/模板版本控制说明（Rule 7 遵从）**：
+  本次变更纯属实盘存储与种子解析层（`web/livetrading/storage.py`）的缺陷修复，**未修改任何量化策略、
+  信号生成算子、组合构建或模板逻辑**，因此根据 Rule 7，**无需且严禁升级策略 `version` 与 `BASE_VERSION`**，
+  亦无需重运行 `--dump-strategies`。
+- **`web/livetrading/storage.py`**：
+  1. 新增共享辅助函数 `_run_dir_has_voided_ticket(run_dir, ticket_names=...)`（`:829-838`），并在
+     `StorageManager` 挂载同名静态方法（`:3058-3064`），统一覆盖单策略 `live_trading_ticket.voided.json`
+     与多策略矩阵 `netted_trading_ticket.voided.json`。
+  2. `plan_post_holdings_meta_backfill`（`:881-884`）：将作废检查前移至 `status.get("meta_present")`
+     之前，凡存在作废标记一律返回 `action="refuse", reason="ticket_voided"`，并移除原死循环代码。
+  3. `_planned_book_from_run_dir`（`:3092-3093`）：顶层加入 `_run_dir_has_voided_ticket` 门禁，
+     遇作废 run 立即返回 `None`。
+  4. `extract_post_run_holdings`（`:2647-2665`）：读取 post 账本与票据前置校验作废标记，遇作废 run
+     安全降级为盘前快照；`_display_book_for_run_dir` 自然落入 `pre_trade_fallback` 分支。
+  5. 未作废历史 run 保持 100% 逐字节兼容（Rule 9）。
+
+### 67.4 验证与 Rule 10 判别性探针（100% 离线合成夹具）
+
+新增配套测试 `web/livetrading/tests/test_vt1_voided_ticket_seed.py`（完全基于 `tmp_path`，Rule 1 离线）：
+1. **Rule 10 判别性探针（`test_vt1_rule10_discriminating_probe_seed_resolution`）**：
+   - 合成两日真实镜像夹具：Day 1 持仓 400 股，Day 2 买入 +4400 股（post_holdings = 4800 股，`complete: true`）；
+   - **Arm A（未作废基准）**：Day 3 `get_previous_post_holdings` 返回 Day 2 的 4800 股；Day 2 回填计划返回
+     `skip / post_holdings_meta_already_complete`；
+   - **Arm B（写入 `live_trading_ticket.voided.json`）**：Day 3 `get_previous_post_holdings` 返回 Day 1 的
+     400 股（目录严格指向 Day 1，Day 2 完全被跳过）；Day 2 回填计划返回 `refuse / ticket_voided`。
+   - 探针可观测到清晰的 `4800` vs `400` 差分，非零差分确认（`ADJUDICATED`）。
+2. **多策略矩阵作废（`test_vt1_multi_netted_voided_ticket_skipped`）**：
+   - `get_previous_multi_netting_post_holdings` 正确识别 `netted_trading_ticket.voided.json` 并跳过作废矩阵 run。
+3. **UI 降级测试（`test_vt1_display_and_extract_fallback_on_voided_run`）**：
+   - 确认作废 run 下 `_display_book_for_run_dir` 返回 `(pre_trade_snapshot, "pre_trade_fallback")`。
+4. **全量回归验收**：
+   - `web/livetrading/tests/test_vt1_voided_ticket_seed.py`：4 passed in 0.37s；
+   - `web/livetrading/tests/`：**453 passed, 1 skipped, 0 failures** in 175s。
